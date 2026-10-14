@@ -1,6 +1,6 @@
 # Research notes and sources
 
-Reference date: 2026-10-13. Sources describe upstream behavior, not proof that Ulos builds or supports a platform. Recheck requirements when locking dependencies or preparing releases.
+Reference date: 2026-10-14. Sources describe upstream behavior, not proof that Ulos builds or supports a platform. Recheck requirements when locking dependencies or preparing releases.
 
 ## GPUI Kit
 
@@ -15,11 +15,29 @@ The getting-started guide uses `gpui-kit` as the single aligned UI dependency, c
 
 These notes are an original concise summary of linked GPUI Kit guidance, not copied examples. GPUI Kit documentation credits its prose under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) and its software/code examples under Apache-2.0. Those terms do not select a license for Ulos.
 
+## Native windows and semantic components
+
+Checked 2026-10-14 against the upstream pages below, summarized here in original wording (not copied prose/example chunks):
+
+- [Window](https://gpui-kit.com/docs/window): window handles select the target context and can fail after close; deferred updates avoid reentrant window/entity access. Focused action dispatch and entity notifications are distinct from native-window state changes. Ulos uses this boundary for typed macOS menu routing and keeps Options on the main handle.
+- [Tooltip](https://gpui-kit.com/component/tooltip): Kit exposes public `component::tooltip::Tooltip` and built-in `Button::tooltip`. Ulos uses Button tooltips with explicit accessible labels for stock icon actions; no separate `gpui-tooltip` dependency is needed.
+- [Multi Window](https://gpui-kit.com/docs/multi-window): Kit opens a separate Root per window; content entities, intended window handles, local subscriptions, close guards, registry cleanup, and last-window quit policy are distinct responsibilities. Ulos keeps child-context input and subscriptions, strong child-to-manager ownership, and weak reverse registries. The manager still combines view and shared session ownership; extracting a dedicated model is future refactoring, not current architecture.
+- [DataTable](https://gpui-kit.com/component/data-table): retained TableState plus a delegate provides viewport virtualization, column sorting and row events. Ulos uses snapshot rows and Kit Checkbox/Button/Label cells, retaining stable record-ID checkbox selection separately from positional table navigation.
+- [Toolbar](https://gpui-kit.com/component/toolbar) and [StatusBar](https://gpui-kit.com/component/status-bar): compose command rows and session status through Kit semantic containers rather than hand-built widget surfaces. The Toolbar page documents that `child` propagates size and forces ghost/compact Button presentation. Ulos deliberately uses `content` to preserve stock controls under its stricter no-control-styling policy; wrapper geometry remains layout-only.
+- [GroupBox](https://gpui-kit.com/component/group-box) and [DescriptionList](https://gpui-kit.com/component/description-list): group destination/status panels and present telemetry label/value pairs with Kit components.
+- [Empty](https://gpui-kit.com/component/empty): named content slots present missing downloads or filtered-out results; the application owns the actions and decides when to show them.
+
+All Ulos widgets, panels and text are required to use Kit components, without manual UI exceptions. Kit-reexported `div`, `v_flex`, and `h_flex` serve layout only; upstream examples permitting custom cells/painting do not override this project policy. Native OS chrome and native picker APIs remain platform-owned, not a bespoke GTK/Swift application UI. Options remains a Kit modal; the requested native-window workflow applies to Add and download status.
+
+### Lag analysis: source evidence, not a runtime benchmark
+
+The locked `gpui-component` 0.7.3 source (`src/dialog/dialog.rs`) sets the default dialog entrance duration to 0.25 seconds and applies slide-down/fade-in animation. This is a dependency configuration observation, not measured Ulos opening latency. Native Add/status windows no longer traverse that modal entrance. The previous eager all-row widget construction is replaced by Kit DataTable viewport cells. Transfer watch polls remain 100ms but apply changed values; the heartbeat refreshes only for changed/stale rates, and unchanged status snapshots do not notify. The 500-record regression covers viewport cell construction and zero manager-model notifications from child opening/typing; native focus and forced test redraws are distinguished from queue notifications. Isolated macOS smoke observations measured synchronous window construction, not visible first paint. No instant-response guarantee or FPS result is established; details and platform limits are recorded in [Status](STATUS.md).
+
 ## Desktop reference and clipboard boundary
 
-The latest explicit user reference is the light IDM 6.28 structure, superseding the earlier dark AB screenshot: native titlebar, menu strip, icon-over-label toolbar, category tree, compact table, and transfer details. It guides original GPUI Kit composition, not copied source/branding or a pixel-identical skin. Kit theme and native platform chrome necessarily differ by OS.
+The latest explicit user reference is the light IDM 6.28 structure, superseding the earlier dark AB screenshot: native titlebar, menus, action toolbar, category tree, table, and transfer details. The newer user request puts macOS menus in the system menu bar through Kit `Menu`/`MenuItem`; other platforms retain Kit in-window dropdowns without search in the menu line. One shared stock action Toolbar uses icon-only Buttons except Add URL and places stock search Input on that same row. It guides original GPUI Kit composition, not copied source/branding or a pixel-identical skin. Kit theme and native platform chrome necessarily differ by OS. Stock Light/Dark `Theme::change` replaces the former custom font, blue palette, and radius overrides; do not treat historical reference values as current control styling or promise an exact platform font size. Default controls remain unmodified, including child/status views, with stock Lucide icons registered through `AllAssets`.
 
-The current manager uses GPUI's normal asynchronous clipboard API, behind an off-by-default session Options toggle. Eligibility checks run once per second only for the active window with manager dialogs closed; disabled detection does not read the clipboard. Accept a single bounded HTTP/HTTPS URL and prefill confirmation without networking; retain fingerprints rather than non-URL text and do not log clipboard contents. Signed source/query values still exist in memory for an accepted download. Wayland access depends on compositor/provider behavior and requires native testing, as do native folder/save pickers. Naming is pure URL-path processing, not HEAD or Content-Disposition discovery.
+The current manager uses GPUI's normal asynchronous clipboard API, behind an off-by-default session Options toggle. Eligibility checks run once per second only while the main window is active, no Add/status window is open, and Options is closed, with eligibility rechecked after async reads; disabled detection does not read the clipboard. Accept a single bounded HTTP/HTTPS URL and prefill confirmation without networking; retain fingerprints rather than non-URL text and do not log clipboard contents. Signed source/query values still exist in memory for an accepted download. Wayland access depends on compositor/provider behavior and requires native testing, as do native folder/save pickers. Naming is pure URL-path processing, not HEAD or Content-Disposition discovery.
 
 ## Browser integration references
 
@@ -46,4 +64,4 @@ Torrent support is a future design direction, not a researched or selected engin
 
 ## Outstanding research and evidence
 
-Choose Linux distributions, browser targets, final name, and Ulos license. Validate GNOME/KDE, X11/Wayland, scale factors, and GPU drivers through an explicit matrix. Only the current macOS development host is available at initialization; no completed Ulos platform tests are claimed here. Linux is a first-class priority, not a promise of compatibility with every distribution.
+Choose Linux distributions, browser targets, and final name. Ulos is licensed under MIT; audit dependency licenses and notices before distribution. Validate GNOME/KDE, X11/Wayland, scale factors, and GPU drivers through an explicit matrix. Only the current macOS development host is available at initialization; no completed Ulos platform tests are claimed here. Linux is a first-class priority, not a promise of compatibility with every distribution.

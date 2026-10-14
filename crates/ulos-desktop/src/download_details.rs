@@ -3,13 +3,19 @@ use std::{path::PathBuf, time::Duration};
 
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable,
+        Disableable,
         button::Button,
+        description_list::{DescriptionItem, DescriptionList},
+        group_box::{GroupBox, GroupBoxVariants},
+        h_flex,
         label::Label,
         progress::Progress,
+        separator::Separator,
         spinner::Spinner,
         tab::{Tab, TabBar},
         table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow},
+        toolbar::Toolbar,
+        v_flex,
     },
     prelude::FluentBuilder as _,
     *,
@@ -20,7 +26,7 @@ use crate::{formatting, queue::DownloadId};
 
 /// Display-only data; the parent must remove URL credentials and query values
 /// before supplying `source` (and sanitize any error text). Deliberately not Debug.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct DetailsSnapshot {
     pub id: DownloadId,
     pub name: String,
@@ -65,8 +71,10 @@ impl DownloadDetails {
 
     /// Keep the same entity while updating telemetry, preserving tab and disclosure state.
     pub fn update(&mut self, snapshot: DetailsSnapshot, cx: &mut Context<Self>) {
-        self.snapshot = snapshot;
-        cx.notify();
+        if self.snapshot != snapshot {
+            self.snapshot = snapshot;
+            cx.notify();
+        }
     }
 
     fn percentage(&self) -> Option<f32> {
@@ -110,7 +118,7 @@ impl DownloadDetails {
         }
     }
 
-    fn status_content(&self, cx: &App) -> AnyElement {
+    fn status_content(&self) -> AnyElement {
         let snapshot = &self.snapshot;
         let rate = snapshot
             .speed
@@ -142,29 +150,29 @@ impl DownloadDetails {
                 snapshot.destination.to_string_lossy().into_owned(),
             ),
         ];
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded_md()
-            .p_3()
-            .children(fields.into_iter().map(|(label, value)| {
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .child(Label::new(label).w(px(126.)).flex_shrink_0())
-                    .child(Label::new(value).flex_1().min_w_0())
-            }))
-            .when_some(snapshot.error.clone(), |panel, error| {
-                panel.child(Label::new(format!("Error: {error}")))
-            })
+        GroupBox::new()
+            .outline()
+            .title(Label::new("Download status"))
+            .child(
+                DescriptionList::horizontal()
+                    .columns(1)
+                    .bordered(false)
+                    .children(fields.into_iter().map(|(label, value)| {
+                        DescriptionItem::new(Label::new(label).into_any_element())
+                            .value(Label::new(value).into_any_element())
+                    }))
+                    .when_some(snapshot.error.clone(), |list, error| {
+                        list.item(
+                            Label::new("Error").into_any_element(),
+                            Label::new(error).into_any_element(),
+                            1,
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
-    fn connection_content(&self, cx: &App) -> AnyElement {
+    fn connection_content(&self) -> AnyElement {
         let percent = self.percentage();
         // No pretend connection exists for a queued/preparing item. Retained byte
         // telemetry or a completed result represents the one actual HTTP stream.
@@ -193,11 +201,9 @@ impl DownloadDetails {
                     ),
             )
         });
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(Label::new("Connection progress"))
+        GroupBox::new()
+            .outline()
+            .title(Label::new("Connection progress"))
             .when(has_stream, |view| {
                 view.child(
                     Progress::new("details-connection-progress")
@@ -232,11 +238,9 @@ impl DownloadDetails {
             .when(!has_stream, |view| {
                 view.child(Label::new("No connection progress yet"))
             })
-            .child(
-                Label::new("Single HTTP connection; segmented transfers are not implemented.")
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground),
-            )
+            .footer(Label::new(
+                "Single HTTP connection; segmented transfers are not implemented.",
+            ))
             .into_any_element()
     }
 }
@@ -250,7 +254,7 @@ impl Render for DownloadDetails {
             DetailsTab::Completion => 2,
         };
         let content = match self.tab {
-            DetailsTab::Status => self.status_content(cx),
+            DetailsTab::Status => self.status_content(),
             DetailsTab::SpeedLimiter => Label::new(
                 "Speed limiting is not implemented. Transfers currently use the available bandwidth.",
             )
@@ -260,101 +264,104 @@ impl Render for DownloadDetails {
             )
             .into_any_element(),
         };
-        div()
+        v_flex()
             .id("download-details")
-            .w_full()
-            .max_w(px(590.))
-            .max_h(px(550.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
+            .size_full()
+            .p_4()
             .gap_3()
-            .text_sm()
-            .text_color(cx.theme().foreground)
-            .child(Label::new(self.snapshot.name.clone()).font_weight(FontWeight::SEMIBOLD))
-            .child(Label::new(format!("URL: {}", self.snapshot.source)))
             .child(
-                TabBar::new("details-tabs")
-                    .selected_index(tab_index)
-                    .child(Tab::new().label("Download status"))
-                    .child(Tab::new().label("Speed limiter"))
-                    .child(Tab::new().label("Options on completion"))
-                    .on_click(cx.listener(|view, index, _, cx| {
-                        view.tab = match index {
-                            1 => DetailsTab::SpeedLimiter,
-                            2 => DetailsTab::Completion,
-                            _ => DetailsTab::Status,
-                        };
-                        cx.notify();
-                    })),
-            )
-            .child(content)
-            .child(
-                Progress::new("details-overall-progress")
-                    .accessibility_label("Overall download progress")
-                    .loading(self.snapshot.active && percent.is_none())
-                    .value(percent.unwrap_or(0.0)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(self.snapshot.active && percent.is_none(), |view| {
-                        view.child(Spinner::new())
-                    })
-                    .child(Label::new(
-                        percent
-                            .map(|percent| format!("{percent:.1}%"))
-                            .unwrap_or_else(|| "Percentage unknown".into()),
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
+                v_flex()
+                    .id("download-details-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .gap_3()
+                    .child(Label::new(format!("URL: {}", self.snapshot.source)))
                     .child(
-                        Button::new("details-disclosure")
-                            .label(if self.show_details {
-                                "Hide details"
-                            } else {
-                                "Show details"
-                            })
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.show_details = !view.show_details;
+                        TabBar::new("details-tabs")
+                            .selected_index(tab_index)
+                            .child(Tab::new().label("Download status"))
+                            .child(Tab::new().label("Speed limiter"))
+                            .child(Tab::new().label("Options on completion"))
+                            .on_click(cx.listener(|view, index, _, cx| {
+                                view.tab = match index {
+                                    1 => DetailsTab::SpeedLimiter,
+                                    2 => DetailsTab::Completion,
+                                    _ => DetailsTab::Status,
+                                };
                                 cx.notify();
                             })),
                     )
+                    .child(content)
                     .child(
-                        Button::new("details-pause")
-                            .label("Pause")
-                            .disabled(true)
-                            .tooltip("Pause and resume are not implemented"),
+                        Progress::new("details-overall-progress")
+                            .accessibility_label("Overall download progress")
+                            .loading(self.snapshot.active && percent.is_none())
+                            .value(percent.unwrap_or(0.0)),
                     )
                     .child(
-                        Button::new("details-cancel")
-                            .label(if self.snapshot.cancelling {
-                                "Cancelling…"
-                            } else {
-                                "Cancel"
+                        h_flex()
+                            .gap_2()
+                            .when(self.snapshot.active && percent.is_none(), |view| {
+                                view.child(Spinner::new())
                             })
-                            .disabled(!self.snapshot.active || self.snapshot.cancelling)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if view.snapshot.active && !view.snapshot.cancelling {
-                                    cx.emit(CancelDownload(view.snapshot.id));
-                                }
-                            })),
-                    ),
+                            .child(Label::new(
+                                percent
+                                    .map(|percent| format!("{percent:.1}%"))
+                                    .unwrap_or_else(|| "Percentage unknown".into()),
+                            )),
+                    )
+                    .child(
+                        Toolbar::new("details-transfer-actions")
+                            .h_auto()
+                            .content(
+                                Button::new("details-disclosure")
+                                    .label(if self.show_details {
+                                        "Hide details"
+                                    } else {
+                                        "Show details"
+                                    })
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.show_details = !view.show_details;
+                                        cx.notify();
+                                    })),
+                            )
+                            .content(
+                                Button::new("details-pause")
+                                    .label("Pause")
+                                    .disabled(true)
+                                    .tooltip("Pause and resume are not implemented"),
+                            )
+                            .content(
+                                Button::new("details-cancel")
+                                    .label(if self.snapshot.cancelling {
+                                        "Cancelling…"
+                                    } else {
+                                        "Cancel"
+                                    })
+                                    .disabled(!self.snapshot.active || self.snapshot.cancelling)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        if view.snapshot.active && !view.snapshot.cancelling {
+                                            cx.emit(CancelDownload(view.snapshot.id));
+                                        }
+                                    })),
+                            ),
+                    )
+                    .when(self.show_details, |view| {
+                        view.child(self.connection_content())
+                    }),
             )
-            .when(self.show_details, |view| {
-                view.child(self.connection_content(cx))
-            })
+            .child(Separator::horizontal())
             .child(
-                div().flex().justify_end().child(
-                    Button::new("details-close")
-                        .label("Close")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(CloseDetails))),
-                ),
+                Toolbar::new("details-window-actions")
+                    .h_auto()
+                    .justify_end()
+                    .flex_shrink_0()
+                    .content(
+                        Button::new("details-close")
+                            .label("Close")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(CloseDetails))),
+                    ),
             )
     }
 }
@@ -378,6 +385,51 @@ mod tests {
             cancelling: false,
             error: None,
         })
+    }
+
+    #[gpui::test]
+    fn telemetry_updates_preserve_view_state_and_skip_unchanged_notifications(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+
+        use gpui_kit::AppContext as _;
+
+        let notifications = Rc::new(Cell::new(0));
+        let (view, _subscription) = cx.update(|cx| {
+            let view = cx.new(|_| {
+                let mut view = details(None);
+                view.tab = super::DetailsTab::Completion;
+                view.show_details = false;
+                view
+            });
+            let count = notifications.clone();
+            let subscription = cx.observe(&view, move |_, _| count.set(count.get() + 1));
+            (view, subscription)
+        });
+        let original = cx.update(|cx| view.read(cx).snapshot.clone());
+        cx.update(|cx| view.update(cx, |view, cx| view.update(original.clone(), cx)));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 0);
+
+        let mut changed = original;
+        changed.progress = Some(DownloadProgress {
+            downloaded_bytes: 50,
+            total_bytes: Some(100),
+        });
+        changed.speed = Some(25.0);
+        cx.update(|cx| view.update(cx, |view, cx| view.update(changed.clone(), cx)));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1);
+        cx.update(|cx| view.update(cx, |view, cx| view.update(changed, cx)));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1);
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.tab == super::DetailsTab::Completion);
+            assert!(!view.show_details);
+            assert_eq!(view.percentage(), Some(50.0));
+        });
     }
 
     #[test]

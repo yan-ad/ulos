@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated: 2026-10-13. See [Status](STATUS.md) for implementation and verification evidence. No dates or speed targets are promised.
+Updated: 2026-10-14. See [Status](STATUS.md) for implementation and verification evidence. No dates or speed targets are promised.
 
 ## Milestone 1 — Workspace scaffold
 
@@ -19,11 +19,13 @@ No Linux/Windows runtime or visual/accessibility results are inferred from macOS
 **Implemented foundation; verification is tracked separately in [Status](STATUS.md).** Initialization was committed as `7bf99c6`; do not infer later commit or test outcomes from this roadmap.
 
 - Shared UI-independent `HttpDownloadTask`, bounded coalescing state, caller-supplied Tokio handle, and cancellation on drop.
-- Light IDM 6.28-inspired manager structure using GPUI Kit, native titlebar, in-window menu strip, icon-over-label toolbar, category tree, compact four-column table, and status bar. This supersedes the earlier dark AB reference, without copied branding/source or an exact-pixel-match promise.
+- Light IDM 6.28-inspired manager structure using GPUI Kit, native titlebar, in-window menu strip, icon-over-label toolbar, category tree, viewport-virtualized Kit DataTable with four data columns, and StatusBar. This supersedes the earlier dark AB reference, without copied branding/source or an exact-pixel-match promise.
 - Real 500-record session queue with one active HTTP transfer, FIFO advancement, presentation-only search/filter/sort, stable selection, metadata-only removal/clear, and finished-file reveal.
-- Add form with URL-path name suggestion, portable sanitization, native folder/save pickers, manual-name preservation, Start download / Download later.
-- Live same-window Details modal, real telemetry and one HTTP-stream row, Hide details, active cancellation, disabled Pause, and honest explanatory limiter/completion tabs.
-- Options copied-link detection: explicit off-by-default session opt-in, active-window one-second async checks, bounded one-URL proposals and fingerprint deduplication, no autonomous downloads or non-URL retention/logging.
+- Independent native Add windows (new draft per invocation, maximum 16) with URL-path name suggestion, portable sanitization, native folder/save pickers, manual-name preservation, Start download / Download later.
+- Native status windows (one reused/activated window per download, different IDs concurrent), real telemetry and one HTTP-stream row, Hide details, active cancellation, disabled Pause, and honest explanatory limiter/completion tabs.
+- Options copied-link detection: explicit off-by-default session opt-in, main-window-active one-second async checks suppressed by any Add/status window or Options dialog and rechecked after reads, bounded one-URL proposals and fingerprint deduplication, no autonomous downloads or non-URL retention/logging.
+- Kit-only widgets, text and panels, with layout-only Kit `div`/`v_flex`/`h_flex`; Options remains a Kit modal. Child roots own their inputs/subscriptions and a strong shared manager handle, while manager registries keep weak child content. Main close leaves children usable; last-window close quits. Picker guards prevent Add dismissal/submission while outstanding. Record removal closes related status windows without file deletion.
+- Change-gated 100ms watch observation and stale-rate refresh, unchanged-status snapshot suppression, and structural 500-record viewport/child-input render regressions. No measured latency or FPS claim.
 
 No persistent queue/history, resume, limiter, scheduler, site grabber, browser bridge, or completion actions are implemented. Scheduler/Grabber remain disabled. Keyboard/focus, accessibility, complete shutdown, and native Linux/Windows validation remain pending; a test adapter is not native-platform evidence.
 
@@ -63,5 +65,5 @@ Research engine suitability and licensing before selection; implement a separate
 
 - Linux distribution/version scope and package formats.
 - Browser families/channels and extension distribution method.
-- Final product name and license; dependency licenses do not license Ulos.
+- Final product name and dependency license/notice audit; Ulos is licensed under MIT.
 - OS baselines, accessibility acceptance criteria, and authenticated-download policy.

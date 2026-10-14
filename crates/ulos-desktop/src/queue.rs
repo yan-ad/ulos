@@ -372,13 +372,9 @@ impl SessionQueue {
             .sum()
     }
 
-    pub fn sort_by(&mut self, column: SortColumn) {
-        if self.sort == column {
-            self.descending = !self.descending;
-        } else {
-            self.sort = column;
-            self.descending = false;
-        }
+    pub fn set_sort(&mut self, column: SortColumn, descending: bool) {
+        self.sort = column;
+        self.descending = descending;
     }
 }
 
@@ -486,17 +482,17 @@ mod tests {
         let large = add(&mut queue, "a");
         queue.item_mut(small).unwrap().total_bytes = Some(1);
         queue.item_mut(large).unwrap().total_bytes = Some(2);
-        queue.sort_by(SortColumn::Size);
+        queue.set_sort(SortColumn::Size, false);
         assert_eq!(visible(&queue), vec![small, large, unknown]);
-        queue.sort_by(SortColumn::Size);
+        queue.set_sort(SortColumn::Size, true);
         assert_eq!(visible(&queue), vec![large, small, unknown]);
-        queue.sort_by(SortColumn::Name);
+        queue.set_sort(SortColumn::Name, false);
         assert!(!queue.descending);
         assert_eq!(visible(&queue), vec![small, large, unknown]);
         for item in &mut queue.items {
             item.added_at = SystemTime::UNIX_EPOCH;
         }
-        queue.sort_by(SortColumn::Added);
+        queue.set_sort(SortColumn::Added, false);
         assert_eq!(visible(&queue), vec![unknown, small, large]);
     }
 
@@ -509,7 +505,7 @@ mod tests {
         queue.filter = Filter::Category(Category::Document);
         assert!(!queue.all_visible_selected());
         queue.select_visible(true);
-        queue.sort_by(SortColumn::Name);
+        queue.set_sort(SortColumn::Name, false);
         assert_eq!(queue.selected, BTreeSet::from([image, document]));
         queue.select_visible(false);
         assert_eq!(queue.selected, BTreeSet::from([image]));
@@ -532,7 +528,7 @@ mod tests {
         assert!(queue.add("source".into(), "first".into()).is_err());
         queue.filter = Filter::Finished;
         queue.search = "missing".into();
-        queue.sort_by(SortColumn::Name);
+        queue.set_sort(SortColumn::Name, false);
         assert_eq!(queue.next_queued(), Some(second));
         queue
             .item_mut(first)

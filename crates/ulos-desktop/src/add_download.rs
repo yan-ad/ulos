@@ -2,10 +2,15 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable, WindowExt,
-        button::{Button, ButtonVariants},
+        Disableable, WindowExt,
+        button::Button,
         form::{Field, Form},
+        group_box::GroupBox,
         input::{Input, InputEvent, InputState},
+        label::Label,
+        separator::Separator,
+        toolbar::Toolbar,
+        v_flex,
     },
     *,
 };
@@ -240,18 +245,32 @@ impl AddDownload {
 
 impl Render for AddDownload {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().flex().flex_col().gap_3().text_color(cx.theme().foreground)
-            .child(Form::new()
-                .child(Field::new().label("Address").child(Input::new(&self.source).disabled(self.choosing_path)))
-                .child(Field::new().label("File name").description("Detected from the URL. Unsafe filename characters are replaced when saved.").child(Input::new(&self.filename).disabled(self.choosing_path)))
-                .child(Field::new().label("Save as").child(Input::new(&self.destination).disabled(self.choosing_path))))
-            .child(div().flex().gap_2()
-                .child(Button::new("choose-folder").label("Choose folder…").disabled(self.choosing_path).on_click(cx.listener(|view, _, window, cx| view.choose_folder(window, cx))))
-                .child(Button::new("choose-destination").label("Save as…").disabled(self.choosing_path).on_click(cx.listener(|view, _, window, cx| view.choose_path(window, cx)))))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("No overwrite. HTTP / HTTPS. Nothing is downloaded until you confirm."))
-            .child(div().flex().justify_end().gap_2()
-                .child(Button::new("close-add").label("Cancel").disabled(self.choosing_path).on_click(cx.listener(|_, _, _, cx| cx.emit(DismissAdd))))
-                .child(Button::new("enqueue-download").label("Download later").disabled(!self.can_submit(cx)).on_click(cx.listener(|view, _, _, cx| view.submit(false, cx))))
-                .child(Button::new("download-now").primary().label("Start download").disabled(!self.can_submit(cx)).on_click(cx.listener(|view, _, _, cx| view.submit(true, cx)))))
+        v_flex()
+            .size_full()
+            .p_4()
+            .gap_3()
+            .child(
+                v_flex()
+                    .id("add-download-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        GroupBox::new()
+                            .child(Form::new()
+                                .child(Field::new().label("Address").child(Input::new(&self.source).disabled(self.choosing_path)))
+                                .child(Field::new().label("File name").description("Detected from the URL. Unsafe filename characters are replaced when saved.").child(Input::new(&self.filename).disabled(self.choosing_path)))
+                                .child(Field::new().label("Save as").child(Input::new(&self.destination).disabled(self.choosing_path))))
+                            .child(Toolbar::new("destination-actions").h_auto()
+                                .content(Button::new("choose-folder").label("Choose folder…").disabled(self.choosing_path).on_click(cx.listener(|view, _, window, cx| view.choose_folder(window, cx))))
+                                .content(Button::new("choose-destination").label("Save as…").disabled(self.choosing_path).on_click(cx.listener(|view, _, window, cx| view.choose_path(window, cx)))))
+                            .footer(Label::new("No overwrite. HTTP / HTTPS. Nothing is downloaded until you confirm.")),
+                    ),
+            )
+            .child(Separator::horizontal())
+            .child(Toolbar::new("add-download-actions").h_auto().justify_end().flex_shrink_0()
+                .content(Button::new("close-add").label("Cancel").disabled(self.choosing_path).on_click(cx.listener(|_, _, _, cx| cx.emit(DismissAdd))))
+                .content(Button::new("enqueue-download").label("Download later").disabled(!self.can_submit(cx)).on_click(cx.listener(|view, _, _, cx| view.submit(false, cx))))
+                .content(Button::new("download-now").label("Start download").disabled(!self.can_submit(cx)).on_click(cx.listener(|view, _, _, cx| view.submit(true, cx)))))
     }
 }

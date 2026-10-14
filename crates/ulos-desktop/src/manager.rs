@@ -1,9 +1,13 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable, Sizable, WindowExt,
+        ActiveTheme, Disableable, WindowExt,
         input::{InputEvent, InputState},
+        table::{ColumnSort, TableEvent, TableState},
     },
     prelude::FluentBuilder as _,
     *,
@@ -11,14 +15,23 @@ use gpui_kit::{
 use ulos_core::tasks::{HttpDownloadTask, TransferState};
 
 use crate::{
-    add_download::{AddDownload, AddRequest, DismissAdd},
+    add_download::AddDownload,
     clipboard::ClipboardDetector,
-    download_details::{CancelDownload, CloseDetails, DetailsSnapshot, DownloadDetails},
+    download_details::{DetailsSnapshot, DownloadDetails},
+    download_table::{DownloadRow, DownloadTable},
     formatting,
-    queue::{DownloadId, Filter, SessionQueue},
+    native_windows::{ChildWindow, NativeAddWindow, StatusWindow, child_options},
+    queue::{DownloadId, Filter, SessionQueue, SortColumn},
 };
 
-actions!(download_manager, [AddUrl, StartQueue, StopAll]);
+actions!(
+    download_manager,
+    [AddUrl, StartQueue, StopAll, ToggleSidebar]
+);
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct MenuStateChanged;
+#[cfg(any(target_os = "macos", test))]
+impl EventEmitter<MenuStateChanged> for DownloadManager {}
 
 pub struct DownloadManager {
     queue: SessionQueue,
@@ -29,18 +42,23 @@ pub struct DownloadManager {
     focus: FocusHandle,
     runtime: tokio::runtime::Handle,
     transfer: Option<HttpDownloadTask>,
-    add_form: Option<Entity<AddDownload>>,
+    pub(crate) add_windows: BTreeMap<WindowId, ChildWindow<AddDownload>>,
+    pub(crate) detail_windows: BTreeMap<DownloadId, ChildWindow<DownloadDetails>>,
+    pub(crate) table: Entity<TableState<DownloadTable>>,
+    _window_closed: Subscription,
+    last_rate: Option<f64>,
     _subscriptions: Vec<Subscription>,
-    _add_subscription: Option<Subscription>,
-    _dismiss_subscription: Option<Subscription>,
     _updates: Option<Task<()>>,
-    details: Option<Entity<DownloadDetails>>,
-    _details_subscription: Option<Subscription>,
-    _details_close_subscription: Option<Subscription>,
     clipboard_enabled: bool,
     clipboard: ClipboardDetector,
     _clipboard_task: Option<Task<()>>,
     options_open: bool,
+    sidebar_collapsed: bool,
+    main_window: AnyWindowHandle,
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) native_menu_subscriptions: Vec<Subscription>,
+    #[cfg(test)]
+    render_count: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 impl DownloadManager {
@@ -53,8 +71,40 @@ impl DownloadManager {
         let subscription = cx.subscribe_in(&search, window, |view, input, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 view.queue.search = input.read(cx).value().to_string();
+                view.sync_table(cx);
                 cx.notify();
             }
+        });
+        let owner = cx.weak_entity();
+        let table = cx.new(|cx| {
+            TableState::new(DownloadTable::new(owner.clone()), window, cx)
+                .row_selectable(true)
+                .col_movable(false)
+        });
+        let table_subscription =
+            cx.subscribe_in(&table, window, |view, table, event, window, cx| {
+                let (TableEvent::SelectRow(row) | TableEvent::DoubleClickedRow(row)) = event else {
+                    return;
+                };
+                let Some(id) = table.read(cx).delegate().rows.get(*row).map(|row| row.id) else {
+                    return;
+                };
+                if matches!(event, TableEvent::DoubleClickedRow(_)) {
+                    view.open_details(id, window, cx);
+                } else {
+                    view.select_item(id, true, cx);
+                }
+            });
+        let owner = cx.weak_entity();
+        let window_closed = cx.on_window_closed(move |cx, closed| {
+            let owner = owner.clone();
+            cx.defer(move |cx| {
+                let _ = owner.update(cx, |view, _| {
+                    view.add_windows.remove(&closed);
+                    view.detail_windows
+                        .retain(|_, child| child.handle.window_id() != closed);
+                });
+            });
         });
         let clipboard_task = cx.spawn_in(window, async move |view, cx| {
             loop {
@@ -62,8 +112,8 @@ impl DownloadManager {
                 let enabled = view.update_in(cx, |view, window, _| {
                     view.clipboard_enabled
                         && window.is_window_active()
-                        && view.add_form.is_none()
-                        && view.details.is_none()
+                        && view.add_windows.is_empty()
+                        && view.detail_windows.is_empty()
                         && !view.options_open
                 });
                 match enabled {
@@ -94,23 +144,34 @@ impl DownloadManager {
             focus: cx.focus_handle(),
             runtime,
             transfer: None,
-            add_form: None,
-            _subscriptions: vec![subscription],
-            _add_subscription: None,
-            _dismiss_subscription: None,
+            add_windows: BTreeMap::new(),
+            detail_windows: BTreeMap::new(),
+            table,
+            _window_closed: window_closed,
+            last_rate: None,
+            _subscriptions: vec![subscription, table_subscription],
             _updates: None,
-            details: None,
-            _details_subscription: None,
-            _details_close_subscription: None,
             clipboard_enabled: false,
             clipboard: ClipboardDetector::default(),
             _clipboard_task: Some(clipboard_task),
             options_open: false,
+            sidebar_collapsed: false,
+            main_window: window.window_handle(),
+            #[cfg(any(target_os = "macos", test))]
+            native_menu_subscriptions: Vec::new(),
+            #[cfg(test)]
+            render_count: Default::default(),
         }
     }
 
     fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
         self.queue.filter = filter;
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
         cx.notify();
     }
 
@@ -124,77 +185,34 @@ impl DownloadManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.add_form.is_some() {
-            return;
-        }
-        let form = cx.new(|cx| AddDownload::new(window, cx));
-        if let Some(source) = source {
-            form.update(cx, |form, cx| form.prefill(source, window, cx));
-        }
-        self._add_subscription = Some(cx.subscribe_in(
-            &form,
-            window,
-            |view, _, request: &AddRequest, window, cx| match view.enqueue(
-                request.source.clone(),
-                request.destination.clone(),
-                request.start_now,
+        self.add_windows
+            .retain(|_, child| child.upgrade().is_some());
+        if self.add_windows.len() >= 16 {
+            window.push_notification(
+                "Close an Add window before opening another (maximum 16).",
                 cx,
-            ) {
-                Ok(id) => {
-                    view.close_add(window, cx);
-                    if request.start_now {
-                        view.open_details(id, window, cx);
-                    }
-                }
-                Err(error) => window.push_notification(error, cx),
-            },
-        ));
-        self._dismiss_subscription = Some(cx.subscribe_in(
-            &form,
-            window,
-            |view, _, _: &DismissAdd, window, cx| view.close_add(window, cx),
-        ));
-        let owner = cx.weak_entity();
-        let content = form.clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let owner = owner.clone();
-            let choosing = content.read(cx).choosing_path;
-            dialog
-                .title("Add a download")
-                .w(px(560.))
-                .child(content.clone())
-                .close_button(!choosing)
-                .keyboard(!choosing)
-                .overlay_closable(!choosing)
-                .on_close(move |_, _, cx| {
-                    let _ = owner.update(cx, |view, cx| {
-                        view.add_form = None;
-                        view._add_subscription = None;
-                        view._dismiss_subscription = None;
-                        cx.notify();
-                    });
-                })
-        });
-        self.add_form = Some(form);
-        cx.notify();
-    }
-
-    fn close_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .add_form
-            .as_ref()
-            .is_some_and(|form| form.read(cx).choosing_path)
-        {
+            );
             return;
         }
-        window.close_dialog(cx);
-        self.add_form = None;
-        self._add_subscription = None;
-        self._dismiss_subscription = None;
-        cx.notify();
+        let owner = cx.entity();
+        match gpui_kit::open_window(
+            child_options("Add a download", 560., 520., cx),
+            cx,
+            move |window, cx| cx.new(|cx| NativeAddWindow::new(owner, source, window, cx)),
+        ) {
+            Ok((handle, wrapper)) => {
+                let content = wrapper.read(cx).content.downgrade();
+                self.add_windows
+                    .insert(handle.window_id(), ChildWindow { handle, content });
+            }
+            Err(_) => window.push_notification("Could not open an Add window.", cx),
+        }
+        // Opening an independent window changes neither queue nor manager presentation.
+        #[cfg(any(target_os = "macos", test))]
+        cx.emit(MenuStateChanged);
     }
 
-    fn enqueue(
+    pub(crate) fn enqueue(
         &mut self,
         source: String,
         destination: std::path::PathBuf,
@@ -211,6 +229,7 @@ impl DownloadManager {
         } else {
             self.advance(cx);
         }
+        self.sync_table(cx);
         cx.notify();
         Ok(id)
     }
@@ -263,8 +282,13 @@ impl DownloadManager {
                     .await;
                 if view
                     .update(cx, |view, cx| {
-                        view.refresh_details(cx);
-                        cx.notify();
+                        let rate = view.measured_rate();
+                        if view.last_rate != rate {
+                            view.last_rate = rate;
+                            view.refresh_details(cx);
+                            view.sync_table(cx);
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -272,6 +296,9 @@ impl DownloadManager {
                 }
             }
         }));
+        self.last_rate = self.measured_rate();
+        self.refresh_details(cx);
+        self.sync_table(cx);
         cx.notify();
     }
 
@@ -283,7 +310,9 @@ impl DownloadManager {
         if let Some(item) = self.queue.item_mut(id) {
             item.apply_state(state, Instant::now());
         }
+        self.last_rate = self.measured_rate();
         self.refresh_details(cx);
+        self.sync_table(cx);
         if terminal {
             self.active = None;
             self.transfer = None;
@@ -335,6 +364,8 @@ impl DownloadManager {
             if let Some(task) = &mut self.transfer {
                 task.cancel();
             }
+            self.refresh_details(cx);
+            self.sync_table(cx);
             self.notice = Some(
                 "Cancellation requested. A file may exist if finalization had already started."
                     .into(),
@@ -354,6 +385,8 @@ impl DownloadManager {
 
     fn remove_selected(&mut self, cx: &mut Context<Self>) {
         let removed = self.queue.remove_selected();
+        self.close_orphaned_status_windows(cx);
+        self.sync_table(cx);
         self.notice = Some(format!(
             "Removed {removed} session record(s). Files were not deleted."
         ));
@@ -370,8 +403,8 @@ impl DownloadManager {
 
     fn offer_clipboard(&mut self, text: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         if !self.clipboard_enabled
-            || self.add_form.is_some()
-            || self.details.is_some()
+            || !self.add_windows.is_empty()
+            || !self.detail_windows.is_empty()
             || self.options_open
         {
             return;
@@ -412,10 +445,12 @@ impl DownloadManager {
     }
 
     fn refresh_details(&self, cx: &mut Context<Self>) {
-        if let Some(details) = &self.details
-            && let Some(snapshot) = self.snapshot(details.read(cx).snapshot.id)
-        {
-            details.update(cx, |view, cx| view.update(snapshot, cx));
+        for (&id, child) in &self.detail_windows {
+            if let Some(details) = child.upgrade()
+                && let Some(snapshot) = self.snapshot(id)
+            {
+                details.update(cx, |view, cx| view.update(snapshot, cx));
+            }
         }
     }
 
@@ -425,52 +460,106 @@ impl DownloadManager {
         }
     }
 
-    fn open_details(&mut self, id: DownloadId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.details.is_some() || self.add_form.is_some() || self.options_open {
+    pub(crate) fn open_details(
+        &mut self,
+        id: DownloadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(child) = self.detail_windows.get(&id)
+            && child.upgrade().is_some()
+            && child
+                .handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
             return;
         }
+        self.detail_windows.remove(&id);
         let Some(snapshot) = self.snapshot(id) else {
             return;
         };
         let title = format!("Download — {}", snapshot.name);
-        let details = cx.new(|_| DownloadDetails::new(snapshot));
-        self._details_subscription = Some(cx.subscribe(
-            &details,
-            |view, _, event: &CancelDownload, cx| {
-                if view.active == Some(event.0) {
-                    view.cancel_active(cx);
-                }
-                view.refresh_details(cx);
-            },
-        ));
-        self._details_close_subscription =
-            Some(
-                cx.subscribe_in(&details, window, |view, _, _: &CloseDetails, window, cx| {
-                    window.close_dialog(cx);
-                    view.details = None;
-                    view._details_subscription = None;
-                    view._details_close_subscription = None;
-                    cx.notify();
-                }),
-            );
-        let owner = cx.weak_entity();
-        let content = details.clone();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let owner = owner.clone();
-            dialog
-                .title(title.clone())
-                .w(px(620.))
-                .child(content.clone())
-                .on_close(move |_, _, cx| {
-                    let _ = owner.update(cx, |view, cx| {
-                        view.details = None;
-                        view._details_subscription = None;
-                        view._details_close_subscription = None;
-                        cx.notify();
-                    });
-                })
+        let owner = cx.entity();
+        match gpui_kit::open_window(
+            child_options(&title, 680., 640., cx),
+            cx,
+            move |window, cx| cx.new(|cx| StatusWindow::new(owner, snapshot, window, cx)),
+        ) {
+            Ok((handle, wrapper)) => {
+                let content = wrapper.read(cx).content.downgrade();
+                self.detail_windows
+                    .insert(id, ChildWindow { handle, content });
+            }
+            Err(_) => window.push_notification("Could not open a download window.", cx),
+        }
+        #[cfg(any(target_os = "macos", test))]
+        cx.emit(MenuStateChanged);
+    }
+
+    pub(crate) fn cancel_id(&mut self, id: DownloadId, cx: &mut Context<Self>) {
+        if self.active == Some(id) {
+            self.cancel_active(cx);
+        }
+    }
+
+    fn measured_rate(&self) -> Option<f64> {
+        self.queue
+            .items
+            .iter()
+            .filter_map(|item| item.speed_bytes_per_second())
+            .reduce(|a, b| a + b)
+    }
+
+    pub(crate) fn sync_table(&mut self, cx: &mut Context<Self>) {
+        let rows = self
+            .queue
+            .visible()
+            .into_iter()
+            .map(|item| DownloadRow {
+                id: item.id,
+                name: item.name(),
+                category: item.category,
+                size: item.total_bytes,
+                status: item.status().into(),
+                rate: item.speed_bytes_per_second(),
+                selected: self.queue.selected.contains(&item.id),
+                destination: item.destination.clone(),
+            })
+            .collect();
+        let all_selected = self.queue.all_visible_selected();
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().rows = rows;
+            table.delegate_mut().header_all_selected = all_selected;
+            cx.notify();
         });
-        self.details = Some(details);
+    }
+
+    pub(crate) fn select_item(&mut self, id: DownloadId, selected: bool, cx: &mut Context<Self>) {
+        self.queue.select(id, selected);
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn select_visible(&mut self, selected: bool, cx: &mut Context<Self>) {
+        self.queue.select_visible(selected);
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn sort_table(
+        &mut self,
+        column: SortColumn,
+        sort: ColumnSort,
+        cx: &mut Context<Self>,
+    ) {
+        let column = if sort == ColumnSort::Default {
+            SortColumn::Added
+        } else {
+            column
+        };
+        self.queue.set_sort(column, sort == ColumnSort::Descending);
+        self.sync_table(cx);
         cx.notify();
     }
 
@@ -484,12 +573,30 @@ impl DownloadManager {
             .collect();
         self.queue.items.retain(|item| !keep.contains(&item.id));
         self.queue.selected.retain(|id| !keep.contains(id));
+        self.close_orphaned_status_windows(cx);
+        self.sync_table(cx);
         self.notice = Some("Cleared finished records. Downloaded files were not deleted.".into());
         cx.notify();
     }
 
+    fn close_orphaned_status_windows(&mut self, cx: &mut Context<Self>) {
+        let removed: Vec<_> = self
+            .detail_windows
+            .keys()
+            .copied()
+            .filter(|id| self.queue.item(*id).is_none())
+            .collect();
+        for id in removed {
+            if let Some(child) = self.detail_windows.remove(&id) {
+                let _ = child
+                    .handle
+                    .update(cx, |_, window, _| window.remove_window());
+            }
+        }
+    }
+
     fn open_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.add_form.is_some() || self.details.is_some() || self.options_open {
+        if self.options_open {
             return;
         }
         self.options_open = true;
@@ -498,14 +605,95 @@ impl DownloadManager {
             let enabled = owner.read_with(cx, |view, _| view.clipboard_enabled).unwrap_or(false);
             let change_owner = owner.clone();
             let close_owner = owner.clone();
-            dialog.title("Options").w(px(480.)).child(div().flex().flex_col().gap_3()
+            dialog.title("Options").w(px(480.)).child(gpui_kit::component::group_box::GroupBox::new()
                 .child(gpui_kit::component::checkbox::Checkbox::new("clipboard-enabled").label("Detect copied HTTP / HTTPS links").checked(enabled)
                     .on_change(move |checked, _, cx| { let _ = change_owner.update(cx, |view, cx| { view.clipboard_enabled = *checked; cx.notify(); }); }))
-                .child("Opt-in, this session only. Checked while the Ulos window is active. Links open a confirmation dialog; they never download automatically.")
-                .child("Clipboard contents are not logged or saved. Wayland clipboard access depends on the compositor."))
+                .child(gpui_kit::component::label::Label::new("Opt-in, this session only. Checked while the Ulos window is active. Links open a confirmation window; they never download automatically."))
+                .child(gpui_kit::component::label::Label::new("Clipboard contents are not logged or saved. Wayland clipboard access depends on the compositor.")))
                 .on_close(move |_, _, cx| { let _ = close_owner.update(cx, |view, cx| { view.options_open = false; cx.notify(); }); })
         });
         cx.notify();
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl DownloadManager {
+    pub(crate) fn menu_state(&self, cx: &App) -> crate::native_menu::MenuState {
+        use crate::native_menu::MenuState;
+        MenuState {
+            can_add: self.add_windows.len() < 16,
+            can_start: !self.queue_running && self.queue.next_queued().is_some(),
+            queue_running: self.queue_running,
+            can_stop: self.active.is_some(),
+            selected_active: self
+                .queue
+                .items
+                .iter()
+                .any(|item| self.queue.selected.contains(&item.id) && item.is_active()),
+            removable: self
+                .queue
+                .items
+                .iter()
+                .any(|item| self.queue.selected.contains(&item.id) && !item.is_active()),
+            finished: self.queue.items.iter().any(|item| item.is_finished()),
+            selected: self
+                .queue
+                .selected
+                .iter()
+                .any(|id| self.queue.item(*id).is_some()),
+            revealable: self
+                .queue
+                .items
+                .iter()
+                .any(|item| self.queue.selected.contains(&item.id) && item.is_finished()),
+            can_options: !self.options_open
+                && self.add_windows.is_empty()
+                && self.detail_windows.is_empty()
+                && cx.windows().contains(&self.main_window),
+            dark: cx.theme().is_dark(),
+            filter: self.queue.filter,
+            sidebar_collapsed: self.sidebar_collapsed,
+        }
+    }
+
+    pub(crate) fn run_menu_command(
+        &mut self,
+        command: crate::native_menu::Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::native_menu::Command;
+        if !command.enabled(&self.menu_state(cx)) {
+            return;
+        }
+        match command {
+            Command::Add => self.open_add(window, cx),
+            Command::Start => self.start_queue(cx),
+            Command::StopQueue => self.stop_queue(cx),
+            Command::StopAll => self.stop_all(cx),
+            Command::StopSelected => self.stop_selected(cx),
+            Command::Remove => self.remove_selected(cx),
+            Command::Clear => self.clear_finished(cx),
+            Command::Options => self.open_options(window, cx),
+            Command::Details => self.open_selected_details(window, cx),
+            Command::Reveal => self.reveal_selected(cx),
+            Command::All => self.set_filter(Filter::All, cx),
+            Command::Finished => self.set_filter(Filter::Finished, cx),
+            Command::Unfinished => self.set_filter(Filter::Unfinished, cx),
+            Command::Queued => self.set_filter(Filter::Queued, cx),
+            Command::ToggleSidebar => self.toggle_sidebar(cx),
+            Command::LightTheme | Command::DarkTheme => {
+                crate::palette::apply(if command == Command::DarkTheme { gpui_kit::component::ThemeMode::Dark } else { gpui_kit::component::ThemeMode::Light }, cx);
+                cx.notify();
+            }
+            Command::Help => window.open_dialog(cx, |dialog, _, _| {
+                use gpui_kit::component::{group_box::GroupBox, label::Label};
+                dialog.title("Ulos Help").child(GroupBox::new()
+                    .child(Label::new("Add URL opens a new download window. Choose a destination and confirm to start, or queue for later."))
+                    .child(Label::new("Queue order is FIFO. Stop Queue lets the active file finish; Stop All requests cancellation. Removing records never deletes downloaded files."))
+                    .child(Label::new("Click a filename or choose Details to open its native status window. Queue history and clipboard preferences are session-only.")))
+            }),
+        }
     }
 }
 
