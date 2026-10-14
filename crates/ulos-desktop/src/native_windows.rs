@@ -94,7 +94,7 @@ impl NativeAddWindow {
         Self {
             content,
             _owner: owner,
-            _subscriptions: vec![submit, dismiss],
+            _subscriptions: vec![submit, dismiss, crate::palette::observe_window(window, cx)],
         }
     }
 }
@@ -135,7 +135,7 @@ impl StatusWindow {
         Self {
             content,
             _owner: owner,
-            _subscriptions: vec![cancel, close],
+            _subscriptions: vec![cancel, close, crate::palette::observe_window(window, cx)],
         }
     }
 }

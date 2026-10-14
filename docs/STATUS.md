@@ -16,6 +16,7 @@ Updated: 2026-10-14. Local host: macOS 27.0.1, Apple Silicon, Rust/Cargo 1.98.1.
 - Progress/state observation is bounded and latest-state/coalesced. Unchanged polling no longer invalidates the manager; rate expiry triggers presentation refresh only when the displayed rate changes. Unchanged status snapshots do not notify their view. DataTable builds viewport cells rather than all 500 records. No network/filesystem work occurs in rendering.
 - macOS Tasks/File/Edit/Downloads/View/Help menus now use the system menu bar through Kit's native Menu API. Linux/Windows retain Kit dropdown menus. Search shares the compact command toolbar; only Add URL has a visible action label. Other toolbar actions use stock icon-only Kit Buttons with managed Kit tooltips and accessible names.
 - Buttons, Inputs and Checkboxes retain stock Kit appearance. Removed per-control variants/sizes and custom palette overrides. Toolbar content slots preserve default control styling rather than applying the toolbar's automatic compact/ghost preparation. Table row allocation accommodates stock filename Buttons without changing those Buttons.
+- Sidebar uses stock Kit groups: Downloads (All, Finished, Unfinished, Queue) and File types (seven category filters). A default Kit icon Button toggles the stock Sidebar between expanded labels/counts and an icon rail with built-in hover labels. Collapse is session-only and does not alter queue/filter/search/selection state.
 
 ## Module map
 
@@ -32,7 +33,7 @@ ulos-desktop/download_table.rs  snapshot-backed virtualized Kit table
 ulos-desktop/native_windows.rs  native roots and child-context subscriptions
 ulos-desktop/native_menu.rs     guarded native commands and cached menu state
 ulos-desktop/clipboard.rs       bounded URL proposal/deduplication
-ulos-desktop/palette.rs         light/default and optional dark theme
+ulos-desktop/palette.rs         System-default preference and stock Light/Dark themes
 ```
 
 ## Verification
@@ -98,7 +99,25 @@ These results supersede the earlier desktop failures, formatting differences and
 - Workspace Clippy with `-D warnings`, formatting check, and desktop build passed. Named-window-only native screenshot review confirmed the integrated toolbar/traffic lights and absence of the separate dark title strip. The window's captured native height is 760px, matching content bounds rather than the prior content-plus-titlebar height. Review process stopped afterward.
 - This is macOS rendering evidence, not a Windows/Linux or native screen-reader pass. No commit/push performed.
 
-## Next
+### Stock grouped sidebar and toggle (2026-10-14, latest)
+
+- Added a stock icon-only toggle before Add URL, with a changing accessible name and Kit tooltip. View offers the same command; Cmd/Ctrl+B toggles from the manager context. macOS native View command also routes from a surviving child window.
+- Stock SidebarGroup components replace the nested category tree with Downloads and File types groups. All eleven filters remain present in the collapsed icon rail; expanded suffix counts are real session counts, and accessibility labels include those counts. No Sidebar/Button/Input/Checkbox custom styling was added. The specialized SidebarToggleButton was not used because it internally forces compact/ghost styling.
+- `cargo test --locked --workspace`: **104 passed** (44 core/CLI, 60 desktop/model/menu/window tests). Workspace Clippy with `-D warnings`, formatting check, desktop build and diff whitespace checks passed.
+- Four added regressions cover actual toggle-button clicks, 255px expanded/48px collapsed geometry, search/selection/FIFO preservation, controller filtering while collapsed, manager shortcut and native child menu dispatch, and both stock themes at 880 × 540. Geometry fixtures use GPUI's public reduced-motion setting; production retains Kit's standard collapse transition. Collapsed filter invocation is controller-tested, not a native item-click or screen-reader navigation claim.
+- Production app startup produced no captured errors. Two scoped native screenshot attempts failed with `could not create image from window`; no native visual pass is claimed for this update, and no permissions were changed. The review process was stopped. Existing native screen-reader/arrow navigation and Windows/Linux review remain pending.
+- No commit or push performed.
+
+### System-default appearance and theme choices (2026-10-14, latest)
+
+- Startup defaults to **Follow system**. A stock toolbar theme-selector Button/DropdownMenu and native/fallback View menus offer Follow system, Light, and Dark. Monitor/Sun/Moon icons and checked choices represent the preference, not merely the effective colors. All components still use stock Kit colors and control styling.
+- System clears an application appearance override and follows retained appearance observers in the manager, Add, and status windows. Manual Light/Dark choices set the application override and ignore OS appearance callbacks until System is chosen again. Preference applies across windows and survives main-window closure while children remain; it is session-only and resets to System on restart.
+- `cargo test --locked --workspace`: **110 passed** (44 core/CLI, 66 desktop/menu/theme/model/window tests). Workspace Clippy with `-D warnings`, formatting check, build, and diff whitespace checks passed.
+- Added resolver/handler and integration coverage for System-default startup, light/dark/vibrant appearance resolution, manual override stability, returning to System, exclusively checked native choices, theme selector at 880 × 540, shared stock colors across child roots, preserved drafts, and System command after main close. Tests call the application appearance handler: the external Kit test API does not expose platform appearance simulation. No host OS appearance settings were changed.
+- Native startup produced no captured errors; the named-window screenshot attempt failed (`could not create image from window`). No new native visual or real OS-switch pass is claimed. Review process stopped and permissions left unchanged. OS/compositor appearance-event delivery, screen-reader behavior and Windows/Linux native rendering remain unverified.
+- No commit or push performed; existing upstream `block 0.1.6` future-compatibility warning remains.
+
+## Next work
 
 1. Native accessibility/keyboard and Linux compositor/GPU tests.
 2. Persistent queue, checkpoint durability and recovery.

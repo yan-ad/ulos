@@ -9,7 +9,7 @@ The project is in early development. Single-stream downloads and a session-based
 - HTTP/HTTPS downloads streamed to disk without buffering the entire file in memory.
 - Unique temporary files beside the destination, response-length checks when available, and publication without overwriting existing files.
 - Cancellation through the CLI or desktop interface, with best-effort temporary-file cleanup.
-- A desktop manager with native macOS system menus (Ulos, Tasks, File, Edit, Downloads, View, Help); non-macOS retains in-window Kit dropdown menus. One shared action toolbar has stock icon-only Buttons except the labeled Add URL button, accessible names, built-in tooltips, and a stock search Input on the same row. Categories and a viewport-virtualized Kit DataTable show filename, size, status, and transfer rate, with stable-ID selection checkboxes. Stock Kit light theme is the default, with optional stock dark theme.
+- A desktop manager with native macOS system menus (Ulos, Tasks, File, Edit, Downloads, View, Help); non-macOS retains in-window Kit dropdown menus. One shared action toolbar has stock icon-only Buttons except the labeled Add URL button, accessible names, built-in tooltips, and a stock search Input on the same row. A collapsible stock Kit sidebar and a viewport-virtualized Kit DataTable show filename, size, status, and transfer rate, with stable-ID selection checkboxes. The default follows system appearance; the toolbar theme selector and View menu offer Follow system, Light, and Dark using stock Kit themes.
 - A session queue capped at 500 records, with one active transfer and FIFO queue advancement. Search, filtering, sorting, and selection do not change queue order.
 - Independent native Add Download windows (new draft per invocation, up to 16) with editable URL, filename, and destination, native folder/save pickers, and options to start now or queue for later.
 - Filename suggestions from the URL path, sanitized into a portable single filename. Naming does not make a network request.
@@ -40,6 +40,8 @@ cargo run --locked -p ulos-desktop
 Use **Add URL** to enter an HTTP/HTTPS address, review the suggested filename, and choose a destination. Choose **Start download** to start immediately when idle, or **Download later** to add the item without starting a stopped queue. If the queue is already running, it can still process items added for later.
 
 On macOS, **⌘N** opens Add Download, **⌘,** opens Options when available, and **⌘Q** quits. Native Edit commands target the focused Kit input.
+
+The sidebar starts expanded each session. Its Downloads group contains All downloads, Finished, Unfinished, and Queue; File types contains seven flat filters: Image, Music, Video, Apps, Document, Compressed, and Other. Expanded items show real session counts; collapsed items use Kit’s icon rail and tooltips, with counts retained in accessible names. Use the stock icon button immediately before Add URL, **⌘B / Ctrl+B** in the manager, or View’s sidebar command. Collapse does not reset search, filtering, selection, or FIFO order, and is not persisted.
 
 The main macOS window extends the manager into the titlebar area, with native window controls beside the action toolbar and no separate visible Ulos title strip. Add/status windows retain their native titles.
 
@@ -124,3 +126,7 @@ Tests use local HTTP fixtures and temporary files. Changes to transfers should c
 Copyright (c) 2026 Ulos Download Manager contributors.
 
 Ulos Download Manager is licensed under the [MIT License](LICENSE). Dependencies retain their respective licenses and notices.
+
+### Appearance
+
+Ulos starts in **Follow system** mode and responds to appearance changes while running. Use the monitor/sun/moon toolbar button or **View** to choose **Follow system**, **Light**, or **Dark**. Explicit Light/Dark choices remain fixed until changed. This session-only preference applies to manager, Add, and status windows; it resets to Follow system on the next launch. No custom control colors are applied.

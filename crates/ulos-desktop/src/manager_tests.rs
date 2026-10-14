@@ -1937,3 +1937,564 @@ fn native_menu_state_events_do_not_notify_the_manager_view(cx: &mut TestAppConte
     assert_eq!(states.borrow().len(), 2);
     assert_eq!(notifications.get(), 0);
 }
+
+// Sidebar widths are Kit's public defaults, not application-specific test sizing.
+fn settle_sidebar(cx: &mut VisualTestContext) {
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    draw(cx);
+    cx.executor().advance_clock(Duration::from_millis(250));
+    draw(cx);
+}
+
+fn click_sidebar_toggle(cx: &mut VisualTestContext) {
+    let bounds = cx.debug_bounds("toggle-sidebar").expect("sidebar toggle");
+    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+    settle_sidebar(cx);
+}
+
+fn assert_sidebar_width(cx: &mut VisualTestContext, width: f32) {
+    let bounds = cx.debug_bounds("manager-sidebar").expect("sidebar wrapper");
+    assert!(
+        (bounds.size.width - gpui_kit::px(width)).abs() <= gpui_kit::px(1.),
+        "Expected sidebar width {width}, got {}",
+        bounds.size.width.as_f32()
+    );
+}
+
+fn assert_sidebar_menu_label(
+    view: &Entity<DownloadManager>,
+    cx: &VisualTestContext,
+    expected: &str,
+) {
+    view.read_with(cx, |view, cx| {
+        let menus = crate::native_menu::menus(&view.menu_state(cx));
+        let menu = menus
+            .iter()
+            .find(|menu| menu.name.as_ref() == "View")
+            .unwrap();
+        let gpui_kit::MenuItem::Action { name, disabled, .. } = &menu.items[0] else {
+            panic!("View starts with the sidebar action")
+        };
+        assert_eq!(name.as_ref(), expected);
+        assert!(!disabled);
+    });
+}
+
+#[gpui::test]
+fn sidebar_mouse_toggle_restores_geometry_without_changing_queue_state(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    // Queue-only entries intentionally have invalid URLs: no HTTP task is started.
+    let (first, second) = queued_pair(
+        &view,
+        cx,
+        "invalid first URL".into(),
+        "invalid second URL".into(),
+        directory.path(),
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.queue.select(second, true);
+            view.search.update(cx, |input, cx| input.focus(window, cx));
+            view.set_filter(Filter::Queued, cx);
+        });
+    });
+    draw(cx);
+    cx.simulate_input("first");
+    settle_sidebar(cx);
+    assert_sidebar_width(cx, 255.);
+    for collapsed in [true, false] {
+        click_sidebar_toggle(cx);
+        assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.sidebar_collapsed, collapsed);
+            assert_eq!(
+                view.queue.selected,
+                std::collections::BTreeSet::from([second])
+            );
+            assert_eq!(view.queue.search, "first");
+            assert_eq!(view.search.read(cx).value().as_ref(), "first");
+            assert_eq!(view.queue.filter, Filter::Queued);
+            assert_eq!(view.queue.next_queued(), Some(first));
+            assert_eq!(view.queue.items.len(), 2);
+            assert!(view.queue.items.iter().all(|item| item.is_queued()));
+            assert!(view.active.is_none());
+            assert!(!view.queue_running);
+        });
+    }
+}
+
+#[gpui::test]
+fn sidebar_collapsed_filter_survives_expansion_without_resetting_selection(
+    cx: &mut TestAppContext,
+) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (image, document) = view.update(cx, |view, cx| {
+        let image = view
+            .enqueue(
+                "invalid image URL".into(),
+                directory.path().join("photo.png"),
+                false,
+                cx,
+            )
+            .unwrap();
+        let document = view
+            .enqueue(
+                "invalid document URL".into(),
+                directory.path().join("notes.pdf"),
+                false,
+                cx,
+            )
+            .unwrap();
+        view.queue.select(document, true);
+        view.sync_table(cx);
+        (image, document)
+    });
+    draw(cx);
+    click_sidebar_toggle(cx);
+    assert_sidebar_width(cx, 48.);
+    // This application enables GPUI's test support, but not Kit/Base's
+    // optional observation registry. SidebarMenuItem's generated IDs therefore
+    // have no public bounds hook here. Exercise the real filter callback while
+    // collapsed rather than guessing rail coordinates or adding UI selectors.
+    view.update(cx, |view, cx| view.set_filter(Filter::Queued, cx));
+    draw(cx);
+    view.read_with(cx, |view, _| assert_eq!(view.queue.filter, Filter::Queued));
+    view.update(cx, |view, cx| {
+        view.set_filter(Filter::Category(crate::queue::Category::Image), cx)
+    });
+    draw(cx);
+    for collapsed in [true, false] {
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_collapsed, collapsed);
+            assert_eq!(
+                view.queue.filter,
+                Filter::Category(crate::queue::Category::Image)
+            );
+            assert_eq!(
+                view.queue
+                    .visible()
+                    .iter()
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>(),
+                vec![image]
+            );
+            assert_eq!(
+                view.queue.selected,
+                std::collections::BTreeSet::from([document])
+            );
+            assert_eq!(view.queue.next_queued(), Some(image));
+            assert_eq!(view.queue.items.len(), 2);
+            assert!(view.active.is_none());
+        });
+        if collapsed {
+            click_sidebar_toggle(cx);
+            assert_sidebar_width(cx, 255.);
+        }
+    }
+}
+
+#[gpui::test]
+fn sidebar_keyboard_from_search_and_native_action_from_child_share_state(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let _menus = cx.update(|window, cx| {
+        // Test windows do not execute main's application binding setup.
+        cx.bind_keys([gpui_kit::KeyBinding::new(
+            "secondary-b",
+            super::ToggleSidebar,
+            Some("DownloadManager"),
+        )]);
+        crate::native_menu::install(cx, view.downgrade(), window.window_handle())
+    });
+    cx.update(|window, cx| {
+        window.activate_window();
+        view.read(cx).search.clone().update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+    });
+    draw(cx);
+    cx.simulate_input("alpha");
+    draw(cx);
+    assert_sidebar_menu_label(&view, cx, "Collapse Sidebar");
+    for collapsed in [true, false] {
+        cx.simulate_keystrokes("secondary-b");
+        settle_sidebar(cx);
+        assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.sidebar_collapsed, collapsed);
+            assert_eq!(view.search.read(cx).value().as_ref(), "alpha");
+            assert_eq!(view.queue.search, "alpha");
+        });
+        assert_sidebar_menu_label(
+            &view,
+            cx,
+            if collapsed {
+                "Expand Sidebar"
+            } else {
+                "Collapse Sidebar"
+            },
+        );
+    }
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_add(window, cx)));
+    draw(cx);
+    let mut child = add_context(&view, cx);
+    child.update(|window, _| window.activate_window());
+    draw(&mut child);
+    for collapsed in [true, false] {
+        child.dispatch_action(crate::native_menu::ToggleDownloadsSidebar);
+        draw(&mut child);
+        settle_sidebar(cx);
+        assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+        assert_sidebar_menu_label(
+            &view,
+            cx,
+            if collapsed {
+                "Expand Sidebar"
+            } else {
+                "Collapse Sidebar"
+            },
+        );
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.sidebar_collapsed, collapsed);
+            assert_eq!(view.search.read(cx).value().as_ref(), "alpha");
+            assert_eq!(view.add_windows.len(), 1);
+            assert!(view.queue.items.is_empty());
+            assert!(view.active.is_none());
+        });
+    }
+}
+
+#[gpui::test]
+fn sidebar_empty_light_and_dark_layout_stays_in_one_row_at_minimum_size(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let (_root, view, cx) = mount(cx, &runtime);
+    cx.simulate_resize(gpui_kit::size(gpui_kit::px(880.), gpui_kit::px(540.)));
+    for mode in [
+        gpui_kit::component::ThemeMode::Light,
+        gpui_kit::component::ThemeMode::Dark,
+    ] {
+        cx.update(|_, cx| crate::palette::apply(mode, cx));
+        settle_sidebar(cx);
+        for collapsed in [false, true, false] {
+            if view.read_with(cx, |view, _| view.sidebar_collapsed) != collapsed {
+                click_sidebar_toggle(cx);
+            }
+            assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+            let search = cx.debug_bounds("download-search").expect("search wrapper");
+            let toggle = cx.debug_bounds("toggle-sidebar").expect("sidebar toggle");
+            let options = cx.debug_bounds("options").expect("options button");
+            assert!((toggle.center().y - search.center().y).abs() <= gpui_kit::px(1.));
+            assert!((options.center().y - search.center().y).abs() <= gpui_kit::px(1.));
+            assert!(toggle.right() <= search.left());
+            assert!(options.right() <= search.left());
+            assert!(options.right() <= gpui_kit::px(880.));
+            #[cfg(target_os = "macos")]
+            assert!(
+                toggle.left() >= gpui_kit::px(80.),
+                "native traffic lights remain clear"
+            );
+            let sidebar = cx.debug_bounds("manager-sidebar").expect("sidebar wrapper");
+            assert!(sidebar.bottom() <= gpui_kit::px(540.));
+            view.read_with(cx, |view, _| {
+                assert!(view.queue.items.is_empty());
+                assert_eq!(view.queue.filter, Filter::All);
+                assert!(!view.queue_running);
+            });
+        }
+    }
+}
+
+// These tests call the application's appearance callback directly. TestWindow
+// does not expose OS appearance-event injection or Kit's private popup state.
+fn assert_theme_menu_preference(
+    state: &crate::native_menu::MenuState,
+    expected: crate::palette::ThemePreference,
+) {
+    use crate::palette::ThemePreference;
+    let menus = crate::native_menu::menus(state);
+    let menu = menus
+        .iter()
+        .find(|menu| menu.name.as_ref() == "View")
+        .unwrap();
+    for (label, preference) in [
+        ("Follow System", ThemePreference::System),
+        ("Light Theme", ThemePreference::Light),
+        ("Dark Theme", ThemePreference::Dark),
+    ] {
+        let item = menu
+            .items
+            .iter()
+            .find(|item| matches!(item, gpui_kit::MenuItem::Action { name, .. } if name.as_ref() == label))
+            .expect("named theme menu action");
+        assert_eq!(item.is_checked(), preference == expected);
+        assert!(!item.is_disabled());
+    }
+}
+
+fn assert_stock_theme(cx: &gpui_kit::App, mode: gpui_kit::component::ThemeMode) {
+    use gpui_kit::component::{Theme, ThemeColor};
+    assert_eq!(Theme::global(cx).mode, mode);
+    let colors = if mode.is_dark() {
+        ThemeColor::dark()
+    } else {
+        ThemeColor::light()
+    };
+    assert_eq!(Theme::global(cx).colors.background, colors.background);
+    assert_eq!(Theme::global(cx).colors.foreground, colors.foreground);
+}
+
+#[gpui::test]
+fn theme_preference_defaults_to_system_and_native_checks_follow_preference(
+    cx: &mut TestAppContext,
+) {
+    use crate::palette::{self, ThemePreference};
+    use gpui_kit::component::ThemeMode;
+    let runtime = runtime();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let _menus = cx.update(|window, cx| {
+        crate::native_menu::install(cx, view.downgrade(), window.window_handle())
+    });
+    cx.update(|_, cx| {
+        assert_eq!(palette::preference(cx), ThemePreference::System);
+        assert_stock_theme(cx, ThemeMode::from(cx.window_appearance()));
+    });
+    assert_eq!(ThemePreference::System.label(), "Follow system");
+    assert!(cx.debug_bounds("theme-selector").is_some());
+    cx.update(|_, cx| palette::appearance_changed(gpui_kit::WindowAppearance::Dark, cx));
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_stock_theme(cx, ThemeMode::Dark);
+        assert!(view.menu_state(cx).dark);
+        assert_theme_menu_preference(&view.menu_state(cx), ThemePreference::System);
+    });
+    cx.dispatch_action(crate::native_menu::UseLightTheme);
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(palette::preference(cx), ThemePreference::Light);
+        assert_stock_theme(cx, ThemeMode::Light);
+        assert_theme_menu_preference(&view.menu_state(cx), ThemePreference::Light);
+    });
+    cx.dispatch_action(crate::native_menu::UseDarkTheme);
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(palette::preference(cx), ThemePreference::Dark);
+        assert_stock_theme(cx, ThemeMode::Dark);
+        assert_theme_menu_preference(&view.menu_state(cx), ThemePreference::Dark);
+    });
+    cx.dispatch_action(crate::native_menu::UseSystemTheme);
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(palette::preference(cx), ThemePreference::System);
+        assert_stock_theme(cx, ThemeMode::from(cx.window_appearance()));
+        assert_theme_menu_preference(&view.menu_state(cx), ThemePreference::System);
+    });
+}
+
+#[gpui::test]
+fn system_theme_callback_updates_shared_native_roots_without_losing_add_drafts(
+    cx: &mut TestAppContext,
+) {
+    use crate::palette::{self, ThemePreference};
+    use gpui_kit::{WindowAppearance, component::ThemeMode};
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = view.update(cx, |view, cx| {
+        view.enqueue(
+            "https://example.org/queued-theme.zip".into(),
+            directory.path().join("queued-theme.zip"),
+            false,
+            cx,
+        )
+        .unwrap()
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_add(window, cx);
+            view.open_add(window, cx);
+            view.open_details(id, window, cx);
+        })
+    });
+    draw(cx);
+    let forms = view.read_with(cx, |view, _| {
+        assert_eq!(view.add_windows.len(), 2);
+        view.add_windows
+            .values()
+            .map(|child| (child.handle, child.upgrade().unwrap()))
+            .collect::<Vec<_>>()
+    });
+    for (index, (handle, form)) in forms.iter().enumerate() {
+        let mut child = VisualTestContext::from_window(*handle, &cx.cx);
+        child.update(|window, cx| {
+            form.update(cx, |form, cx| {
+                form.prefill(format!("https://example.org/draft-{index}.zip"), window, cx)
+            })
+        });
+        draw(&mut child);
+    }
+    let drafts = forms
+        .iter()
+        .map(|(_, form)| {
+            form.read_with(cx, |form, cx| {
+                (
+                    form.source.read(cx).value().to_string(),
+                    form.destination.read(cx).value().to_string(),
+                    form.filename.read(cx).value().to_string(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let details_handle = view.read_with(cx, |view, _| view.detail_windows[&id].handle);
+    for (appearance, mode) in [
+        (WindowAppearance::Dark, ThemeMode::Dark),
+        (WindowAppearance::Light, ThemeMode::Light),
+    ] {
+        cx.update(|_, cx| palette::appearance_changed(appearance, cx));
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(palette::preference(cx), ThemePreference::System);
+            assert_stock_theme(cx, mode);
+            assert_eq!(view.menu_state(cx).dark, mode.is_dark());
+            assert!(view.queue.item(id).unwrap().is_queued());
+            assert!(view.active.is_none());
+            assert!(view.transfer.is_none());
+        });
+        for ((handle, form), draft) in forms.iter().zip(&drafts) {
+            let mut child = VisualTestContext::from_window(*handle, &cx.cx);
+            draw(&mut child);
+            child.update(|_, cx| {
+                assert_eq!(palette::preference(cx), ThemePreference::System);
+                assert_stock_theme(cx, mode);
+            });
+            form.read_with(&child, |form, cx| {
+                assert_eq!(form.source.read(cx).value().as_ref(), draft.0);
+                assert_eq!(form.destination.read(cx).value().as_ref(), draft.1);
+                assert_eq!(form.filename.read(cx).value().as_ref(), draft.2);
+            });
+        }
+        let mut details = VisualTestContext::from_window(details_handle, &cx.cx);
+        draw(&mut details);
+        details.update(|_, cx| {
+            assert_eq!(palette::preference(cx), ThemePreference::System);
+            assert_stock_theme(cx, mode);
+        });
+    }
+    for handle in forms
+        .iter()
+        .map(|(handle, _)| *handle)
+        .chain([details_handle])
+    {
+        let mut child = VisualTestContext::from_window(handle, &cx.cx);
+        child.update(|window, _| window.remove_window());
+    }
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.add_windows.is_empty());
+        assert!(view.detail_windows.is_empty());
+    });
+    assert_eq!(cx.update(|_, cx| cx.windows().len()), 1);
+    assert!(!directory.path().join("queued-theme.zip").exists());
+}
+
+#[gpui::test]
+fn manual_theme_native_actions_ignore_appearance_and_system_survives_main_close(
+    cx: &mut TestAppContext,
+) {
+    use crate::palette::{self, ThemePreference};
+    use gpui_kit::{WindowAppearance, component::ThemeMode};
+    let runtime = runtime();
+    let (root, view, cx) = mount(cx, &runtime);
+    let _menus = cx.update(|window, cx| {
+        crate::native_menu::install(cx, view.downgrade(), window.window_handle())
+    });
+    cx.update(|window, cx| {
+        window.activate_window();
+        view.read(cx)
+            .search
+            .clone()
+            .update(cx, |input, cx| input.focus(window, cx));
+    });
+    draw(cx);
+    cx.dispatch_action(crate::native_menu::UseLightTheme);
+    cx.update(|_, cx| palette::appearance_changed(WindowAppearance::Dark, cx));
+    draw(cx);
+    cx.update(|_, cx| {
+        assert_eq!(palette::preference(cx), ThemePreference::Light);
+        assert_stock_theme(cx, ThemeMode::Light);
+    });
+    cx.dispatch_action(crate::native_menu::UseDarkTheme);
+    cx.update(|_, cx| palette::appearance_changed(WindowAppearance::Light, cx));
+    draw(cx);
+    cx.update(|_, cx| {
+        assert_eq!(palette::preference(cx), ThemePreference::Dark);
+        assert_stock_theme(cx, ThemeMode::Dark);
+    });
+    cx.dispatch_action(crate::native_menu::NewDownload);
+    draw(cx);
+    let mut child = add_context(&view, cx);
+    let owner = view.downgrade();
+    cx.update(|window, _| window.remove_window());
+    drop(root);
+    drop(view);
+    child.run_until_parked();
+    child.update(|window, _| window.activate_window());
+    draw(&mut child);
+    child.dispatch_action(crate::native_menu::UseSystemTheme);
+    draw(&mut child);
+    child.update(|_, cx| {
+        assert_eq!(palette::preference(cx), ThemePreference::System);
+        palette::appearance_changed(WindowAppearance::Dark, cx);
+    });
+    draw(&mut child);
+    owner.upgrade().unwrap().read_with(&child, |view, cx| {
+        assert_stock_theme(cx, ThemeMode::Dark);
+        assert_eq!(palette::preference(cx), ThemePreference::System);
+        assert_theme_menu_preference(&view.menu_state(cx), ThemePreference::System);
+        assert_eq!(view.add_windows.len(), 1);
+        assert_eq!(cx.windows().len(), 1);
+        assert!(view.queue.items.is_empty());
+        assert!(view.active.is_none());
+    });
+    child.update(|window, _| window.remove_window());
+    child.run_until_parked();
+    assert_eq!(child.cx.update(|cx| cx.windows().len()), 0);
+    assert!(
+        owner.upgrade().is_none(),
+        "last child root releases manager"
+    );
+}
+
+#[gpui::test]
+fn theme_selector_stock_geometry_and_click_preserve_preference_until_selection(
+    cx: &mut TestAppContext,
+) {
+    use crate::palette::{self, ThemePreference};
+    let runtime = runtime();
+    let (_root, _view, cx) = mount(cx, &runtime);
+    cx.simulate_resize(gpui_kit::size(gpui_kit::px(880.), gpui_kit::px(540.)));
+    draw(cx);
+    let theme = cx
+        .debug_bounds("theme-selector")
+        .expect("stock theme dropdown button");
+    let add = cx.debug_bounds("add-url").expect("Add URL button");
+    let search = cx.debug_bounds("download-search").expect("search wrapper");
+    let toggle = cx.debug_bounds("toggle-sidebar").expect("sidebar toggle");
+    for control in [add, search, toggle] {
+        assert!((theme.center().y - control.center().y).abs() <= gpui_kit::px(1.));
+    }
+    for control in [add, toggle] {
+        assert!((theme.size.height - control.size.height).abs() <= gpui_kit::px(1.));
+    }
+    assert!(theme.size.height > gpui_kit::px(24.));
+    assert!(theme.right() <= gpui_kit::px(880.));
+    cx.update(|_, cx| assert_eq!(palette::preference(cx), ThemePreference::System));
+    cx.simulate_click(theme.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    // Clicking the stock dropdown is exercised, not a native popup visibility
+    // assertion. Its private Kit popup state is intentionally not inspected.
+    cx.update(|_, cx| assert_eq!(palette::preference(cx), ThemePreference::System));
+}

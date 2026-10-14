@@ -31,6 +31,7 @@ gpui_kit::actions!(
         ShowUnfinishedDownloads,
         ShowQueuedDownloads,
         ToggleDownloadsSidebar,
+        UseSystemTheme,
         UseLightTheme,
         UseDarkTheme,
         ShowHelp,
@@ -55,6 +56,7 @@ pub enum Command {
     Unfinished,
     Queued,
     ToggleSidebar,
+    SystemTheme,
     LightTheme,
     DarkTheme,
     Help,
@@ -76,6 +78,7 @@ pub struct MenuState {
     pub dark: bool,
     pub filter: Filter,
     pub sidebar_collapsed: bool,
+    pub theme_preference: crate::palette::ThemePreference,
 }
 
 impl Command {
@@ -96,6 +99,7 @@ impl Command {
             | Self::Unfinished
             | Self::Queued
             | Self::ToggleSidebar
+            | Self::SystemTheme
             | Self::LightTheme
             | Self::DarkTheme
             | Self::Help => true,
@@ -182,8 +186,12 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
             item("Queued", ShowQueuedDownloads, Command::Queued, state)
                 .checked(state.filter == Filter::Queued),
             MenuItem::separator(),
-            item("Light Theme", UseLightTheme, Command::LightTheme, state).checked(!state.dark),
-            item("Dark Theme", UseDarkTheme, Command::DarkTheme, state).checked(state.dark),
+            item("Follow System", UseSystemTheme, Command::SystemTheme, state)
+                .checked(state.theme_preference == crate::palette::ThemePreference::System),
+            item("Light Theme", UseLightTheme, Command::LightTheme, state)
+                .checked(state.theme_preference == crate::palette::ThemePreference::Light),
+            item("Dark Theme", UseDarkTheme, Command::DarkTheme, state)
+                .checked(state.theme_preference == crate::palette::ThemePreference::Dark),
         ]),
         Menu::new("Help").items([item("Ulos Help", ShowHelp, Command::Help, state)]),
     ]
@@ -255,6 +263,7 @@ pub fn install(
     register::<ShowUnfinishedDownloads>(cx, &owner, main, Command::Unfinished);
     register::<ShowQueuedDownloads>(cx, &owner, main, Command::Queued);
     register::<ToggleDownloadsSidebar>(cx, &owner, main, Command::ToggleSidebar);
+    register::<UseSystemTheme>(cx, &owner, main, Command::SystemTheme);
     register::<UseLightTheme>(cx, &owner, main, Command::LightTheme);
     register::<UseDarkTheme>(cx, &owner, main, Command::DarkTheme);
     register::<ShowHelp>(cx, &owner, main, Command::Help);
@@ -284,6 +293,11 @@ pub fn install(
     let theme_cache = cache.clone();
     subscriptions.push(cx.observe_global::<gpui_kit::component::Theme>(move |cx| {
         refresh(&theme_owner, &theme_cache, cx)
+    }));
+    let preference_owner = owner.clone();
+    let preference_cache = cache.clone();
+    subscriptions.push(crate::palette::observe_preference(cx, move |cx| {
+        refresh(&preference_owner, &preference_cache, cx)
     }));
     subscriptions.push(cx.on_window_closed(move |cx, _| {
         let owner = owner.clone();
@@ -389,6 +403,7 @@ mod tests {
             Command::Unfinished,
             Command::Queued,
             Command::ToggleSidebar,
+            Command::SystemTheme,
             Command::LightTheme,
             Command::DarkTheme,
             Command::Help,
@@ -405,26 +420,39 @@ mod tests {
             Filter::Unfinished,
             Filter::Queued,
         ] {
-            for dark in [false, true] {
-                let menus = menus(&MenuState {
-                    filter,
-                    dark,
-                    ..Default::default()
-                });
-                let view = menu(&menus, "View");
-                for (index, candidate) in [
-                    Filter::All,
-                    Filter::Finished,
-                    Filter::Unfinished,
-                    Filter::Queued,
-                ]
-                .iter()
-                .enumerate()
-                {
-                    assert_eq!(view.items[index + 2].is_checked(), filter == *candidate);
+            for theme_preference in crate::palette::ThemePreference::ALL {
+                for dark in [false, true] {
+                    let menus = menus(&MenuState {
+                        filter,
+                        dark,
+                        theme_preference,
+                        ..Default::default()
+                    });
+                    let view = menu(&menus, "View");
+                    for (index, candidate) in [
+                        Filter::All,
+                        Filter::Finished,
+                        Filter::Unfinished,
+                        Filter::Queued,
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        assert_eq!(view.items[index + 2].is_checked(), filter == *candidate);
+                    }
+                    assert_eq!(
+                        view.items[7].is_checked(),
+                        theme_preference == crate::palette::ThemePreference::System
+                    );
+                    assert_eq!(
+                        view.items[8].is_checked(),
+                        theme_preference == crate::palette::ThemePreference::Light
+                    );
+                    assert_eq!(
+                        view.items[9].is_checked(),
+                        theme_preference == crate::palette::ThemePreference::Dark
+                    );
                 }
-                assert_eq!(view.items[7].is_checked(), !dark);
-                assert_eq!(view.items[8].is_checked(), dark);
             }
         }
     }

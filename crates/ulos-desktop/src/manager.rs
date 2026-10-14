@@ -149,7 +149,11 @@ impl DownloadManager {
             table,
             _window_closed: window_closed,
             last_rate: None,
-            _subscriptions: vec![subscription, table_subscription],
+            _subscriptions: vec![
+                subscription,
+                table_subscription,
+                crate::palette::observe_window(window, cx),
+            ],
             _updates: None,
             clipboard_enabled: false,
             clipboard: ClipboardDetector::default(),
@@ -653,6 +657,7 @@ impl DownloadManager {
             dark: cx.theme().is_dark(),
             filter: self.queue.filter,
             sidebar_collapsed: self.sidebar_collapsed,
+            theme_preference: crate::palette::preference(cx),
         }
     }
 
@@ -682,9 +687,13 @@ impl DownloadManager {
             Command::Unfinished => self.set_filter(Filter::Unfinished, cx),
             Command::Queued => self.set_filter(Filter::Queued, cx),
             Command::ToggleSidebar => self.toggle_sidebar(cx),
-            Command::LightTheme | Command::DarkTheme => {
-                crate::palette::apply(if command == Command::DarkTheme { gpui_kit::component::ThemeMode::Dark } else { gpui_kit::component::ThemeMode::Light }, cx);
-                cx.notify();
+            Command::SystemTheme | Command::LightTheme | Command::DarkTheme => {
+                use crate::palette::ThemePreference;
+                crate::palette::choose(match command {
+                    Command::SystemTheme => ThemePreference::System,
+                    Command::DarkTheme => ThemePreference::Dark,
+                    _ => ThemePreference::Light,
+                }, cx);
             }
             Command::Help => window.open_dialog(cx, |dialog, _, _| {
                 use gpui_kit::component::{group_box::GroupBox, label::Label};

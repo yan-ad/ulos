@@ -7,6 +7,9 @@ use tokio::{
     sync::{oneshot, watch},
 };
 
+use crate::transfer::{
+    self, ResumeCapability, TransferControl, TransferOptions, TransferTelemetry,
+};
 use crate::{DownloadError, DownloadProgress, DownloadReceipt, DownloadRequest, Downloader};
 
 /// The latest transfer state. Intermediate progress updates may be coalesced.
@@ -14,6 +17,8 @@ use crate::{DownloadError, DownloadProgress, DownloadReceipt, DownloadRequest, D
 pub enum TransferState {
     Preparing,
     Downloading(DownloadProgress),
+    /// Session work remains owned by this task while its range streams pause.
+    Paused(DownloadProgress),
     Completed(DownloadReceipt),
     Failed(String),
     /// The download future was dropped before reporting completion.
@@ -53,6 +58,8 @@ impl TransferState {
 pub struct HttpDownloadTask {
     state: watch::Receiver<TransferState>,
     cancellation: Option<oneshot::Sender<()>>,
+    control: Option<TransferControl>,
+    telemetry: Option<watch::Receiver<TransferTelemetry>>,
 }
 
 impl HttpDownloadTask {
@@ -95,7 +102,125 @@ impl HttpDownloadTask {
         Self {
             state,
             cancellation: Some(cancellation),
+            control: None,
+            telemetry: None,
         }
+    }
+
+    /// Starts the controlled engine. Legacy `start` retains its single GET path.
+    /// Validation and all network/filesystem work run on the supplied runtime.
+    pub fn start_with_options(
+        runtime: &Handle,
+        url: String,
+        destination: PathBuf,
+        options: TransferOptions,
+    ) -> Self {
+        let (state_tx, state) = watch::channel(TransferState::Preparing);
+        let (telemetry_tx, telemetry) = watch::channel(TransferTelemetry {
+            destination: destination.clone(),
+            bytes_per_second: options.bytes_per_second,
+            ..TransferTelemetry::default()
+        });
+        let control = TransferControl::new(options.bytes_per_second);
+        let worker_control = control.clone();
+        let (cancellation, cancelled) = oneshot::channel();
+        let guard = TerminalGuard(state_tx.clone());
+        runtime.spawn(async move {
+            let _guard = guard;
+            let updates = state_tx.clone();
+            // Drop the engine, its range workers, and staging guards before
+            // publishing cancellation. A simultaneously ready result wins.
+            let result = {
+                let transfer =
+                    transfer::run(&url, destination, options, worker_control, move |value| {
+                        // Aborted range workers must not overwrite a terminal
+                        // result if their final callback races cancellation.
+                        updates.send_if_modified(|state| {
+                            if state.is_terminal() {
+                                return false;
+                            }
+                            telemetry_tx.send_replace(value.clone());
+                            *state = if value.paused {
+                                TransferState::Paused(value.progress)
+                            } else {
+                                TransferState::Downloading(value.progress)
+                            };
+                            true
+                        });
+                    });
+                tokio::pin!(transfer);
+                tokio::select! {
+                    biased;
+                    result = &mut transfer => Some(result),
+                    _ = cancelled => None,
+                }
+            };
+            let terminal = match result {
+                Some(Ok(receipt)) => TransferState::Completed(receipt),
+                Some(Err(DownloadError::Cancelled)) | None => TransferState::Cancelled,
+                Some(Err(error)) => TransferState::Failed(error.to_string()),
+            };
+            state_tx.send_replace(terminal);
+        });
+        Self {
+            state,
+            cancellation: Some(cancellation),
+            control: Some(control),
+            telemetry: Some(telemetry),
+        }
+    }
+
+    /// Subscribes to bounded latest telemetry; unavailable for legacy tasks.
+    pub fn telemetry(&self) -> Option<watch::Receiver<TransferTelemetry>> {
+        self.telemetry.clone()
+    }
+
+    /// Requests a session pause only after range/validator support is observed.
+    pub fn pause(&self) -> bool {
+        let Some(control) = &self.control else {
+            return false;
+        };
+        if !matches!(*self.state.borrow(), TransferState::Downloading(_))
+            || self
+                .telemetry
+                .as_ref()
+                .is_none_or(|value| value.borrow().resume != ResumeCapability::Supported)
+            || control.is_paused()
+        {
+            return false;
+        }
+        control.pause();
+        true
+    }
+
+    /// Resumes a previously requested pause without discarding session bytes.
+    pub fn resume(&self) -> bool {
+        let Some(control) = &self.control else {
+            return false;
+        };
+        if self.state.borrow().is_terminal()
+            || self
+                .telemetry
+                .as_ref()
+                .is_none_or(|value| value.borrow().resume != ResumeCapability::Supported)
+            || !control.is_paused()
+        {
+            return false;
+        }
+        control.resume();
+        true
+    }
+
+    /// Changes the shared live budget. `None` disables limiting; zero is rejected.
+    pub fn set_rate_limit(&self, bytes_per_second: Option<u64>) -> bool {
+        let Some(control) = &self.control else {
+            return false;
+        };
+        if self.state.borrow().is_terminal() || bytes_per_second == Some(0) {
+            return false;
+        }
+        control.set_rate_limit(bytes_per_second);
+        true
     }
 
     /// Subscribes to the latest state without allocating an unbounded queue.

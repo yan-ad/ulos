@@ -10,17 +10,12 @@ use gpui_kit::{
         empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
         input::Input,
         label::Label,
+        menu::{DropdownMenu, PopupMenuItem},
         sidebar::{Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenu, SidebarMenuItem},
         status_bar::StatusBar,
         table::DataTable,
         toolbar::Toolbar,
     },
-};
-
-#[cfg(not(target_os = "macos"))]
-use gpui_kit::component::{
-    ThemeMode,
-    menu::{DropdownMenu, PopupMenuItem},
 };
 
 fn category_icon(category: Category) -> AssetIcon {
@@ -35,7 +30,7 @@ fn category_icon(category: Category) -> AssetIcon {
     }
 }
 
-fn toolbar_button(id: &'static str, label: &'static str, icon: AssetIcon) -> Button {
+fn toolbar_button(id: &'static str, label: &str, icon: AssetIcon) -> Button {
     Button::new(id)
         .accessibility_label(label)
         .debug_selector(move || id.into())
@@ -85,6 +80,28 @@ fn manager_menu_item(
 }
 
 impl DownloadManager {
+    fn theme_selector(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::palette::{self, ThemePreference};
+        let selected = palette::preference(cx);
+        let icon = match selected {
+            ThemePreference::System => AssetIcon::Monitor,
+            ThemePreference::Light => AssetIcon::Sun,
+            ThemePreference::Dark => AssetIcon::Moon,
+        };
+        toolbar_button(id, &format!("Theme: {}", selected.label()), icon).dropdown_menu(
+            move |menu, _, _| {
+                ThemePreference::ALL
+                    .into_iter()
+                    .fold(menu, |menu, preference| {
+                        menu.item(
+                            PopupMenuItem::new(preference.label())
+                                .checked(preference == selected)
+                                .on_click(move |_, _, cx| palette::choose(preference, cx)),
+                        )
+                    })
+            },
+        )
+    }
     fn sidebar_filter(
         &self,
         filter: Filter,
@@ -261,6 +278,7 @@ impl DownloadManager {
                         cx.listener(|view, _, window, cx| view.open_selected_details(window, cx)),
                     ),
             )
+            .content(self.theme_selector("theme-selector", cx))
             .content(div().flex_1().min_w(px(8.)))
             .content(
                 div()
@@ -302,7 +320,7 @@ impl DownloadManager {
             .items
             .iter()
             .any(|item| self.queue.selected.contains(&item.id) && item.is_finished());
-        let dark = cx.theme().is_dark();
+        let theme_preference = crate::palette::preference(cx);
         div()
             .id("manager-menubar")
             .debug_selector(|| "manager-menubar".into())
@@ -317,12 +335,6 @@ impl DownloadManager {
                     .label("Tasks")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(manager_menu_item(
-                            "Toggle sidebar",
-                            view.clone(),
-                            MenuCommand::ToggleSidebar,
-                        ))
-                        .separator()
-                        .item(manager_menu_item(
                             "Add URL…",
                             tasks.clone(),
                             MenuCommand::Add,
@@ -401,6 +413,12 @@ impl DownloadManager {
                     .label("View")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(manager_menu_item(
+                            "Toggle sidebar",
+                            view.clone(),
+                            MenuCommand::ToggleSidebar,
+                        ))
+                        .separator()
+                        .item(manager_menu_item(
                             "All downloads",
                             view.clone(),
                             MenuCommand::Filter(Filter::All),
@@ -422,16 +440,35 @@ impl DownloadManager {
                         ))
                         .separator()
                         .item(
-                            PopupMenuItem::new(if dark { "Light theme" } else { "Dark theme" })
+                            PopupMenuItem::new("Follow system")
+                                .checked(
+                                    theme_preference == crate::palette::ThemePreference::System,
+                                )
                                 .on_click(|_, _, cx| {
-                                    crate::palette::apply(
-                                        if cx.theme().is_dark() {
-                                            ThemeMode::Light
-                                        } else {
-                                            ThemeMode::Dark
-                                        },
+                                    crate::palette::choose(
+                                        crate::palette::ThemePreference::System,
                                         cx,
-                                    );
+                                    )
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Light")
+                                .checked(theme_preference == crate::palette::ThemePreference::Light)
+                                .on_click(|_, _, cx| {
+                                    crate::palette::choose(
+                                        crate::palette::ThemePreference::Light,
+                                        cx,
+                                    )
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Dark")
+                                .checked(theme_preference == crate::palette::ThemePreference::Dark)
+                                .on_click(|_, _, cx| {
+                                    crate::palette::choose(
+                                        crate::palette::ThemePreference::Dark,
+                                        cx,
+                                    )
                                 }),
                         )
                     }),

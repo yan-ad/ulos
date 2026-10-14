@@ -23,7 +23,7 @@ This document records the implemented manager foundation and future scope. See [
 
 See [Architecture](ARCHITECTURE.md) for the transfer contract and [Roadmap](ROADMAP.md) for sequencing.
 
-Controls retain stock Kit theme defaults in the manager and child windows, with Light/Dark switching and no per-control size, padding, color, radius, or Button variant overrides. Layout wrappers provide geometry; 48px DataTable rows accommodate default Buttons. macOS `⌘N`, `⌘,`, and `⌘Q` route to Add, available main-window Options, and Quit; native Edit targets focused Kit inputs. These presentation/menu changes add no transfer or scheduler behavior.
+Controls retain stock Kit theme defaults in the manager and child windows, with System-default appearance and explicit Light/Dark overrides and no per-control size, padding, color, radius, or Button variant overrides. Layout wrappers provide geometry; 48px DataTable rows accommodate default Buttons. macOS `⌘N`, `⌘,`, and `⌘Q` route to Add, available main-window Options, and Quit; native Edit targets focused Kit inputs. These presentation/menu changes add no transfer or scheduler behavior.
 
 All application widgets, content text, and panels must use GPUI Kit, without manual UI exceptions: Toolbar, StatusBar, Label, GroupBox, DescriptionList, Empty, DataTable, Form/Input, Button, Checkbox, Tabs, Progress/Spinner and other Kit components. Kit-reexported `div`, `v_flex`, and `h_flex` are layout-only. Native OS chrome and path pickers are not a bespoke GTK/Swift widget implementation. Outstanding pickers block Add close/dismiss/submit until resolved.
 

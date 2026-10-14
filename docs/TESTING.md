@@ -54,7 +54,7 @@ The current entry point is the manager, not the older single-transfer starter. S
 
 ### Native-menu and stock-control regression references
 
-The source contains the following adapter expectations, not native visual/AX evidence or a passing-run claim. Full tests are currently being run separately by the parent task; this docs-only update does not count or report them as passed.
+The source contains the following adapter expectations, not native visual/AX evidence or a passing-run claim. This docs-only update does not run the suite or count these expectations as passes.
 
 - `native_menu_toolbar_uses_stock_sizes_and_one_row_at_minimum_width`: at 880px width, no macOS in-window menu strip, same-row search/actions, consistent stock Button heights, and all action controls before search. Also review the 880 × 540 minimum, 240px/160px search wrapper, and 48px DataTable rows with unclipped default Buttons on native platforms.
 - `native_menu_add_bubbles_from_search_and_options_waits_for_children` and `native_menu_add_routes_to_surviving_child_after_main_closes`: global typed dispatch from focused search and surviving child roots; independent Add drafts and guarded main-window-only Options.
@@ -66,6 +66,17 @@ The source contains the following adapter expectations, not native visual/AX evi
 - `native_menu_state_events_do_not_notify_the_manager_view`: child-open menu-state events and child-close availability keep manager notification count at zero; distinguish native focus redraw from explicit model notification. Theme metadata refresh is independently driven by global Theme observation and must not add manager notifications.
 
 Native visual and accessibility capture is not authorized for this update. No first-paint, native menu rendering, tooltip focus, or screen-reader result is asserted.
+
+### Collapsible-sidebar regression references
+
+Four adapter regressions in `manager_tests.rs` describe the intended coverage, not passing results:
+
+- `sidebar_mouse_toggle_restores_geometry_without_changing_queue_state`: mouse clicks on the toolbar toggle collapse/expand to Kit’s 48px/255px defaults while preserving search, selected IDs, filter, queued records, and FIFO, with no active HTTP task.
+- `sidebar_collapsed_filter_survives_expansion_without_resetting_selection`: invokes the real filter controller while collapsed, including Category(Image), then expands without resetting selection/filter. This is **not** a collapsed-item mouse-click test: generated item bounds are unavailable with the current Kit/Base observation-registry test feature configuration. No dependency change is needed for this controller coverage.
+- `sidebar_keyboard_from_search_and_native_action_from_child_share_state`: manager-scoped secondary-B from focused search and the global native typed action from a child share collapse state and update View’s Collapse/Expand label without editing search text.
+- `sidebar_empty_light_and_dark_layout_stays_in_one_row_at_minimum_size`: stock Light/Dark, expanded/collapsed, at 880 × 540; toggle immediately before Add URL, same-row toolbar/search geometry, and unchanged stock Button sizing.
+
+The final-width fixture uses public `set_reduce_motion(true)` for deterministic layout. Kit’s transition uses the GPUI frame clock; advancing the executor clock is not proof of the actual 200ms animation. Animation, rail tooltip interaction, screen-reader names/counts, sidebar item focus and arrow navigation still require native review; no full native keyboard support is claimed.
 
 ### Native-window and rendering regression references
 
@@ -84,7 +95,7 @@ Also review the empty manager, sorting/filtering and stable-ID checkboxes versus
 
 Native review should cover:
 
-- Latest light IDM 6.28-inspired structure: native titlebar, macOS system menus Ulos / Tasks / File / Edit / Downloads / View / Help (no in-window menu line), non-macOS in-window Kit dropdowns, and one shared action Toolbar with stock icon-only Buttons except Add URL, accessible names/built-in tooltips, and stock search Input on the same row. Check category tree, selection-plus-four-column table, status bar, and filename-click native status window. Confirm Kit controls, panels, text and semantic containers throughout (Toolbar, StatusBar, Label, GroupBox, DescriptionList, Empty, DataTable, Form/Input, Button, Checkbox, Tabs, Progress/Spinner); `div`/`v_flex`/`h_flex` are layout-only, with no manual painting or bespoke GTK/Swift UI. Options remains a Kit modal. Confirm no copied branding; do not demand an OS-independent pixel match.
+- Light IDM 6.28-inspired manager structure with the latest Kit/shadcn-style sidebar refinement: native titlebar, macOS system menus Ulos / Tasks / File / Edit / Downloads / View / Help (no in-window menu line), non-macOS in-window Kit dropdowns, and one shared action Toolbar with stock icon-only Buttons except Add URL, accessible names/built-in tooltips, and stock search Input on the same row. Check grouped collapsible sidebar, selection-plus-four-column table, status bar, and filename-click native status window. Confirm Kit controls, panels, text and semantic containers throughout (Toolbar, StatusBar, Label, GroupBox, DescriptionList, Empty, DataTable, Form/Input, Button, Checkbox, Tabs, Progress/Spinner); `div`/`v_flex`/`h_flex` are layout-only, with no manual painting or bespoke GTK/Swift UI. Options remains a Kit modal. Confirm no copied branding; do not demand an OS-independent pixel match.
 - Empty state, 500-record cap, duplicate queued/active destinations, FIFO independent of table ordering, Start download versus Download later while idle/busy/running, Stop selected/Stop Queue/Stop All, and record removal/reveal with no file deletion.
 - Address / File name / Save as, folder/save picker acceptance/cancellation and close/dismiss/submit guards while outstanding, manual overrides, unsafe selected/edited names, extension-preserving 180-byte limits, Unicode and reserved Windows device bases, no-overwrite collisions, and no naming-time HEAD/header request.
 - Details live real bytes/rate/ETA, unknown/zero length, connecting/failure/cancel/completion, one actual stream row, Hide details, close/reopen, disabled Pause, Resume Not implemented, and explanatory Speed limiter / Options on completion tabs. No fake segmented progress. Reopen the same ID to activate its existing window, and open different IDs concurrently.
@@ -116,3 +127,7 @@ Before torrent support ships, use deterministic local fixtures and legal payload
 ## Future browser and distribution tests
 
 For selected Chromium/Firefox versions verify host registration and allowlists, bounded malformed/unsupported messages, unauthorized sender rejection, explicit user import, host disconnect/restart, and protocol-safe diagnostics. Verify browser import remains explicitly consented and separate from the implemented session clipboard opt-in; neither should trigger autonomous downloads. Test clean installs and packaged native host discovery on each release platform. Include the Ulos LICENSE file and audit dependencies/notices before distribution.
+
+## System-default appearance
+
+Theme resolver tests cover light/dark and vibrant appearances, System callbacks, explicit overrides and returning to System. Manager tests cover preference-based native checkmarks, selector geometry/clicks at 880 × 540, global stock tokens across multiple native roots without losing drafts, and System selection from a child after main-window closure. Appearance transitions call the application handler because Kit’s external test API does not expose the platform appearance simulation; these tests are not a claim of actual OS settings changes or Linux compositor appearance delivery. Native observers are retained in each window. No test changes the host OS theme.
