@@ -2,7 +2,7 @@
 
 Updated: 2026-10-13. This is a test plan; [Status](STATUS.md) records actual verification results and known gaps.
 
-## Planned workspace commands
+## Workspace validation commands
 
 Run from the workspace root after scaffold initialization. Core and CLI should be default members, so default lint/test commands avoid GUI system dependencies.
 
@@ -48,7 +48,20 @@ Add tests with the features, not claims that the scaffold already supports them:
 
 ## Desktop and platform matrix
 
-The initial desktop check is an observed starter window with legible text and working input, not an active transfer UI. After integration verify real state updates, cancellation, errors, keyboard navigation, focus, accessibility, and shutdown without orphaned work. Review the UI with the user after initialization.
+The current entry point is the manager, not the older single-transfer starter. Source-level tests include pure queue/filter/sort/selection/telemetry invariants, URL-derived naming and sanitization, bounded clipboard URL acceptance/fingerprint deduplication, and Details percentages/stream state. Do not infer passing results or test counts from their presence; record actual commands and outcomes separately.
+
+`manager_tests.rs` uses GPUI test adapters and real local HTTP fixtures for FIFO advancement even with every row hidden, Stop Queue without next-request dispatch, Stop All cancellation/temporary-file cleanup with the next item still queued, metadata-only removal, retained Add inputs/save prompts, unsupported-source failure, and stale-ID isolation. Further cases cover opt-in/dismissed clipboard proposals, safe prefill/manual-name preservation, folder-picker submission sanitation, redacted Details snapshots/close-reopen/progress refresh, and Details cancellation against a real partial transfer. Test adapters do not prove native clipboard, focus, picker, or rendering behavior.
+
+Native review should cover:
+
+- Latest light IDM 6.28-inspired structure: native titlebar, in-window Tasks / File / Downloads / View / Help menus, icon-over-label toolbar, category tree, compact selection-plus-four-column table, status bar, and filename-click Details modal. Confirm Kit primitives and no copied branding; do not demand an OS-independent pixel match.
+- Empty state, 500-record cap, duplicate queued/active destinations, FIFO independent of table ordering, Start download versus Download later while idle/busy/running, Stop selected/Stop Queue/Stop All, and record removal/reveal with no file deletion.
+- Address / File name / Save as, folder/save picker acceptance/cancellation, manual overrides, unsafe selected/edited names, extension-preserving 180-byte limits, Unicode and reserved Windows device bases, no-overwrite collisions, and no naming-time HEAD/header request.
+- Details live real bytes/rate/ETA, unknown/zero length, connecting/failure/cancel/completion, one actual stream row, Hide details, close/reopen, disabled Pause, Resume Not implemented, and explanatory Speed limiter / Options on completion tabs. No fake segmented progress or detached-window claim.
+- Clipboard off-by-default session toggle, no reads when disabled/inactive/dialog-open, async active-window checks, bounded single-URL rejection, unchanged-fingerprint dedup after dismissal, prefill without overwriting an open form, no non-URL retention/logging, signed URL display redaction, and no network/download until explicit confirmation. Check Wayland compositor behavior; candidate bounds are not OS read-allocation bounds.
+- Minimum-size overflow/scrolling, keyboard Add shortcut, accessible input/selection/progress names, focus restoration, screen readers, owned task teardown, and runtime shutdown including the two-second timeout. Do not assume cleanup completed solely because shutdown returned.
+
+No new pass counts, native visual/accessibility outcomes, or Linux/Windows support claims are made here.
 
 Only the current macOS host is available at initialization. Until recorded CI/native runs exist, Linux and Windows remain unvalidated. Linux must receive first-class testing:
 
@@ -62,6 +75,14 @@ Only the current macOS host is available at initialization. Until recorded CI/na
 
 Record exact distro, desktop, session, scale, GPU/driver, Rust version, and dependency lockfile. Build-only/headless CI is not a replacement for graphical validation. Windows needs MSVC/CMake/SDK validation; macOS needs the upstream OS baseline and CLT. No matrix row is a support guarantee before testing.
 
+## Shared HTTP task acceptance cases
+
+Test `HttpDownloadTask` independently of GPUI on a supplied Tokio runtime: preparation errors, actual output bytes, known/unknown lengths, and transitions through `Preparing`, `Downloading`, and terminal `Completed`/`Failed`/`Cancelled` states. Check bounded coalescing watch delivery with slow observers; intermediate progress need not be retained. Verify explicit cancellation and drop-requested cancellation, including publication races and best-effort cleanup. Test CLI and desktop adapters against the same task contract; drop is not an awaited join. These are acceptance requirements, not asserted completed results.
+
+## Future torrent tests
+
+Before torrent support ships, use deterministic local fixtures and legal payloads for valid/invalid magnet and `.torrent` sources, bounded/malformed metadata, bad piece hashes, interruption/cancellation, and safe multifile publication. Cover traversal/absolute paths, collisions, existing files, and no-overwrite behavior. Verify chosen tracker/DHT privacy policy, seeding consent/defaults, bandwidth limits, storage exhaustion/allocation, and teardown. Do not treat an infohash as an HTTP representation validator. Engine choice and fixture implementation are pending; no torrent tests or dependencies are claimed.
+
 ## Future browser and distribution tests
 
-For selected Chromium/Firefox versions verify host registration and allowlists, bounded malformed/unsupported messages, unauthorized sender rejection, explicit user import, host disconnect/restart, and protocol-safe diagnostics. Confirm there is no automatic clipboard polling. Test clean installs and packaged native host discovery on each release platform. Choose the Ulos license and audit dependencies/notices before distribution.
+For selected Chromium/Firefox versions verify host registration and allowlists, bounded malformed/unsupported messages, unauthorized sender rejection, explicit user import, host disconnect/restart, and protocol-safe diagnostics. Verify browser import remains explicitly consented and separate from the implemented session clipboard opt-in; neither should trigger autonomous downloads. Test clean installs and packaged native host discovery on each release platform. Choose the Ulos license and audit dependencies/notices before distribution.

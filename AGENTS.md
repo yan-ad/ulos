@@ -21,3 +21,5 @@ Run cargo fmt --all -- --check, cargo test, and cargo clippy --all-targets -- -D
 ## UI
 
 The user requested anti-slop review after implementation. No brand direction has been approved. Use a restrained, honest starter; no fake downloads, invented metrics, or controls without behavior. A full design brief and native accessibility/keyboard review are required before calling the GUI complete.
+
+The user supplied IDM-style layout references; DESIGN.md records that working structure, not final branding. Keep GPUI Kit primitives. Clipboard detection is explicitly requested but must remain opt-in, session-only, active-window gated, and confirmation-only: never log clipboard contents or start network work just because a URL was copied. Filename detection must be single-component, portable and sanitized; do not overwrite destinations. Unsupported features must be visibly disabled or explained, never simulated.

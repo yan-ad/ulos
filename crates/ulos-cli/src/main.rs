@@ -1,7 +1,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
-use ulos_core::{DownloadRequest, Downloader};
+use ulos_core::tasks::{HttpDownloadTask, TransferState};
 
 #[derive(Parser)]
 #[command(
@@ -30,19 +30,30 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let request = DownloadRequest::new(&args.url, args.output)?;
-    let downloader = Downloader::new()?;
-    let transfer = downloader.download(&request, |_| {});
-    tokio::pin!(transfer);
-    tokio::select! {
-        result = &mut transfer => {
-            let receipt = result?;
-            println!("Saved {} bytes to {}", receipt.downloaded_bytes, receipt.destination.display());
-            Ok(())
+    let mut transfer =
+        HttpDownloadTask::start(&tokio::runtime::Handle::current(), args.url, args.output);
+    let mut updates = transfer.subscribe();
+    let mut cancelling = false;
+    loop {
+        let state = updates.borrow_and_update().clone();
+        match state {
+            TransferState::Completed(receipt) => {
+                println!("Saved {} bytes to {}", receipt.downloaded_bytes, receipt.destination.display());
+                return Ok(());
+            }
+            TransferState::Failed(error) => return Err(error.into()),
+            TransferState::Cancelled => return Err("Download cancelled. A completed file may exist if finalization had already started".into()),
+            _ => {}
         }
-        result = tokio::signal::ctrl_c() => {
-            result?;
-            Err("Download cancelled. A completed file may exist if finalization had already started".into())
+        tokio::select! {
+            result = updates.changed() => {
+                result.map_err(|_| "Transfer worker stopped before reporting an outcome")?;
+            }
+            result = tokio::signal::ctrl_c(), if !cancelling => {
+                result?;
+                transfer.cancel();
+                cancelling = true;
+            }
         }
     }
 }
