@@ -1294,12 +1294,17 @@ mod tests {
     #[gpui::test]
     fn downloads_default_and_manual_destination_survive_url_changes(cx: &mut TestAppContext) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let downloads = directory.path().join("Downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let manual = directory.path().join("manual.zip");
+        let picked = directory.path().join("picker.zip");
         cx.update(gpui_kit::init);
         let mut form = None;
         let (_root, cx) = cx.add_window_view(|window, cx| {
             let view = cx.new(|cx| {
                 AddDownload::new(
-                    Some(PathBuf::from("/tmp/Downloads")),
+                    Some(downloads.clone()),
                     runtime.handle().clone(),
                     window,
                     cx,
@@ -1313,30 +1318,30 @@ mod tests {
             form.update(cx, |view, cx| {
                 view.prefill("https://example.org/first.zip".into(), window, cx);
                 assert_eq!(
-                    view.destination.read(cx).value().as_ref(),
-                    "/tmp/Downloads/first.zip"
+                    PathBuf::from(view.destination.read(cx).value().as_ref()),
+                    downloads.join("first.zip")
                 );
                 view.prefill("https://example.org/second.zip".into(), window, cx);
                 assert_eq!(
-                    view.destination.read(cx).value().as_ref(),
-                    "/tmp/Downloads/second.zip"
+                    PathBuf::from(view.destination.read(cx).value().as_ref()),
+                    downloads.join("second.zip")
                 );
                 view.destination.update(cx, |input, cx| {
-                    input.set_value("/tmp/manual.zip", window, cx)
+                    input.set_value(manual.to_str().unwrap(), window, cx)
                 });
                 view.prefill("https://example.org/third.zip".into(), window, cx);
                 assert_eq!(
-                    view.destination.read(cx).value().as_ref(),
-                    "/tmp/manual.zip"
+                    PathBuf::from(view.destination.read(cx).value().as_ref()),
+                    manual
                 );
                 // Clipboard/programmatic prefill remains network-free.
                 assert!(view._preview_task.is_none());
                 assert_eq!(view.preview, super::PreviewState::NotRequested);
-                view.set_path(PathBuf::from("/tmp/picker.zip"), window, cx);
+                view.set_path(picked.clone(), window, cx);
                 view.prefill("https://example.org/fourth.zip".into(), window, cx);
                 assert_eq!(
-                    view.destination.read(cx).value().as_ref(),
-                    "/tmp/picker.zip"
+                    PathBuf::from(view.destination.read(cx).value().as_ref()),
+                    picked
                 );
             })
         });

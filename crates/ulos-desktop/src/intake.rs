@@ -20,6 +20,33 @@ pub fn merge_pending(
         if !merged.contains(&path) {
             merged.push(path);
         }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_drive_file_urls_roundtrip_but_remote_and_driveless_urls_do_not() {
+            let path = PathBuf::from("C:\\Users\\Example\\Downloads\\日 a.torrent");
+            assert_eq!(
+                opened_urls(vec![
+                    "file:///C:/Users/Example/Downloads/%E6%97%A5%20a.torrent".into()
+                ]),
+                Ok(vec![path.clone()])
+            );
+            assert_eq!(
+                argument_paths([path.as_os_str().to_owned()]),
+                Ok(vec![path])
+            );
+            for value in [
+                "file:///tmp/a.torrent",
+                "file://server/share/a.torrent",
+                "\\\\server\\share\\a.torrent",
+                "\\\\?\\C:\\tmp\\a.torrent",
+            ] {
+                assert!(
+                    opened_urls(vec![value.into()]).is_err(),
+                    "unsupported path was accepted"
+                );
+            }
+        }
     }
     if merged.len() > MAX_INTAKE_FILES {
         return Err(TOO_MANY);
@@ -231,14 +258,22 @@ mod tests {
 
     #[test]
     fn decodes_only_file_urls_and_rejects_remote_or_malformed_input() {
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\tmp\\日 a.torrent")
+        } else {
+            PathBuf::from("/tmp/日 a.torrent")
+        };
+        let url = Url::from_file_path(&path).unwrap();
         assert_eq!(
-            opened_urls(vec![
-                "file:///tmp/%E6%97%A5%20a.torrent".into(),
-                "/tmp/日 a.torrent".into()
-            ]),
-            Ok(vec![PathBuf::from("/tmp/日 a.torrent")])
+            opened_urls(vec![url.to_string(), path.to_str().unwrap().into()]),
+            Ok(vec![path])
         );
-        assert!(opened_urls(vec!["file://localhost/tmp/a.torrent".into()]).is_ok());
+        let localhost = if cfg!(windows) {
+            "file://localhost/C:/tmp/a.torrent"
+        } else {
+            "file://localhost/tmp/a.torrent"
+        };
+        assert!(opened_urls(vec![localhost.into()]).is_ok());
         for value in [
             "https://host/a.torrent",
             "magnet:?xt=abc",
@@ -276,22 +311,24 @@ mod tests {
 
     #[test]
     fn argument_contract_and_options() {
-        let args = [
-            "-psn_0_123",
-            "--",
-            "-name.torrent",
-            "file:///tmp/a%20b.torrent",
-        ]
-        .map(OsString::from);
+        let path = if cfg!(windows) {
+            PathBuf::from("C:\\tmp\\a b.torrent")
+        } else {
+            PathBuf::from("/tmp/a b.torrent")
+        };
+        let url = Url::from_file_path(&path).unwrap().to_string();
+        let args = ["-psn_0_123", "--", "-name.torrent", &url].map(OsString::from);
         assert_eq!(
             argument_paths(args),
-            Ok(vec![
-                PathBuf::from("-name.torrent"),
-                PathBuf::from("/tmp/a b.torrent")
-            ])
+            Ok(vec![PathBuf::from("-name.torrent"), path])
         );
         assert_eq!(argument_paths([]), Ok(vec![]));
         assert!(argument_paths([OsString::from("--help")]).is_err());
+        assert!(argument_paths([OsString::from("-name.torrent")]).is_err());
+        assert_eq!(
+            argument_paths([OsString::from("--"), OsString::from("-name.torrent")]),
+            Ok(vec![PathBuf::from("-name.torrent")])
+        );
         assert!(argument_paths(std::iter::repeat_n(OsString::from("-psn_0_1"), 19)).is_err());
         assert!(argument_paths(std::iter::repeat_n(OsString::from("a.torrent"), 17)).is_err());
     }
