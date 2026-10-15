@@ -1070,11 +1070,11 @@ fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 #[cfg(windows)]
 fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::rename(from, to).map_err(|error| {
-        // MoveFileEx reports an existing directory as ACCESS_DENIED, rather
-        // than ALREADY_EXISTS. Normalize only after the atomic operation failed;
-        // this lookup never authorizes replacing an existing destination.
-        if matches!(error.raw_os_error(), Some(5 | 80 | 183)) && fs::symlink_metadata(to).is_ok() {
+    renamore::rename_exclusive(from, to).map_err(|error| {
+        // Use MoveFileExW with no replacement flags, not std::fs::rename's
+        // replacement-capable fallback. Windows collision codes vary by target
+        // type/filesystem; inspect only after failure to decide whether to retry.
+        if fs::symlink_metadata(to).is_ok() {
             std::io::ErrorKind::AlreadyExists.into()
         } else {
             error
@@ -1132,6 +1132,58 @@ mod tests {
         assert_eq!(published, dir.path().join("target (1)"));
         assert_eq!(fs::read(target.join("original")).unwrap(), b"original");
         assert_eq!(fs::read(published.join("new")).unwrap(), b"new");
+    }
+    #[test]
+    fn directory_move_reports_collisions_and_preserves_empty_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("payload");
+        let target = dir.path().join("target");
+        fs::create_dir(&payload).unwrap();
+        fs::write(payload.join("new"), b"new").unwrap();
+        fs::create_dir(&target).unwrap();
+        let result = rename_directory(&payload, &target);
+        assert!(
+            matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "native directory collision: {result:?}"
+        );
+        assert!(payload.join("new").is_file());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        fs::create_dir(dir.path().join("target (1)")).unwrap();
+        let published = publish(&payload, &target, true, CollisionPolicy::Rename).unwrap();
+        assert_eq!(published, dir.path().join("target (2)"));
+        assert_eq!(fs::read(published.join("new")).unwrap(), b"new");
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(dir.path().join("target (1)")).unwrap().count(),
+            0
+        );
+    }
+    #[test]
+    fn directory_move_refuses_file_collision_and_reports_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("payload");
+        let target = dir.path().join("target");
+        fs::create_dir(&payload).unwrap();
+        fs::write(payload.join("new"), b"new").unwrap();
+        fs::write(&target, b"original").unwrap();
+        let result = rename_directory(&payload, &target);
+        assert!(
+            matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "native file collision: {result:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert!(payload.join("new").is_file());
+        let absent = dir.path().join("absent");
+        let result = rename_directory(&absent, &dir.path().join("missing-parent/out"));
+        assert!(
+            matches!(&result, Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists),
+            "non-collision error must not become retry: {result:?}"
+        );
+        let destination = dir.path().join("published");
+        let result = rename_directory(&payload, &destination);
+        assert!(result.is_ok(), "native absent-target move: {result:?}");
+        assert_eq!(fs::read(destination.join("new")).unwrap(), b"new");
+        assert!(!payload.exists());
     }
     #[test]
     fn publication_is_no_replace_even_when_target_arrives_late() {

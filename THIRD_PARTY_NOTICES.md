@@ -27,3 +27,13 @@ A copy of the Apache 2.0 license is included in `packaging/licenses/Apache-2.0.t
 This notice identifies the selected torrent engine; it is not a complete
 transitive-dependency licensing or distribution-compliance audit. Distribution
 still requires reviewing all bundled dependencies, notices, and assets.
+
+## renamore 0.3.2 (Windows builds)
+
+- Upstream: <https://github.com/indianakernick/renamore>
+- License selected: MIT (upstream offers MIT OR Apache-2.0)
+- Copyright (c) 2022 Indiana Kernick
+
+Used for Windows exclusive directory publication (`MoveFileExW` without replacement
+flags). The full MIT notice is bundled in `packaging/licenses/renamore-MIT.txt`.
+No non-atomic rename fallback is used.
