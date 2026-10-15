@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::{AppContext, Entity, TestAppContext, VisualTestContext, component::Root};
+use gpui_kit::{
+    AppContext, Entity, Focusable, TestAppContext, VisualTestContext, component::Root, px,
+};
 use ulos_core::{DownloadProgress, DownloadReceipt};
 
 use super::DownloadManager;
@@ -19,6 +21,418 @@ fn runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("test runtime")
+}
+
+#[gpui::test]
+fn running_named_queues_share_one_slot_and_exhausted_state_refreshes(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let first = fixture(b"first queue bytes");
+    let second = fixture(b"second queue bytes");
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (a, b) = queued_pair(
+        &view,
+        cx,
+        first.source.clone(),
+        second.source.clone(),
+        directory.path(),
+    );
+    let (one, two) = view.update(cx, |view, cx| {
+        let one = view.scheduler.create("First queue").unwrap();
+        let two = view.scheduler.create("Second queue").unwrap();
+        view.queue.assign_queue(&[a], one).unwrap();
+        view.queue.assign_queue(&[b], two).unwrap();
+        view.scheduler.selected = two;
+        view.scheduler.queue_mut(one).unwrap().running = true;
+        view.scheduler.queue_mut(two).unwrap().running = true;
+        view.advance(cx);
+        assert_eq!(view.active, Some(a));
+        (one, two)
+    });
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_scheduler(window, cx)));
+    draw(cx);
+    let content = view.read_with(cx, |view, _| {
+        view.scheduler_window.as_ref().unwrap().upgrade().unwrap()
+    });
+    poll(cx, |_| first.requested.try_recv().is_ok());
+    assert!(second.requested.try_recv().is_err());
+    view.read_with(cx, |view, _| assert_eq!(view.queue.active_count(), 1));
+    first.release.send(()).unwrap();
+    poll(cx, |_| second.requested.try_recv().is_ok());
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.active, Some(b));
+        assert_eq!(view.queue.active_count(), 1);
+        assert!(!view.scheduler.queue(one).unwrap().running);
+    });
+    second.release.send(()).unwrap();
+    poll(cx, |cx| {
+        view.read_with(cx, |view, _| {
+            view.active.is_none() && !view.scheduler.any_running()
+        })
+    });
+    draw(cx);
+    content.read_with(cx, |content, _| {
+        assert!(
+            content
+                .snapshot
+                .queues
+                .iter()
+                .filter(|queue| queue.id == one || queue.id == two)
+                .all(|queue| !queue.running)
+        );
+    });
+    first.server.join().unwrap();
+    second.server.join().unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join("first.bin")).unwrap(),
+        b"first queue bytes"
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("second.bin")).unwrap(),
+        b"second queue bytes"
+    );
+}
+
+#[gpui::test]
+fn scheduler_parent_rechecks_membership_and_expired_schedules_refresh_independently(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        scheduler::{DEFAULT_QUEUE, Schedule, ScheduleSpec},
+        scheduler_window::SchedulerRequest,
+    };
+    use chrono::{Local, NaiveDate, TimeZone};
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = view.update(cx, |view, cx| {
+        view.enqueue(
+            "https://example.invalid/file".into(),
+            directory.path().join("file.bin"),
+            false,
+            cx,
+        )
+        .unwrap()
+    });
+    let _menus = cx.update(|window, cx| {
+        crate::native_menu::install(cx, view.downgrade(), window.window_handle())
+    });
+    let button = cx
+        .debug_bounds("scheduler")
+        .expect("enabled Scheduler toolbar action");
+    cx.simulate_click(button.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    let content = view.read_with(cx, |view, _| {
+        view.scheduler_window.as_ref().unwrap().upgrade().unwrap()
+    });
+    let at = |hour| {
+        Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2030, 6, 3)
+                    .unwrap()
+                    .and_hms_opt(hour, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap()
+    };
+    view.update(cx, |view, cx| {
+        let second = view.scheduler.create("Second").unwrap();
+        let third = view.scheduler.create("Third").unwrap();
+        for (queue, start, stop) in [(DEFAULT_QUEUE, 10, 11), (second, 10, 11), (third, 15, 16)] {
+            let schedule = Schedule::new(
+                ScheduleSpec::Once {
+                    date: at(9).date_naive(),
+                    start: at(start).time(),
+                    stop: Some(at(stop).time()),
+                },
+                at(9),
+            )
+            .unwrap();
+            view.scheduler
+                .set_schedule(queue, Some(schedule), at(9))
+                .unwrap();
+        }
+        view.scheduler_tick(at(12), cx);
+        assert!(
+            !view
+                .scheduler
+                .queue(DEFAULT_QUEUE)
+                .unwrap()
+                .schedule
+                .as_ref()
+                .unwrap()
+                .enabled
+        );
+        assert!(view.scheduler.has_enabled_schedule());
+        view.arm_shutdown(id, cx);
+        assert!(!view.queue.item(id).unwrap().completion.is_armed());
+        let old_draft = view.scheduler_snapshot();
+        view.scheduler.selected = second;
+        view.scheduler_request(&SchedulerRequest::DeleteQueue(third), &old_draft, cx);
+        assert!(
+            view.scheduler.queue(third).is_some(),
+            "stale drafts cannot delete another queue"
+        );
+        view.scheduler.selected = DEFAULT_QUEUE;
+        view.scheduler_error = None;
+        view.refresh_scheduler(cx);
+    });
+    draw(cx);
+    content.read_with(cx, |content, _| {
+        assert!(
+            content
+                .snapshot
+                .queues
+                .iter()
+                .find(|queue| queue.id == DEFAULT_QUEUE)
+                .unwrap()
+                .schedule
+                .is_none()
+        );
+        assert!(
+            content
+                .snapshot
+                .queues
+                .iter()
+                .any(|queue| queue.schedule.is_some())
+        );
+    });
+    view.update(cx, |view, cx| {
+        let target = view.scheduler.create("Delete me").unwrap();
+        view.scheduler.selected = target;
+        view.queue.assign_queue(&[id], target).unwrap();
+        let draft = view.scheduler_snapshot();
+        view.scheduler_request(&SchedulerRequest::DeleteQueue(target), &draft, cx);
+        assert!(view.scheduler.queue(target).is_none());
+        assert_eq!(view.queue.item(id).unwrap().queue_id, DEFAULT_QUEUE);
+        assert!(view.queue.item(id).unwrap().is_queued());
+        let draft = view.scheduler_snapshot();
+        view.scheduler_request(&SchedulerRequest::DeleteQueue(DEFAULT_QUEUE), &draft, cx);
+        assert!(view.scheduler.queue(DEFAULT_QUEUE).is_some());
+        assert!(view.scheduler_error.is_some());
+    });
+    assert!(!directory.path().join("file.bin").exists());
+}
+
+#[gpui::test]
+fn compact_table_checkboxes_toggle_both_ways_and_links_do_not_select(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (first, second) = queued_pair(
+        &view,
+        cx,
+        "https://example.invalid/first".into(),
+        "https://example.invalid/second".into(),
+        directory.path(),
+    );
+    draw(cx);
+    assert_eq!(first, 1);
+    for selected in [true, false, true, false] {
+        let checkbox = cx.debug_bounds("select-download-1").unwrap();
+        cx.simulate_click(checkbox.center(), gpui_kit::Modifiers::default());
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.queue.selected.contains(&first), selected);
+            assert!(!view.queue.selected.contains(&second));
+            assert_eq!(
+                view.table
+                    .read(cx)
+                    .delegate()
+                    .rows
+                    .iter()
+                    .find(|row| row.id == first)
+                    .unwrap()
+                    .selected,
+                selected
+            );
+        });
+    }
+    for selected in [true, false] {
+        let checkbox = cx.debug_bounds("select-visible").unwrap();
+        cx.simulate_click(checkbox.center(), gpui_kit::Modifiers::default());
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.queue.selected.len(), if selected { 2 } else { 0 })
+        });
+    }
+    let table_bounds = cx.debug_bounds("download-table").unwrap();
+    let first_checkbox = cx.debug_bounds("select-download-1").unwrap();
+    assert!(first_checkbox.center().y - table_bounds.top() < px(60.));
+    let name = cx.debug_bounds("download-name-1").unwrap();
+    assert!(
+        name.size.width < px(300.),
+        "filename is content, not a full-width Button"
+    );
+    cx.simulate_click(name.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.detail_windows.contains_key(&first));
+        assert!(view.queue.selected.is_empty());
+        assert!(view.active.is_none());
+    });
+    cx.update(|window, cx| {
+        view.read(cx).table.clone().update(cx, |table, cx| {
+            table.set_selected_row(1, cx);
+            table.focus_handle(cx).focus(window, cx);
+        });
+    });
+    draw(cx);
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.detail_windows.contains_key(&second));
+        assert!(view.queue.selected.is_empty());
+    });
+}
+
+#[gpui::test]
+fn named_queue_schedule_runs_reordered_work_and_stop_preserves_active_transfer(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        scheduler::{Schedule, ScheduleSpec},
+        scheduler_window::SchedulerRequest,
+    };
+    use chrono::{Local, NaiveDate, TimeZone};
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let first = fixture(b"first scheduled payload");
+    let second = fixture(b"second scheduled payload");
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (a, b) = queued_pair(
+        &view,
+        cx,
+        first.source.clone(),
+        second.source.clone(),
+        directory.path(),
+    );
+    let at = |hour, minute| {
+        Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2030, 6, 3)
+                    .unwrap()
+                    .and_hms_opt(hour, minute, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap()
+    };
+    let queue_id = view.update(cx, |view, cx| {
+        let queue_id = view.scheduler.create("Night downloads").unwrap();
+        view.scheduler.selected = queue_id;
+        view.queue.assign_queue(&[a, b], queue_id).unwrap();
+        assert!(view.queue.move_queued(b, true));
+        view.queue.set_description(b, "Nightly archive").unwrap();
+        let schedule = Schedule::new(
+            ScheduleSpec::Once {
+                date: at(9, 0).date_naive(),
+                start: at(10, 0).time(),
+                stop: Some(at(11, 0).time()),
+            },
+            at(9, 0),
+        )
+        .unwrap();
+        view.scheduler
+            .set_schedule(queue_id, Some(schedule), at(9, 0))
+            .unwrap();
+        view.scheduler_tick(at(9, 30), cx);
+        assert!(view.active.is_none());
+        view.scheduler_tick(at(10, 0), cx);
+        assert_eq!(view.active, Some(b));
+        assert!(view.queue.item(b).unwrap().last_try.is_some());
+        view.sync_table(cx);
+        let row = view
+            .table
+            .read(cx)
+            .delegate()
+            .rows
+            .iter()
+            .find(|row| row.id == b)
+            .unwrap();
+        assert_eq!(row.queue_name, "Night downloads");
+        assert_eq!(row.description, "Nightly archive");
+        queue_id
+    });
+    poll(cx, |_| second.requested.try_recv().is_ok());
+    view.update(cx, |view, cx| {
+        let snapshot = view.scheduler_snapshot();
+        view.scheduler_request(&SchedulerRequest::AssignSelected(queue_id), &snapshot, cx);
+        assert!(view.scheduler_error.is_some());
+        view.scheduler_tick(at(11, 0), cx);
+        assert_eq!(view.active, Some(b));
+        assert!(!view.queue.item(b).unwrap().cancelling);
+        assert!(!view.scheduler.queue(queue_id).unwrap().running);
+    });
+    second.release.send(()).unwrap();
+    poll(cx, |cx| view.read_with(cx, |view, _| view.active.is_none()));
+    assert!(first.requested.try_recv().is_err());
+    view.read_with(cx, |view, _| {
+        assert!(view.queue.item(b).unwrap().is_finished());
+        assert!(view.queue.item(a).unwrap().is_queued());
+        assert_eq!(view.queue.item(a).unwrap().last_try, None);
+    });
+    view.update(cx, |view, cx| {
+        let snapshot = view.scheduler_snapshot();
+        view.scheduler_request(&SchedulerRequest::StartQueue(queue_id), &snapshot, cx);
+    });
+    poll(cx, |_| first.requested.try_recv().is_ok());
+    first.release.send(()).unwrap();
+    poll(cx, |cx| view.read_with(cx, |view, _| view.active.is_none()));
+    first.server.join().unwrap();
+    second.server.join().unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join("second.bin")).unwrap(),
+        b"second scheduled payload"
+    );
+}
+
+#[gpui::test]
+fn scheduler_window_is_reused_blocks_clipboard_and_survives_main_close(cx: &mut TestAppContext) {
+    use crate::scheduler_window::SchedulerRequest;
+    let runtime = runtime();
+    let (root, view, cx) = mount(cx, &runtime);
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_scheduler(window, cx)));
+    draw(cx);
+    let (handle, content) = view.read_with(cx, |view, _| {
+        let child = view.scheduler_window.as_ref().unwrap();
+        (child.handle, child.upgrade().unwrap())
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_scheduler(window, cx);
+            view.clipboard_enabled = true;
+            view.offer_clipboard(Some("https://example.invalid/copied"), window, cx);
+            assert!(view.add_windows.is_empty());
+            assert_eq!(view.scheduler_window.as_ref().unwrap().handle, handle);
+        })
+    });
+    let mut child = VisualTestContext::from_window(handle, &cx.cx);
+    child.dispatch_action(crate::native_menu::OpenScheduler);
+    draw(&mut child);
+    view.read_with(&child, |view, _| {
+        assert_eq!(view.scheduler_window.as_ref().unwrap().handle, handle)
+    });
+    child.update(|_, cx| {
+        content.update(cx, |_, cx| {
+            cx.emit(SchedulerRequest::CreateQueue("Night".into()))
+        })
+    });
+    draw(&mut child);
+    view.read_with(&child, |view, _| assert_eq!(view.scheduler.queues.len(), 2));
+    cx.update(|window, _| window.remove_window());
+    draw(&mut child);
+    child.update(|_, cx| {
+        content.update(cx, |_, cx| {
+            cx.emit(SchedulerRequest::CreateQueue("Weekend".into()))
+        })
+    });
+    draw(&mut child);
+    view.read_with(&child, |view, _| assert_eq!(view.scheduler.queues.len(), 3));
+    child.update(|_, cx| content.update(cx, |_, cx| cx.emit(SchedulerRequest::Close)));
+    child.run_until_parked();
+    drop(root);
 }
 
 #[gpui::test]
@@ -2979,6 +3393,7 @@ fn advanced_collision_rename_retry_preserves_original_without_initial_http(
     std::fs::write(&path, b"original content").unwrap();
     let fixture = advanced_fixture(false);
     let (_root, view, cx) = mount(cx, &runtime);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
     let id = advanced_add(&view, cx, &fixture, path.clone(), true);
     let (details, mut child) = advanced_details(&view, id, cx);
     poll(cx, |cx| {
@@ -3009,6 +3424,7 @@ fn advanced_overwrite_retry_requires_dialog_confirmation(cx: &mut TestAppContext
     std::fs::write(&path, b"keep until confirmed").unwrap();
     let fixture = advanced_fixture(false);
     let (_root, view, cx) = mount(cx, &runtime);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
     let id = advanced_add(&view, cx, &fixture, path.clone(), true);
     let (details, mut child) = advanced_details(&view, id, cx);
     poll(cx, |cx| {

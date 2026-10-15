@@ -13,6 +13,7 @@ ulos-core.workspace = true
 url.workspace = true
 directories = "6.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }

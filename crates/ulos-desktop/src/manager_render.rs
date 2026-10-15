@@ -37,6 +37,7 @@ enum MenuCommand {
     Remove,
     Clear,
     Options,
+    Scheduler,
     Details,
     Reveal,
     ToggleSidebar,
@@ -59,6 +60,7 @@ fn manager_menu_item(
             MenuCommand::Remove => view.remove_selected(window, cx),
             MenuCommand::Clear => view.clear_finished(window, cx),
             MenuCommand::Options => view.open_options(window, cx),
+            MenuCommand::Scheduler => view.open_scheduler(window, cx),
             MenuCommand::Details => view.open_selected_details(window, cx),
             MenuCommand::Reveal => view.reveal_selected(cx),
             MenuCommand::ToggleSidebar => view.toggle_sidebar(cx),
@@ -212,7 +214,13 @@ impl DownloadManager {
             )
             .content(
                 toolbar_button("start-queue", "Start Queue", AssetIcon::Play)
-                    .disabled(self.queue_running || self.queue.next_queued().is_none())
+                    .disabled(
+                        self.queue_running
+                            || self
+                                .queue
+                                .next_in_queue(crate::scheduler::DEFAULT_QUEUE)
+                                .is_none(),
+                    )
                     .on_click(cx.listener(|view, _, _, cx| view.start_queue(cx))),
             )
             .content(
@@ -239,8 +247,7 @@ impl DownloadManager {
             )
             .content(
                 toolbar_button("scheduler", "Scheduler", AssetIcon::Calendar)
-                    .disabled(true)
-                    .tooltip("Scheduling is not implemented yet"),
+                    .on_click(cx.listener(|view, _, window, cx| view.open_scheduler(window, cx))),
             )
             .content(
                 toolbar_button("grabber", "Grabber", AssetIcon::Globe)
@@ -281,7 +288,11 @@ impl DownloadManager {
         let downloads = entity.clone();
         let view = entity;
         let running = self.queue_running;
-        let can_start = !running && self.queue.next_queued().is_some();
+        let can_start = !running
+            && self
+                .queue
+                .next_in_queue(crate::scheduler::DEFAULT_QUEUE)
+                .is_some();
         let can_stop = self.queue.active_count() > 0;
         let selected = !self.queue.selected.is_empty();
         let selected_active = self
@@ -331,6 +342,11 @@ impl DownloadManager {
                             manager_menu_item("Stop All", tasks.clone(), MenuCommand::StopAll)
                                 .disabled(!can_stop),
                         )
+                        .item(manager_menu_item(
+                            "Scheduling & queues…",
+                            tasks.clone(),
+                            MenuCommand::Scheduler,
+                        ))
                     }),
             )
             .child(
@@ -479,8 +495,9 @@ impl DownloadManager {
             .when(!empty, |this| {
                 this.child(
                     DataTable::new(&self.table)
-                        .with_size(gpui_kit::component::Size::Size(px(48.)))
-                        .bordered(true),
+                        .with_size(gpui_kit::component::Size::Size(px(36.)))
+                        .header_row_height(px(32.))
+                        .bordered(false),
                 )
             })
             .when(empty, |this| {
@@ -556,6 +573,16 @@ impl Render for DownloadManager {
             .on_action(cx.listener(|view, _: &StartQueue, _, cx| view.start_queue(cx)))
             .on_action(cx.listener(|view, _: &StopAll, _, cx| view.stop_all(cx)))
             .on_action(cx.listener(|view, _: &ToggleSidebar, _, cx| view.toggle_sidebar(cx)))
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "enter" && view.table.read(cx).focus_handle(cx).is_focused(window) {
+                    let id = view.table.read(cx).selected_row()
+                        .and_then(|row| view.table.read(cx).delegate().rows.get(row).map(|row| row.id));
+                    if let Some(id) = id {
+                        view.open_details(id, window, cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -593,7 +620,7 @@ impl Render for DownloadManager {
                     )))
                     .child(Label::new(format!(
                         "Queue {} · Session only",
-                        if self.queue_running {
+                        if self.queue_running || self.scheduler.any_running() {
                             "Running"
                         } else {
                             "stopped"

@@ -24,6 +24,7 @@ gpui_kit::actions!(
         RemoveDownloads,
         ClearFinishedDownloads,
         OpenOptions,
+        OpenScheduler,
         ShowDownloadDetails,
         RevealDownloads,
         ShowAllDownloads,
@@ -49,6 +50,7 @@ pub enum Command {
     Remove,
     Clear,
     Options,
+    Scheduler,
     Details,
     Reveal,
     All,
@@ -93,6 +95,7 @@ impl Command {
             Self::Clear => state.finished,
             Self::Options => state.can_options,
             Self::Details => state.selected,
+            Self::Scheduler => true,
             Self::Reveal => state.revealable,
             Self::All
             | Self::Finished
@@ -125,6 +128,12 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
             item("Start Queue", StartDownloads, Command::Start, state),
             item("Stop Queue", StopDownloadsQueue, Command::StopQueue, state),
             item("Stop All", StopDownloads, Command::StopAll, state),
+            item(
+                "Scheduling & Queues…",
+                OpenScheduler,
+                Command::Scheduler,
+                state,
+            ),
         ]),
         Menu::new("File").items([
             item("Add URL…", NewDownload, Command::Add, state),
@@ -256,6 +265,7 @@ pub fn install(
     register::<RemoveDownloads>(cx, &owner, main, Command::Remove);
     register::<ClearFinishedDownloads>(cx, &owner, main, Command::Clear);
     register::<OpenOptions>(cx, &owner, main, Command::Options);
+    register::<OpenScheduler>(cx, &owner, main, Command::Scheduler);
     register::<ShowDownloadDetails>(cx, &owner, main, Command::Details);
     register::<RevealDownloads>(cx, &owner, main, Command::Reveal);
     register::<ShowAllDownloads>(cx, &owner, main, Command::All);

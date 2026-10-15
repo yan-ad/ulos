@@ -9,13 +9,13 @@ The project is in early development. The CLI retains single-stream downloads. Th
 - HTTP/HTTPS downloads streamed to disk without buffering the entire file in memory.
 - Unique temporary files beside the destination and applicable response-length checks. Reject existing files by default, optionally publish a numbered filename, or explicitly authorize replacement only after a successful staged transfer.
 - Cancellation through the CLI or desktop interface, with best-effort temporary-file cleanup.
-- A desktop manager with native macOS system menus (Ulos, Tasks, File, Edit, Downloads, View, Help); non-macOS retains in-window Kit dropdown menus. One shared action toolbar has stock icon-only Buttons except the labeled Add URL button, accessible names, built-in tooltips, and a stock search Input on the same row. A collapsible stock Kit sidebar and a viewport-virtualized Kit DataTable show filename, size, status, and transfer rate, with stable-ID selection checkboxes. The default follows system appearance; the toolbar theme selector and View menu offer Follow system, Light, and Dark using stock Kit themes.
-- A session queue capped at 500 records, with one active download (possibly multiple HTTP connections) and FIFO queue advancement. A paused download retains its active slot. Search, filtering, sorting, and selection do not change queue order.
+- A desktop manager with native macOS system menus (Ulos, Tasks, File, Edit, Downloads, View, Help); non-macOS retains in-window Kit dropdown menus. One shared action toolbar has stock icon-only Buttons except the labeled Add URL button, accessible names, built-in tooltips, and a stock search Input on the same row. A collapsible stock Kit sidebar and a viewport-virtualized Kit DataTable show nine columns total: selection checkbox, Name, Size, Status, Transfer rate, Queue, Time left, Last try, and Description, with stable-ID checkbox selection independent of row focus. The default follows system appearance; the toolbar theme selector and View menu offer Follow system, Light, and Dark using stock Kit themes.
+- A session capped at 500 records and 32 named queues (default Main queue), with one global active HTTP transfer (possibly multiple connections). A paused download retains its active slot. Scheduler supports explicit queue ordering and local once/weekly schedules while Ulos stays open; table search, filtering, sorting, and selection do not change dispatch order.
 - Independent native Add Download windows (new draft per invocation, up to 16) with editable URL, filename, and destination, native folder/save pickers, and options to start now or queue for later.
 - Filename suggestions from the URL path, sanitized into a portable single filename. Naming itself makes no network request. Address edits automatically check advisory size with a debounced HEAD request; sizes use KB/MB/GB/TB with a filename-category icon. Clipboard-prefilled drafts remain network-free until edited or explicitly checked.
 - Stock Kit radio groups for connections and existing-file conflicts. Conflict choices appear only for an existing regular target; replacement still requires destination-specific consent.
 - Native download status windows showing actual progress, transfer rate, and estimated time when available. Each download has one reused/activated window; different download IDs can be viewed concurrently. Removing records does not delete downloaded files; completed downloads can be revealed in their folder.
-- Optional copied-link detection that opens an Add Download form for confirmation. It is off by default, session-only, and gated by the active main manager window, suppressed by any Add/status window or Options dialog, and rechecked after async reads. Copying a URL never starts a download or network request.
+- Optional copied-link detection that opens an Add Download form for confirmation. It is off by default, session-only, and gated by the active main manager window, suppressed by any Add/status/Scheduler window or Options dialog, and rechecked after async reads. Copying a URL never starts a download or network request.
 
 Buttons, Inputs, and Checkboxes retain stock Kit appearance, including in child windows; no per-control size, padding, color, or variant overrides. All application widgets, panels, and text use GPUI Kit components; Kit-reexported `div`, `v_flex`, and `h_flex` are layout-only, with no custom-painted controls. Options remains a Kit modal. Native OS chrome and path pickers do not require bespoke GTK/Swift UI. Outstanding pickers guard Add close/dismiss/submit. Closing the manager leaves child windows usable; the app quits when its last window closes. Closing status alone never cancels a transfer, but does cancel its armed shutdown or countdown; removing/clearing records closes related status windows while leaving files untouched.
 
@@ -42,11 +42,11 @@ Use **Add URL** to enter an HTTP/HTTPS address, review the suggested filename, a
 
 On macOS, **⌘N** opens Add Download, **⌘,** opens Options when available, and **⌘Q** quits. Native Edit commands target the focused Kit input.
 
-The sidebar starts expanded each session. Its Downloads group contains All downloads, Finished, Unfinished, and Queue; File types contains seven flat filters: Image, Music, Video, Apps, Document, Compressed, and Other. Expanded items show real session counts; collapsed items use Kit’s icon rail and tooltips, with counts retained in accessible names. Use the stock icon button immediately before Add URL, **⌘B / Ctrl+B** in the manager, or View’s sidebar command. Collapse does not reset search, filtering, selection, or FIFO order, and is not persisted.
+The sidebar starts expanded each session. Its Downloads group contains All downloads, Finished, Unfinished, and Queue; File types contains seven flat filters: Image, Music, Video, Apps, Document, Compressed, and Other. Expanded items show real session counts; collapsed items use Kit’s icon rail and tooltips, with counts retained in accessible names. Use the stock icon button immediately before Add URL, **⌘B / Ctrl+B** in the manager, or View’s sidebar command. Collapse does not reset search, filtering, selection, or dispatch order, and is not persisted.
 
 The main macOS window extends the manager into the titlebar area, with native window controls beside the action toolbar and no separate visible Ulos title strip. Add windows keep native window controls without a visible title. The macOS status window uses transparent full-content chrome and a short fixed Download title, with Kit segmented tabs in its TitleBar.
 
-Click a filename or use **Details** to inspect the transfer. Closing its details window does not cancel the download. Queue records and clipboard preferences are not saved between sessions.
+Click a filename Kit Link, press Enter on the focused row, double-click a row, or use **Details** to inspect the transfer. Closing its details window does not cancel the download. The borderless Kit table uses 36px rows and a 32px header through public APIs; filename Links have colored category icons, not Button variants. Time left uses actual transfer rate only; Last try is the local actual worker-start time; Description is user-entered in Scheduler. Unknown values stay blank. Clipboard preferences are session-only. SQLite stores metadata-only destination/status/bytes history, not source URLs or schedules. Restored source-less records cannot start or retry. Queue names, membership, ordering, schedules, descriptions, and Last try are session-only; this is not durable transfer recovery.
 
 ### Desktop transfer controls
 
@@ -58,9 +58,17 @@ In **Speed**, enable the limiter, enter **1–1,048,576 KiB/s**, and apply. Disa
 
 Add Download offers **Ask / do not overwrite** (default), **Rename**, or **Overwrite**. Overwrite requires the explicit authorization checkbox for the selected destination; changing the destination resets consent. An already-exists failure exposes **Override existing** (Kit confirmation required) and **Add another file** (fresh numbered-name retry). No retry starts automatically. Rename keeps the original and publishes `stem (1).extension`, trying further bounded candidates on collision.
 
+### Scheduling & queues
+
+Open **Scheduler** to create or rename queues (32 maximum including Main queue). Select downloads with the main-table checkboxes, then assign them to the selected queue in Scheduler. Delete a non-main queue to reassign its members to Main queue; active/paused work cannot be moved or reassigned and blocks deletion of its queue. Use **Move earlier / Move later** for waiting files, independently of table sort. Start/Stop Queue in the main toolbar targets Main queue; named queues are started/stopped in Scheduler. Across running queues, dispatch picks the smallest `(queue_order, id)`, not round-robin. Stopping a queue lets its active transfer finish without further advancement; **Stop All** stops every queue and requests active cancellation.
+
+Schedules use local **Once** (future `YYYY-MM-DD`, `HH:MM`) or **Weekly** (at least one weekday) starts and an optional `HH:MM` stop. Stop must differ from start; an earlier stop is overnight on the next day and stops advancement, not the active transfer. Nonexistent local DST occurrences are skipped; ambiguous times use the earlier instant. After sleep, only the current unexpired window can start, never an ended window; without a stop, catch-up is limited to the start's local day, not an automatic end-of-day stop. Repeated ticks or a manual stop cannot restart the same occurrence. Recurrence never retries finished, failed, or cancelled rows automatically.
+
+The reused native Scheduler child has its own Kit Root and stays usable after the main window closes. Ulos must remain open; there is no OS/background scheduler. Scheduler suppresses clipboard detection both before reads and when async proposals return. Enabling a schedule cancels and blocks completion shutdown. Queue and schedule configuration is session-only.
+
 ### Confirmed completion shutdown
 
-**This feature can turn off your computer. Save all work in other applications first.** In an active download's **Completion** tab, check **Shut down after successful completion**, then accept the confirmation dialog. It is off by default and per download. Only successfully published completion with every queue record finished can start the visible **30-second countdown**; **Cancel shutdown** withdraws an undispatched request. New work, retry, failure, cancellation, record removal, closing that status window, or closing all windows cancels the intent. Closing status leaves downloading alone: no hidden countdown is allowed.
+**This feature can turn off your computer. Save all work in other applications first.** In an active download's **Completion** tab, check **Shut down after successful completion**, then accept the confirmation dialog. It is off by default and per download. Only successfully published completion with every queue record finished can start the visible **30-second countdown**; **Cancel shutdown** withdraws an undispatched request. New work, retry, failure, cancellation, record removal, enabling a schedule, closing that status window, or closing all windows cancels the intent. Enabled schedules also block arming/countdown/dispatch. Closing status leaves downloading alone: no hidden countdown is allowed.
 
 The production provider requests real OS shutdown: macOS System Events through `osascript` (Automation permission may prompt), Linux `systemctl poweroff` (requires an available provider and OS permission), or Windows `shutdown.exe /s /t 0`. There is no forced app closure, sudo, elevation, or permission bypass. Provider errors are displayed; successful command exit is not proof the computer powered off. After dispatch, Ulos cannot revoke the OS request. Tests inspect gates/command plans and suppress dispatch; no host poweroff or OS settings changes were tested. See [Testing](docs/TESTING.md).
 
@@ -81,16 +89,16 @@ Transfers write into an exclusively created `.part` file beside the destination.
 
 Cancellation can race with final publication, so a completed file may exist even after cancellation is requested. Abrupt termination can leave temporary files; crash recovery and resumable checkpoints are not implemented.
 
-Copied-link detection requires explicit consent for each session. It accepts one bounded HTTP/HTTPS URL and offers confirmation rather than downloading automatically. Clipboard contents are not logged or persisted. Download details omit URL credentials, query strings, and fragments, but secrets in URL paths are not automatically redacted. Accepted source URLs, including signed queries, remain in memory while needed for the transfer.
+Copied-link detection requires explicit consent for each session. It accepts one bounded HTTP/HTTPS URL and offers confirmation rather than downloading automatically. Clipboard contents and network secrets are not logged; clipboard contents are not persisted. Download details omit URL credentials, query strings, and fragments, but secrets in URL paths are not automatically redacted. Accepted source URLs, including signed queries, remain in memory while needed for the transfer.
 
 Ulos does not provide DRM, captcha, or access-control bypass.
 
 ## Not implemented yet
 
 - Durable checkpoints and pause/resume across application restarts (session pause/resume is implemented for verified range transfers).
-- Persistent queues, download history, and startup recovery.
+- Durable source-bearing queues, checkpoints, and startup recovery (current SQLite history is metadata-only).
 - Automatic retries (manual failed-download retry is available).
-- Scheduling, site grabbing, and completion actions beyond confirmed shutdown.
+- Background/closed-app scheduling, site grabbing, and completion actions beyond confirmed shutdown.
 - Browser extensions and native-messaging integration.
 - Torrent downloads, including magnet links and `.torrent` files.
 - Installers and automatic updates.
@@ -146,4 +154,4 @@ Ulos Download Manager is licensed under the [MIT License](LICENSE). Dependencies
 
 ### Appearance
 
-Ulos starts in **Follow system** mode and responds to appearance changes while running. Use the monitor/sun/moon toolbar button or **View** to choose **Follow system**, **Light**, or **Dark**. Explicit Light/Dark choices remain fixed until changed. This session-only preference applies to manager, Add, and status windows; it resets to Follow system on the next launch. No custom control colors are applied.
+Ulos starts in **Follow system** mode and responds to appearance changes while running. Use the monitor/sun/moon toolbar button or **View** to choose **Follow system**, **Light**, or **Dark**. Explicit Light/Dark choices remain fixed until changed. This session-only preference applies to manager, Add, status, and Scheduler windows; it resets to Follow system on the next launch. No custom control colors are applied; shared category icons provide file-type scanning cues.

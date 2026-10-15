@@ -6,6 +6,7 @@ use crate::{
         RequestShutdown, RetryDownload, SetConnections, SetRateLimit, TogglePause,
     },
     manager::DownloadManager,
+    scheduler_window::{SchedulerRequest, SchedulerSnapshot, SchedulerWindow},
 };
 use gpui_kit::{
     component::{ActiveTheme, WindowExt, v_flex},
@@ -15,6 +16,50 @@ use gpui_kit::{
 pub(crate) struct ChildWindow<T: 'static> {
     pub handle: AnyWindowHandle,
     pub content: WeakEntity<T>,
+}
+
+pub(crate) struct NativeSchedulerWindow {
+    pub content: Entity<SchedulerWindow>,
+    _owner: Entity<DownloadManager>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl NativeSchedulerWindow {
+    pub fn new(
+        owner: Entity<DownloadManager>,
+        snapshot: SchedulerSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let content = cx.new(|cx| SchedulerWindow::new(snapshot, window, cx));
+        let subscription = cx.subscribe_in(
+            &content,
+            window,
+            |view, _, request: &SchedulerRequest, window, cx| {
+                if matches!(request, SchedulerRequest::Close) {
+                    window.remove_window();
+                    return;
+                }
+                let draft = view.content.read(cx).snapshot.clone();
+                view._owner
+                    .update(cx, |owner, cx| owner.scheduler_request(request, &draft, cx));
+            },
+        );
+        Self {
+            content,
+            _owner: owner,
+            _subscriptions: vec![subscription, crate::palette::observe_window(window, cx)],
+        }
+    }
+}
+
+impl Render for NativeSchedulerWindow {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .child(self.content.clone())
+    }
 }
 impl<T: 'static> ChildWindow<T> {
     pub fn upgrade(&self) -> Option<Entity<T>> {

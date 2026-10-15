@@ -1,13 +1,15 @@
 //! Snapshot-backed Kit table. Only viewport cells instantiate visual controls.
-use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+use chrono::{DateTime, Local};
 
 use gpui_kit::{
     component::{
         Disableable, Icon,
-        button::Button,
         checkbox::Checkbox,
         h_flex,
         label::Label,
+        link::Link,
         table::{Column, ColumnSort, TableDelegate, TableState},
     },
     *,
@@ -31,7 +33,10 @@ pub struct DownloadRow {
     pub progress: Option<ulos_core::DownloadProgress>,
     pub rate: Option<f64>,
     pub selected: bool,
-    pub destination: PathBuf,
+    pub queue_name: String,
+    pub time_left: Option<Duration>,
+    pub last_try: Option<SystemTime>,
+    pub description: String,
 }
 
 pub struct DownloadTable {
@@ -48,31 +53,62 @@ impl DownloadTable {
         Self {
             rows: Vec::new(),
             owner,
-            columns: vec![
-                Column::new("selected", "")
-                    .width(px(40.))
-                    .resizable(false)
-                    .movable(false)
-                    .selectable(false),
-                Column::new("name", "Name")
-                    .width(px(400.))
-                    .sortable()
-                    .movable(false),
-                Column::new("size", "Size")
-                    .width(px(100.))
-                    .sortable()
-                    .movable(false),
-                Column::new("status", "Status")
-                    .width(px(170.))
-                    .movable(false),
-                Column::new("rate", "Transfer rate")
-                    .width(px(130.))
-                    .movable(false),
-            ],
+            columns: columns(),
             header_all_selected: false,
             #[cfg(test)]
             rendered_cells: Default::default(),
         }
+    }
+}
+
+/// Preserve the original sortable column indexes when adding snapshot columns.
+fn columns() -> Vec<Column> {
+    vec![
+        Column::new("selected", "")
+            .width(px(40.))
+            .resizable(false)
+            .movable(false)
+            .selectable(false),
+        Column::new("name", "Name")
+            .width(px(300.))
+            .sortable()
+            .movable(false),
+        Column::new("size", "Size")
+            .width(px(100.))
+            .sortable()
+            .movable(false),
+        Column::new("status", "Status")
+            .width(px(180.))
+            .movable(false),
+        Column::new("rate", "Transfer rate")
+            .width(px(120.))
+            .movable(false),
+        Column::new("queue", "Queue").width(px(140.)).movable(false),
+        Column::new("time-left", "Time left")
+            .width(px(100.))
+            .movable(false),
+        Column::new("last-try", "Last try")
+            .width(px(160.))
+            .movable(false),
+        Column::new("description", "Description")
+            .width(px(240.))
+            .movable(false),
+    ]
+}
+
+impl DownloadRow {
+    fn time_left_label(&self) -> String {
+        self.time_left.map(formatting::duration).unwrap_or_default()
+    }
+
+    fn last_try_label(&self) -> String {
+        self.last_try
+            .map(|value| {
+                DateTime::<Local>::from(value)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -116,10 +152,12 @@ impl TableDelegate for DownloadTable {
         if col_ix == 0 {
             let owner = self.owner.clone();
             Checkbox::new("select-visible")
+                .debug_selector(|| "select-visible".into())
                 .accessibility_label("Select all visible downloads")
                 .checked(self.header_all_selected)
                 .disabled(self.rows.is_empty())
                 .on_change(move |checked, _, cx| {
+                    cx.stop_propagation();
                     let checked = *checked;
                     let owner = owner.clone();
                     cx.defer(move |cx| {
@@ -128,7 +166,11 @@ impl TableDelegate for DownloadTable {
                 })
                 .into_any_element()
         } else {
-            Label::new(self.columns[col_ix].name.clone()).into_any_element()
+            let key = self.columns[col_ix].key.clone();
+            div()
+                .debug_selector(move || format!("download-header-{key}"))
+                .child(Label::new(self.columns[col_ix].name.clone()))
+                .into_any_element()
         }
     }
 
@@ -147,9 +189,11 @@ impl TableDelegate for DownloadTable {
             0 => {
                 let owner = self.owner.clone();
                 Checkbox::new(("select-download", id))
+                    .debug_selector(move || format!("select-download-{id}"))
                     .accessibility_label(format!("Select {}", row.name))
                     .checked(row.selected)
                     .on_change(move |checked, _, cx| {
+                        cx.stop_propagation();
                         let checked = *checked;
                         let owner = owner.clone();
                         cx.defer(move |cx| {
@@ -161,24 +205,26 @@ impl TableDelegate for DownloadTable {
             }
             1 => {
                 let owner = self.owner.clone();
-                Button::new(("download-name", id))
-                    .accessibility_label(format!("Open details for {}", row.name))
-                    .debug_selector(move || format!("download-name-{id}"))
-                    .icon(crate::file_icons::category_icon(row.category, cx))
-                    .label(row.name.clone())
-                    .tooltip(row.destination.display().to_string())
-                    .on_click(move |_, window, cx| {
-                        let _ =
-                            owner.update(cx, |manager, cx| manager.open_details(id, window, cx));
-                    })
+                h_flex()
+                    .gap_2()
+                    .child(crate::file_icons::category_icon(row.category, cx))
+                    .child(
+                        Link::new(("download-name", id))
+                            // A target URL would launch externally even with on_click.
+                            // Details are an application action, so deliberately omit href.
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("download-name-{id}"))
+                                    .child(Label::new(row.name.clone())),
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = owner
+                                    .update(cx, |manager, cx| manager.open_details(id, window, cx));
+                            }),
+                    )
                     .into_any_element()
             }
-            2 => Label::new(
-                row.size
-                    .map(formatting::bytes)
-                    .unwrap_or_else(|| "—".into()),
-            )
-            .into_any_element(),
+            2 => Label::new(row.size.map(formatting::bytes).unwrap_or_default()).into_any_element(),
             3 => h_flex()
                 .gap_2()
                 .child(
@@ -189,12 +235,17 @@ impl TableDelegate for DownloadTable {
                         .text_color(status_color(&row.status, cx)),
                 )
                 .into_any_element(),
-            _ => Label::new(
+            4 => Label::new(
                 row.rate
                     .map(|rate| format!("{}/s", formatting::bytes(rate as u64)))
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_default(),
             )
             .into_any_element(),
+            5 => Label::new(row.queue_name.clone()).into_any_element(),
+            6 => Label::new(row.time_left_label()).into_any_element(),
+            7 => Label::new(row.last_try_label()).into_any_element(),
+            8 => Label::new(row.description.clone()).into_any_element(),
+            _ => unreachable!("unknown download table column"),
         }
     }
 }
@@ -215,8 +266,82 @@ fn status_label(status: &str, progress: Option<ulos_core::DownloadProgress>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::status_label;
+    use super::{DownloadRow, columns, status_label};
+    use crate::queue::Category;
+    use chrono::{DateTime, Local};
+    use std::time::{Duration, SystemTime};
     use ulos_core::DownloadProgress;
+
+    fn snapshot() -> DownloadRow {
+        DownloadRow {
+            id: 7,
+            name: "archive.zip".into(),
+            category: Category::Compressed,
+            size: None,
+            status: "Queued".into(),
+            progress: None,
+            rate: None,
+            selected: false,
+            queue_name: "Main queue".into(),
+            time_left: None,
+            last_try: None,
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn headers_preserve_original_indexes_and_append_snapshot_columns() {
+        let columns = columns();
+        let contract = [
+            ("selected", "", 40.),
+            ("name", "Name", 300.),
+            ("size", "Size", 100.),
+            ("status", "Status", 180.),
+            ("rate", "Transfer rate", 120.),
+            ("queue", "Queue", 140.),
+            ("time-left", "Time left", 100.),
+            ("last-try", "Last try", 160.),
+            ("description", "Description", 240.),
+        ];
+        assert_eq!(columns.len(), contract.len());
+        for (index, (column, (key, label, width))) in columns.iter().zip(contract).enumerate() {
+            assert_eq!(column.key.as_ref(), key);
+            assert_eq!(column.name.as_ref(), label);
+            assert_eq!(column.width, gpui_kit::px(width));
+            assert!(!column.movable);
+            assert_eq!(column.sort.is_some(), matches!(index, 1 | 2));
+        }
+        assert!(!columns[0].resizable);
+        assert!(!columns[0].selectable);
+    }
+
+    #[test]
+    fn missing_snapshot_values_stay_empty() {
+        let row = snapshot();
+        assert_eq!(row.queue_name, "Main queue");
+        assert_eq!(row.time_left_label(), "");
+        assert_eq!(row.last_try_label(), "");
+        assert_eq!(row.description, "");
+    }
+
+    #[test]
+    fn snapshot_formats_actual_duration_and_local_attempt_time() {
+        let mut row = snapshot();
+        for (seconds, expected) in [(0, "0s"), (59, "59s"), (61, "1m 1s"), (3661, "1h 1m")] {
+            row.time_left = Some(Duration::from_secs(seconds));
+            assert_eq!(row.time_left_label(), expected);
+        }
+        let attempted = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        row.last_try = Some(attempted);
+        assert_eq!(
+            row.last_try_label(),
+            DateTime::<Local>::from(attempted)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        );
+        row.description = "Release archive".into();
+        assert_eq!(row.description, "Release archive");
+    }
 
     #[test]
     fn known_progress_supplements_readable_status() {

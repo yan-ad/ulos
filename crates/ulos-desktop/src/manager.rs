@@ -27,6 +27,8 @@ use crate::{
     native_windows::{ChildWindow, NativeAddWindow, StatusWindow, add_options, status_options},
     platform_paths::PlatformPaths,
     queue::{DownloadId, Filter, SessionQueue, SortColumn},
+    scheduler::{DEFAULT_QUEUE, Scheduler},
+    scheduler_window::SchedulerWindow,
     storage::{HistoryRecord, HistoryWriter},
 };
 
@@ -73,6 +75,10 @@ pub struct DownloadManager {
     removal_busy: bool,
     pending_removal: Option<Vec<DownloadId>>,
     _file_removal: Option<Task<()>>,
+    scheduler: Scheduler,
+    scheduler_window: Option<ChildWindow<SchedulerWindow>>,
+    scheduler_error: Option<String>,
+    _schedule_timer: Option<Task<()>>,
     #[cfg(any(target_os = "macos", test))]
     pub(crate) native_menu_subscriptions: Vec<Subscription>,
     #[cfg(test)]
@@ -101,17 +107,13 @@ impl DownloadManager {
         });
         let table_subscription =
             cx.subscribe_in(&table, window, |view, table, event, window, cx| {
-                let (TableEvent::SelectRow(row) | TableEvent::DoubleClickedRow(row)) = event else {
+                let TableEvent::DoubleClickedRow(row) = event else {
                     return;
                 };
                 let Some(id) = table.read(cx).delegate().rows.get(*row).map(|row| row.id) else {
                     return;
                 };
-                if matches!(event, TableEvent::DoubleClickedRow(_)) {
-                    view.open_details(id, window, cx);
-                } else {
-                    view.select_item(id, true, cx);
-                }
+                view.open_details(id, window, cx);
             });
         let owner = cx.weak_entity();
         let window_closed = cx.on_window_closed(move |cx, closed| {
@@ -122,6 +124,13 @@ impl DownloadManager {
                         view.cancel_all_shutdowns(cx);
                     }
                     view.add_windows.remove(&closed);
+                    if view
+                        .scheduler_window
+                        .as_ref()
+                        .is_some_and(|child| child.handle.window_id() == closed)
+                    {
+                        view.scheduler_window = None;
+                    }
                     let shutdown_ids: Vec<_> = view
                         .detail_windows
                         .iter()
@@ -154,6 +163,7 @@ impl DownloadManager {
                         && !view.options_open
                         && !view.removal_open
                         && !view.removal_busy
+                        && view.scheduler_window.is_none()
                 });
                 match enabled {
                     Ok(false) => continue,
@@ -171,6 +181,17 @@ impl DownloadManager {
                             view.offer_clipboard(text.as_deref(), window, cx);
                         }
                     });
+                }
+            }
+        });
+        let schedule_timer = cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if view
+                    .update(cx, |view, cx| view.scheduler_tick(chrono::Local::now(), cx))
+                    .is_err()
+                {
+                    break;
                 }
             }
         });
@@ -212,6 +233,10 @@ impl DownloadManager {
             removal_busy: false,
             pending_removal: None,
             _file_removal: None,
+            scheduler: Scheduler::default(),
+            scheduler_window: None,
+            scheduler_error: None,
+            _schedule_timer: Some(schedule_timer),
             #[cfg(any(target_os = "macos", test))]
             native_menu_subscriptions: Vec::new(),
             #[cfg(test)]
@@ -333,6 +358,7 @@ impl DownloadManager {
         };
         let source = item.source().to_owned();
         let destination = item.destination.clone();
+        item.last_try = Some(std::time::SystemTime::now());
         item.apply_state(TransferState::Preparing, Instant::now());
         let options = item.options.clone();
         self.active = Some(id);
@@ -462,7 +488,9 @@ impl DownloadManager {
                     .item_mut(id)
                     .is_some_and(|item| item.completion.on_success(Instant::now()));
                 if countdown {
-                    if self.queue.items.iter().all(|item| item.is_finished()) {
+                    if self.queue.items.iter().all(|item| item.is_finished())
+                        && !self.scheduler.has_enabled_schedule()
+                    {
                         self.start_shutdown_countdown(id, cx);
                     } else {
                         self.cancel_all_shutdowns(cx);
@@ -485,18 +513,42 @@ impl DownloadManager {
     }
 
     fn advance(&mut self, cx: &mut Context<Self>) {
-        if self.queue_running && self.active.is_none() {
-            if let Some(id) = self.queue.next_queued() {
-                self.start_item(id, cx);
-            } else {
-                self.queue_running = false;
-                cx.notify();
+        self.scheduler
+            .queue_mut(DEFAULT_QUEUE)
+            .expect("Main queue exists")
+            .running = self.queue_running;
+        if self.active.is_some() || self.removal_busy {
+            return;
+        }
+        let mut stopped = false;
+        for queue in &mut self.scheduler.queues {
+            if queue.running && self.queue.next_in_queue(queue.id).is_none() {
+                queue.running = false;
+                stopped = true;
             }
+        }
+        self.queue_running = self
+            .scheduler
+            .queue(DEFAULT_QUEUE)
+            .is_some_and(|queue| queue.running);
+        let next = self
+            .scheduler
+            .queues
+            .iter()
+            .filter(|queue| queue.running)
+            .filter_map(|queue| self.queue.next_in_queue(queue.id))
+            .min_by_key(|id| self.queue.item(*id).map(|item| (item.queue_order, item.id)));
+        if let Some(id) = next {
+            self.start_item(id, cx);
+        }
+        if stopped {
+            self.refresh_scheduler(cx);
+            cx.notify();
         }
     }
 
     fn start_queue(&mut self, cx: &mut Context<Self>) {
-        if self.queue.next_queued().is_none() {
+        if self.queue.next_in_queue(DEFAULT_QUEUE).is_none() {
             return;
         }
         self.queue_running = true;
@@ -506,13 +558,23 @@ impl DownloadManager {
 
     fn stop_queue(&mut self, cx: &mut Context<Self>) {
         self.queue_running = false;
+        self.scheduler
+            .queue_mut(DEFAULT_QUEUE)
+            .expect("Main queue exists")
+            .running = false;
         self.notice = Some("Queue stopped. The active download will finish.".into());
+        self.refresh_scheduler(cx);
         cx.notify();
     }
 
     fn stop_all(&mut self, cx: &mut Context<Self>) {
         self.queue_running = false;
+        for queue in &mut self.scheduler.queues {
+            queue.running = false;
+        }
         self.cancel_active(cx);
+        self.sync_table(cx);
+        cx.notify();
     }
 
     fn cancel_active(&mut self, cx: &mut Context<Self>) {
@@ -562,6 +624,7 @@ impl DownloadManager {
             || self.options_open
             || self.removal_open
             || self.removal_busy
+            || self.scheduler_window.is_some()
         {
             return;
         }
@@ -610,7 +673,11 @@ impl DownloadManager {
             } else {
                 None
             },
-            completion_error: self.completion_error.clone(),
+            completion_error: if self.scheduler.has_enabled_schedule() {
+                Some("Completion shutdown is unavailable while a schedule is enabled. Clear schedules first.".into())
+            } else {
+                self.completion_error.clone()
+            },
             paused: matches!(item.state, Some(TransferState::Paused(_))),
             error: match &item.state {
                 Some(TransferState::Failed(error)) => {
@@ -786,7 +853,17 @@ impl DownloadManager {
         if self.active.is_none() {
             self.start_item(id, cx);
         } else {
-            self.queue_running = true;
+            let queue_id = self
+                .queue
+                .item(id)
+                .map(|item| item.queue_id)
+                .unwrap_or(DEFAULT_QUEUE);
+            if let Some(queue) = self.scheduler.queue_mut(queue_id) {
+                queue.running = true;
+            }
+            if queue_id == DEFAULT_QUEUE {
+                self.queue_running = true;
+            }
         }
         self.refresh_details(cx);
         self.sync_table(cx);
@@ -826,6 +903,7 @@ impl DownloadManager {
         cx: &mut Context<Self>,
     ) {
         if !completion::shutdown_supported()
+            || self.scheduler.has_enabled_schedule()
             || !self
                 .queue
                 .item(id)
@@ -849,6 +927,7 @@ impl DownloadManager {
 
     fn arm_shutdown(&mut self, id: DownloadId, cx: &mut Context<Self>) {
         if !completion::shutdown_supported()
+            || self.scheduler.has_enabled_schedule()
             || !self
                 .queue
                 .item(id)
@@ -900,6 +979,7 @@ impl DownloadManager {
                 .get(&id)
                 .is_some_and(|child| cx.windows().contains(&child.handle))
             || self.active.is_some()
+            || self.scheduler.has_enabled_schedule()
             || !self.queue.items.iter().all(|item| item.is_finished())
         {
             self.cancel_all_shutdowns(cx);
@@ -980,8 +1060,15 @@ impl DownloadManager {
                 status: item.status().into(),
                 rate: item.speed_bytes_per_second(),
                 selected: self.queue.selected.contains(&item.id),
-                destination: item.destination.clone(),
                 progress: item.progress(),
+                queue_name: self
+                    .scheduler
+                    .queue(item.queue_id)
+                    .map(|queue| queue.name.clone())
+                    .unwrap_or_default(),
+                time_left: item.eta(),
+                last_try: item.last_try,
+                description: item.description.clone(),
             })
             .collect();
         let all_selected = self.queue.all_visible_selected();
@@ -990,6 +1077,7 @@ impl DownloadManager {
             table.delegate_mut().header_all_selected = all_selected;
             cx.notify();
         });
+        self.refresh_scheduler(cx);
     }
 
     pub(crate) fn select_item(&mut self, id: DownloadId, selected: bool, cx: &mut Context<Self>) {
@@ -1048,7 +1136,7 @@ impl DownloadManager {
     }
 
     fn open_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.options_open {
+        if self.options_open || self.scheduler_window.is_some() {
             return;
         }
         self.options_open = true;
@@ -1074,7 +1162,7 @@ impl DownloadManager {
         use crate::native_menu::MenuState;
         MenuState {
             can_add: self.add_windows.len() < 16,
-            can_start: !self.queue_running && self.queue.next_queued().is_some(),
+            can_start: !self.queue_running && self.queue.next_in_queue(DEFAULT_QUEUE).is_some(),
             queue_running: self.queue_running,
             can_stop: self.active.is_some(),
             selected_active: self
@@ -1101,6 +1189,7 @@ impl DownloadManager {
             can_options: !self.options_open
                 && self.add_windows.is_empty()
                 && self.detail_windows.is_empty()
+                && self.scheduler_window.is_none()
                 && cx.windows().contains(&self.main_window),
             dark: cx.theme().is_dark(),
             filter: self.queue.filter,
@@ -1128,6 +1217,7 @@ impl DownloadManager {
             Command::Remove => self.remove_selected(window, cx),
             Command::Clear => self.clear_finished(window, cx),
             Command::Options => self.open_options(window, cx),
+            Command::Scheduler => self.open_scheduler(window, cx),
             Command::Details => self.open_selected_details(window, cx),
             Command::Reveal => self.reveal_selected(cx),
             Command::All => self.set_filter(Filter::All, cx),
@@ -1158,6 +1248,8 @@ impl DownloadManager {
 mod history;
 #[path = "manager_render.rs"]
 mod rendering;
+#[path = "manager_scheduler.rs"]
+mod scheduling;
 
 #[cfg(test)]
 #[path = "manager_tests.rs"]

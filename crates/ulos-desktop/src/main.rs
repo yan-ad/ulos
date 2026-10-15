@@ -12,6 +12,8 @@ mod native_windows;
 mod palette;
 mod platform_paths;
 mod queue;
+mod scheduler;
+mod scheduler_window;
 mod storage;
 mod window_chrome;
 

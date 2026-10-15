@@ -11,6 +11,7 @@ use ulos_core::{DownloadProgress, tasks::TransferState};
 
 use crate::{
     completion::CompletionGate,
+    scheduler::{DEFAULT_QUEUE, QueueId},
     storage::{HistoryRecord, HistoryStatus},
 };
 
@@ -96,6 +97,10 @@ pub enum SortColumn {
 // Deliberately no Debug: source URLs may contain private signed query strings.
 pub struct QueueItem {
     pub id: DownloadId,
+    pub queue_id: QueueId,
+    pub queue_order: u64,
+    pub last_try: Option<SystemTime>,
+    pub description: String,
     pub destination: PathBuf,
     pub category: Category,
     pub added_at: SystemTime,
@@ -389,6 +394,10 @@ impl SessionQueue {
                 };
                 QueueItem {
                     id: record.id,
+                    queue_id: DEFAULT_QUEUE,
+                    queue_order: record.id,
+                    last_try: None,
+                    description: String::new(),
                     category: Category::from_path(&record.destination),
                     telemetry: TransferTelemetry {
                         destination: record.destination.clone(),
@@ -444,6 +453,10 @@ impl SessionQueue {
         self.next_id = id;
         self.items.push(QueueItem {
             id,
+            queue_id: DEFAULT_QUEUE,
+            queue_order: id,
+            last_try: None,
+            description: String::new(),
             category: Category::from_path(&destination),
             // Four HTTP connections, not CPU workers; core's default stays one.
             options: TransferOptions {
@@ -476,12 +489,85 @@ impl SessionQueue {
         self.items.iter_mut().find(|item| item.id == id)
     }
 
+    #[cfg(test)]
     pub fn next_queued(&self) -> Option<DownloadId> {
         self.items
             .iter()
             .filter(|item| item.is_queued())
-            .min_by_key(|item| item.id)
+            .min_by_key(|item| (item.queue_order, item.id))
             .map(|item| item.id)
+    }
+
+    /// Atomic membership change. Queue existence belongs to the scheduler owner.
+    pub fn assign_queue(
+        &mut self,
+        ids: &[DownloadId],
+        queue_id: QueueId,
+    ) -> Result<(), &'static str> {
+        for id in ids {
+            let item = self.item(*id).ok_or("Download not found")?;
+            if item.is_active() || matches!(item.state, Some(TransferState::Paused(_))) {
+                return Err("Active or paused downloads cannot change queues");
+            }
+        }
+        for item in &mut self.items {
+            if ids.contains(&item.id) {
+                item.queue_id = queue_id;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_description(
+        &mut self,
+        id: DownloadId,
+        description: &str,
+    ) -> Result<(), &'static str> {
+        if description.chars().count() > 512 || description.chars().any(char::is_control) {
+            return Err("Descriptions allow at most 512 characters and no controls");
+        }
+        self.item_mut(id).ok_or("Download not found")?.description = description.into();
+        Ok(())
+    }
+
+    pub fn next_in_queue(&self, queue_id: QueueId) -> Option<DownloadId> {
+        self.items
+            .iter()
+            .filter(|item| item.queue_id == queue_id && item.is_queued())
+            .min_by_key(|item| (item.queue_order, item.id))
+            .map(|item| item.id)
+    }
+
+    /// Move one queued item past its queued neighbor, independent of view order.
+    /// Renumber the bounded queued subset to handle equal order keys safely.
+    pub fn move_queued(&mut self, id: DownloadId, earlier: bool) -> bool {
+        let Some(item) = self.item(id).filter(|item| item.is_queued()) else {
+            return false;
+        };
+        let queue_id = item.queue_id;
+        let mut ordered: Vec<_> = self
+            .items
+            .iter()
+            .filter(|item| item.queue_id == queue_id && item.is_queued())
+            .map(|item| (item.queue_order, item.id))
+            .collect();
+        ordered.sort_unstable();
+        let Some(index) = ordered.iter().position(|(_, candidate)| *candidate == id) else {
+            return false;
+        };
+        let neighbor = if earlier {
+            index.checked_sub(1)
+        } else {
+            index.checked_add(1).filter(|index| *index < ordered.len())
+        };
+        let Some(neighbor) = neighbor else {
+            return false;
+        };
+        ordered.swap(index, neighbor);
+        for (order, (_, id)) in ordered.into_iter().enumerate() {
+            self.item_mut(id).unwrap().queue_order = order as u64;
+        }
+        true
     }
 
     pub fn active_count(&self) -> usize {
@@ -620,6 +706,66 @@ mod tests {
             downloaded: 17,
             total: Some(100),
         }
+    }
+
+    #[test]
+    fn membership_reordering_and_descriptions_are_view_independent() {
+        let mut queue = SessionQueue::default();
+        let a = add(&mut queue, "a");
+        let b = add(&mut queue, "b");
+        let c = add(&mut queue, "c");
+        assert_eq!(queue.item(a).unwrap().queue_id, DEFAULT_QUEUE);
+        assert_eq!(queue.item(a).unwrap().queue_order, a);
+        assert_eq!(queue.item(a).unwrap().last_try, None);
+        queue.assign_queue(&[a, c], 7).unwrap();
+        queue.filter = Filter::Finished;
+        queue.search = "missing".into();
+        queue.set_sort(SortColumn::Name, true);
+        assert_eq!(queue.next_in_queue(7), Some(a));
+        assert!(queue.move_queued(c, true));
+        assert_eq!(queue.next_in_queue(7), Some(c));
+        assert_eq!(queue.item(b).unwrap().queue_order, b);
+        assert!(queue.move_queued(c, false));
+        assert_eq!(queue.next_in_queue(7), Some(a));
+        queue.item_mut(a).unwrap().apply_state(
+            TransferState::Paused(DownloadProgress {
+                downloaded_bytes: 0,
+                total_bytes: None,
+            }),
+            Instant::now(),
+        );
+        assert!(!queue.move_queued(a, true));
+        assert!(queue.assign_queue(&[c, a], 8).is_err());
+        assert_eq!(queue.item(c).unwrap().queue_id, 7);
+        assert_eq!(queue.item(a).unwrap().last_try, None);
+        assert!(queue.assign_queue(&[c, 999], 8).is_err());
+        queue
+            .set_description(c, "Session note with spaces")
+            .unwrap();
+        for value in ["bad\nline", "bad\tline", &"x".repeat(513)] {
+            assert!(queue.set_description(c, value).is_err());
+        }
+        assert_eq!(
+            queue.item(c).unwrap().description,
+            "Session note with spaces"
+        );
+        assert_eq!(queue.next_in_queue(99), None);
+    }
+
+    #[test]
+    fn session_metadata_is_not_restored_from_history() {
+        let mut queue = SessionQueue::default();
+        let id = add(&mut queue, "fixture");
+        queue.assign_queue(&[id], 9).unwrap();
+        queue.set_description(id, "private note").unwrap();
+        queue.item_mut(id).unwrap().last_try = Some(SystemTime::now());
+        let mut restored = SessionQueue::default();
+        restored.restore_history(queue.history_records()).unwrap();
+        let item = restored.item(id).unwrap();
+        assert_eq!(item.queue_id, DEFAULT_QUEUE);
+        assert_eq!(item.queue_order, id);
+        assert_eq!(item.last_try, None);
+        assert!(item.description.is_empty());
     }
 
     #[test]
