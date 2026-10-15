@@ -485,7 +485,10 @@ fn bounded_manifests_and_unicode_paths() {
         None,
     ))
     .unwrap();
-    assert_eq!(source.files()[0].path.to_str(), Some("café/一.txt"));
+    assert_eq!(
+        source.files()[0].path,
+        std::path::Path::new("café").join("一.txt")
+    );
     let too_many = vec![("same", 0); 4097];
     assert!(parse(metainfo(info("root", b"x", Some(too_many)), None)).is_err());
     assert!(parse(metainfo(info(&"界".repeat(61), b"x", None), None)).is_err());

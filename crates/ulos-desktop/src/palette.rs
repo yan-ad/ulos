@@ -84,6 +84,7 @@ pub fn observe_window(window: &mut Window, cx: &mut App) -> Subscription {
     window.observe_window_appearance(|window, cx| appearance_changed(window.appearance(), cx))
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn observe_preference(cx: &mut App, callback: impl FnMut(&mut App) + 'static) -> Subscription {
     cx.observe_global::<ThemeSettings>(callback)
 }

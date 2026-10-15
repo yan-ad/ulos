@@ -1070,7 +1070,16 @@ fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 #[cfg(windows)]
 fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::rename(from, to)
+    fs::rename(from, to).map_err(|error| {
+        // MoveFileEx reports an existing directory as ACCESS_DENIED, rather
+        // than ALREADY_EXISTS. Normalize only after the atomic operation failed;
+        // this lookup never authorizes replacing an existing destination.
+        if matches!(error.raw_os_error(), Some(5 | 80 | 183)) && fs::symlink_metadata(to).is_ok() {
+            std::io::ErrorKind::AlreadyExists.into()
+        } else {
+            error
+        }
+    })
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn rename_directory(_from: &Path, _to: &Path) -> std::io::Result<()> {
@@ -1110,6 +1119,20 @@ mod tests {
         assert_eq!(monitor.sample(&down, 100, 0, at(300)), 0);
     }
     use super::*;
+    #[test]
+    fn existing_directory_collision_renames_without_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("payload");
+        let target = dir.path().join("target");
+        fs::create_dir(&payload).unwrap();
+        fs::write(payload.join("new"), b"new").unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("original"), b"original").unwrap();
+        let published = publish(&payload, &target, true, CollisionPolicy::Rename).unwrap();
+        assert_eq!(published, dir.path().join("target (1)"));
+        assert_eq!(fs::read(target.join("original")).unwrap(), b"original");
+        assert_eq!(fs::read(published.join("new")).unwrap(), b"new");
+    }
     #[test]
     fn publication_is_no_replace_even_when_target_arrives_late() {
         let dir = tempfile::tempdir().unwrap();

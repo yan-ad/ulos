@@ -30,6 +30,7 @@ fn toolbar_button(id: &'static str, label: &str, icon: AssetIcon) -> Button {
 #[derive(Clone, Copy)]
 enum MenuCommand {
     Add,
+    Torrent,
     Start,
     StopQueue,
     StopAll,
@@ -55,6 +56,7 @@ fn manager_menu_item(
     PopupMenuItem::new(label).on_click(move |_, window, cx| {
         let _ = manager.update(cx, |view, cx| match command {
             MenuCommand::Add => view.open_add(window, cx),
+            MenuCommand::Torrent => view.choose_torrent_files(window, cx),
             MenuCommand::Start => view.start_queue(cx),
             MenuCommand::StopQueue => view.stop_queue(cx),
             MenuCommand::StopAll => view.stop_all(cx),
@@ -345,6 +347,11 @@ impl DownloadManager {
                             "Add URL…",
                             tasks.clone(),
                             MenuCommand::Add,
+                        ))
+                        .item(manager_menu_item(
+                            "Open Torrent…",
+                            tasks.clone(),
+                            MenuCommand::Torrent,
                         ))
                         .item(
                             manager_menu_item("Start Queue", tasks.clone(), MenuCommand::Start)
