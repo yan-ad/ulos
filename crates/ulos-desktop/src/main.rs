@@ -1,10 +1,13 @@
 mod add_download;
+mod add_torrent;
 mod clipboard;
 mod completion;
 mod download_details;
 mod download_table;
+mod download_task;
 mod file_icons;
 mod formatting;
+mod intake;
 mod manager;
 #[cfg(any(target_os = "macos", test))]
 mod native_menu;
@@ -49,7 +52,25 @@ fn main() {
         Err(error) => (None, Vec::new(), None, Some(error)),
     };
     let flush_writer = writer.clone();
-    application().with_assets(assets::AllAssets).run(move |cx| {
+    let inbox = std::rc::Rc::new(std::cell::RefCell::new(Vec::<std::path::PathBuf>::new()));
+    let intake_error = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    match intake::argument_paths(std::env::args_os().skip(1)) {
+        Ok(paths) => *inbox.borrow_mut() = paths,
+        Err(error) => *intake_error.borrow_mut() = Some(error.into()),
+    }
+    let app = application().with_assets(assets::AllAssets);
+    let opened = inbox.clone();
+    let opened_error = intake_error.clone();
+    app.on_open_urls(move |urls| match intake::opened_urls(urls) {
+        Ok(paths) => {
+            let mut pending = opened.borrow_mut();
+            if let Err(error) = intake::merge_pending(&mut pending, paths) {
+                *opened_error.borrow_mut() = Some(error.into());
+            }
+        }
+        Err(error) => *opened_error.borrow_mut() = Some(error.into()),
+    });
+    app.run(move |cx| {
         init(cx);
         palette::init(cx);
         cx.bind_keys([
@@ -80,6 +101,7 @@ fn main() {
         };
         manager.update(cx, |manager, cx| {
             manager.initialize_history(paths, history, writer, history_error, cx);
+            manager.watch_torrent_intake(inbox, intake_error, cx);
         });
         #[cfg(target_os = "macos")]
         {

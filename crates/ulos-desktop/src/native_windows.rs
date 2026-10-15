@@ -1,6 +1,7 @@
 //! Independent native roots. Roots own the manager; its registries own only weak content.
 use crate::{
     add_download::{AddDownload, AddRequest, DismissAdd},
+    add_torrent::{AddTorrent, DismissTorrent, TorrentRequest},
     download_details::{
         CancelDownload, CancelShutdown, CloseDetails, DetailsSnapshot, DownloadDetails,
         RequestShutdown, RetryDownload, SetConnections, SetRateLimit, TogglePause,
@@ -16,6 +17,73 @@ use gpui_kit::{
 pub(crate) struct ChildWindow<T: 'static> {
     pub handle: AnyWindowHandle,
     pub content: WeakEntity<T>,
+}
+
+pub(crate) struct NativeTorrentWindow {
+    pub content: Entity<AddTorrent>,
+    _owner: Entity<DownloadManager>,
+    _subscriptions: Vec<Subscription>,
+}
+impl NativeTorrentWindow {
+    pub fn new(
+        owner: Entity<DownloadManager>,
+        path: Option<std::path::PathBuf>,
+        directory: Option<std::path::PathBuf>,
+        runtime: tokio::runtime::Handle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let content = cx.new(|cx| AddTorrent::new(path, directory, runtime, window, cx));
+        let weak = content.downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            weak.upgrade()
+                .is_none_or(|view| !view.read(cx).choosing_path)
+        });
+        let submit = cx.subscribe_in(
+            &content,
+            window,
+            |view, _, request: &TorrentRequest, window, cx| {
+                if !view.content.read(cx).matches_request(request, cx) {
+                    return;
+                }
+                let result = view
+                    ._owner
+                    .update(cx, |owner, cx| owner.enqueue_torrent(request, cx));
+                match result {
+                    Ok(id) => {
+                        window.remove_window();
+                        if request.start_now {
+                            view._owner
+                                .update(cx, |owner, cx| owner.open_details(id, window, cx));
+                        }
+                    }
+                    Err(error) => window.push_notification(error, cx),
+                }
+            },
+        );
+        let dismiss = cx.subscribe_in(
+            &content,
+            window,
+            |view, _, _: &DismissTorrent, window, cx| {
+                if !view.content.read(cx).choosing_path {
+                    window.remove_window();
+                }
+            },
+        );
+        Self {
+            content,
+            _owner: owner,
+            _subscriptions: vec![submit, dismiss, crate::palette::observe_window(window, cx)],
+        }
+    }
+}
+impl Render for NativeTorrentWindow {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .child(self.content.clone())
+    }
 }
 
 pub(crate) struct NativeSchedulerWindow {

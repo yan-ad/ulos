@@ -19,10 +19,12 @@ use ulos_core::{
 
 use crate::{
     add_download::AddDownload,
+    add_torrent::AddTorrent,
     clipboard::ClipboardDetector,
     completion::{self, CompletionAction},
     download_details::{DetailsSnapshot, DownloadDetails},
     download_table::{DownloadRow, DownloadTable},
+    download_task::DownloadTask,
     formatting,
     native_windows::{ChildWindow, NativeAddWindow, StatusWindow, add_options, status_options},
     platform_paths::PlatformPaths,
@@ -49,7 +51,12 @@ pub struct DownloadManager {
     notice: Option<String>,
     focus: FocusHandle,
     runtime: tokio::runtime::Handle,
-    transfer: Option<HttpDownloadTask>,
+    transfer: Option<DownloadTask>,
+    torrent_windows: BTreeMap<WindowId, ChildWindow<AddTorrent>>,
+    _torrent_picker: Option<Task<()>>,
+    _torrent_intake: Option<Task<()>>,
+    torrent_picker_open: bool,
+    attempt: u64,
     pub(crate) add_windows: BTreeMap<WindowId, ChildWindow<AddDownload>>,
     pub(crate) detail_windows: BTreeMap<DownloadId, ChildWindow<DownloadDetails>>,
     pub(crate) table: Entity<TableState<DownloadTable>>,
@@ -99,6 +106,12 @@ impl DownloadManager {
                 cx.notify();
             }
         });
+        let close_owner = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            close_owner
+                .upgrade()
+                .is_none_or(|owner| !owner.read(cx).torrent_picker_open)
+        });
         let owner = cx.weak_entity();
         let table = cx.new(|cx| {
             TableState::new(DownloadTable::new(owner.clone()), window, cx)
@@ -124,6 +137,7 @@ impl DownloadManager {
                         view.cancel_all_shutdowns(cx);
                     }
                     view.add_windows.remove(&closed);
+                    view.torrent_windows.remove(&closed);
                     if view
                         .scheduler_window
                         .as_ref()
@@ -159,6 +173,8 @@ impl DownloadManager {
                     view.clipboard_enabled
                         && window.is_window_active()
                         && view.add_windows.is_empty()
+                        && view.torrent_windows.is_empty()
+                        && !view.torrent_picker_open
                         && view.detail_windows.is_empty()
                         && !view.options_open
                         && !view.removal_open
@@ -204,6 +220,11 @@ impl DownloadManager {
             focus: cx.focus_handle(),
             runtime,
             transfer: None,
+            torrent_windows: BTreeMap::new(),
+            _torrent_picker: None,
+            _torrent_intake: None,
+            torrent_picker_open: false,
+            attempt: 0,
             add_windows: BTreeMap::new(),
             detail_windows: BTreeMap::new(),
             table,
@@ -267,7 +288,7 @@ impl DownloadManager {
     ) {
         self.add_windows
             .retain(|_, child| child.upgrade().is_some());
-        if self.add_windows.len() >= 16 {
+        if self.add_windows.len() + self.torrent_windows.len() >= 16 {
             window.push_notification(
                 "Close an Add window before opening another (maximum 16).",
                 cx,
@@ -357,6 +378,10 @@ impl DownloadManager {
             return;
         };
         let source = item.source().to_owned();
+        let torrent = item.torrent_source.clone();
+        if !item.has_source() {
+            return;
+        }
         let destination = item.destination.clone();
         item.last_try = Some(std::time::SystemTime::now());
         item.apply_state(TransferState::Preparing, Instant::now());
@@ -364,9 +389,27 @@ impl DownloadManager {
         self.active = Some(id);
         self.save_history();
         self._updates = None;
-        let task =
-            HttpDownloadTask::start_with_options(&self.runtime, source, destination, options);
+        let task = if let Some(source) = torrent {
+            DownloadTask::Torrent(ulos_core::torrent::TorrentDownloadTask::start(
+                &self.runtime,
+                source,
+                destination,
+                ulos_core::torrent::TorrentOptions {
+                    collision: options.collision,
+                },
+            ))
+        } else {
+            DownloadTask::Http(HttpDownloadTask::start_with_options(
+                &self.runtime,
+                source,
+                destination,
+                options,
+            ))
+        };
+        self.attempt = self.attempt.wrapping_add(1);
+        let attempt = self.attempt;
         let mut telemetry = task.telemetry();
+        let mut torrent_telemetry = task.torrent_telemetry();
         let mut receiver = task.subscribe();
         self.transfer = Some(task);
         self._updates = Some(cx.spawn(async move |view, cx| {
@@ -376,12 +419,24 @@ impl DownloadManager {
                 let metadata_changed = telemetry
                     .as_ref()
                     .is_some_and(|receiver| matches!(receiver.has_changed(), Ok(true)));
+                let metadata_changed = metadata_changed
+                    || torrent_telemetry
+                        .as_ref()
+                        .is_some_and(|receiver| matches!(receiver.has_changed(), Ok(true)));
                 if first || matches!(changed, Ok(true)) || metadata_changed {
                     first = false;
                     let state = receiver.borrow_and_update().clone();
                     let terminal = state.is_terminal();
                     if view
                         .update(cx, |view, cx| {
+                            if view.attempt != attempt || view.active != Some(id) {
+                                return;
+                            }
+                            if let Some(receiver) = &mut torrent_telemetry
+                                && let Some(item) = view.queue.item_mut(id)
+                            {
+                                item.apply_torrent_telemetry(receiver.borrow_and_update().clone());
+                            }
                             view.apply_observation(
                                 id,
                                 state,
@@ -407,6 +462,14 @@ impl DownloadManager {
                         TransferState::Failed("Transfer worker stopped unexpectedly".into())
                     };
                     let _ = view.update(cx, |view, cx| {
+                        if view.attempt != attempt || view.active != Some(id) {
+                            return;
+                        }
+                        if let Some(receiver) = &mut torrent_telemetry
+                            && let Some(item) = view.queue.item_mut(id)
+                        {
+                            item.apply_torrent_telemetry(receiver.borrow_and_update().clone());
+                        }
                         view.apply_observation(
                             id,
                             terminal,
@@ -620,6 +683,8 @@ impl DownloadManager {
     fn offer_clipboard(&mut self, text: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         if !self.clipboard_enabled
             || !self.add_windows.is_empty()
+            || !self.torrent_windows.is_empty()
+            || self.torrent_picker_open
             || !self.detail_windows.is_empty()
             || self.options_open
             || self.removal_open
@@ -635,16 +700,24 @@ impl DownloadManager {
 
     fn snapshot(&self, id: DownloadId) -> Option<DetailsSnapshot> {
         let item = self.queue.item(id)?;
-        let source = match url::Url::parse(item.source()) {
-            Ok(mut url) => {
-                url.set_query(None);
-                url.set_fragment(None);
-                let _ = url.set_username("");
-                let _ = url.set_password(None);
-                url.to_string()
+        let source = if item.is_torrent {
+            if item.has_source() {
+                "Local torrent metadata".into()
+            } else {
+                "Source not retained".into()
             }
-            Err(_) if !item.has_source() => "Source not retained".into(),
-            Err(_) => "Invalid source URL".into(),
+        } else {
+            match url::Url::parse(item.source()) {
+                Ok(mut url) => {
+                    url.set_query(None);
+                    url.set_fragment(None);
+                    let _ = url.set_username("");
+                    let _ = url.set_password(None);
+                    url.to_string()
+                }
+                Err(_) if !item.has_source() => "Source not retained".into(),
+                Err(_) => "Invalid source URL".into(),
+            }
         };
         Some(DetailsSnapshot {
             id,
@@ -655,7 +728,11 @@ impl DownloadManager {
                 .paths
                 .as_ref()
                 .map(|paths| {
-                    paths.folder_label(item.destination.parent().unwrap_or(&item.destination))
+                    paths.folder_label(if item.output_directory {
+                        &item.destination
+                    } else {
+                        item.destination.parent().unwrap_or(&item.destination)
+                    })
                 })
                 .unwrap_or_default(),
             status: item.status().into(),
@@ -679,6 +756,9 @@ impl DownloadManager {
                 self.completion_error.clone()
             },
             paused: matches!(item.state, Some(TransferState::Paused(_))),
+            is_torrent: item.is_torrent,
+            output_directory: item.output_directory,
+            torrent: item.torrent_telemetry.clone(),
             error: match &item.state {
                 Some(TransferState::Failed(error)) => {
                     Some(if error.starts_with("Network request failed:") {
@@ -781,6 +861,11 @@ impl DownloadManager {
         rate: Option<u64>,
         cx: &mut Context<Self>,
     ) {
+        if self.queue.item(id).is_some_and(|item| item.is_torrent) {
+            self.notice = Some("Torrent rate controls are not available.".into());
+            cx.notify();
+            return;
+        }
         if rate == Some(0) {
             self.notice = Some("Rate must be greater than zero.".into());
             cx.notify();
@@ -815,6 +900,9 @@ impl DownloadManager {
         connections: usize,
         cx: &mut Context<Self>,
     ) {
+        if self.queue.item(id).is_some_and(|item| item.is_torrent) {
+            return;
+        }
         if !(1..=MAX_CONNECTIONS).contains(&connections) {
             self.notice = Some(format!(
                 "Connections must be between 1 and {MAX_CONNECTIONS}."
@@ -1053,6 +1141,7 @@ impl DownloadManager {
             .visible()
             .into_iter()
             .map(|item| DownloadRow {
+                is_torrent: item.is_torrent,
                 id: item.id,
                 name: item.name(),
                 category: item.category,
@@ -1161,7 +1250,7 @@ impl DownloadManager {
     pub(crate) fn menu_state(&self, cx: &App) -> crate::native_menu::MenuState {
         use crate::native_menu::MenuState;
         MenuState {
-            can_add: self.add_windows.len() < 16,
+            can_add: self.add_windows.len() + self.torrent_windows.len() < 16,
             can_start: !self.queue_running && self.queue.next_in_queue(DEFAULT_QUEUE).is_some(),
             queue_running: self.queue_running,
             can_stop: self.active.is_some(),
@@ -1188,6 +1277,8 @@ impl DownloadManager {
                 .any(|item| self.queue.selected.contains(&item.id) && item.is_finished()),
             can_options: !self.options_open
                 && self.add_windows.is_empty()
+                && self.torrent_windows.is_empty()
+                && !self.torrent_picker_open
                 && self.detail_windows.is_empty()
                 && self.scheduler_window.is_none()
                 && cx.windows().contains(&self.main_window),
@@ -1210,6 +1301,7 @@ impl DownloadManager {
         }
         match command {
             Command::Add => self.open_add(window, cx),
+            Command::Torrent => self.choose_torrent_files(window, cx),
             Command::Start => self.start_queue(cx),
             Command::StopQueue => self.stop_queue(cx),
             Command::StopAll => self.stop_all(cx),
@@ -1250,7 +1342,12 @@ mod history;
 mod rendering;
 #[path = "manager_scheduler.rs"]
 mod scheduling;
+#[path = "manager_torrent.rs"]
+mod torrents;
 
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "manager_torrent_tests.rs"]
+mod torrent_tests;

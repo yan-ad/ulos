@@ -54,6 +54,9 @@ pub struct DetailsSnapshot {
     pub shutdown_remaining: Option<u64>,
     pub completion_error: Option<String>,
     pub paused: bool,
+    pub is_torrent: bool,
+    pub output_directory: bool,
+    pub torrent: Option<ulos_core::torrent::TorrentTelemetry>,
 }
 
 pub struct CancelDownload(pub DownloadId);
@@ -181,7 +184,7 @@ impl DownloadDetails {
         cx.notify();
     }
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rate_input.is_some() {
+        if self.snapshot.is_torrent || self.rate_input.is_some() {
             return;
         }
         let rate = self
@@ -222,7 +225,7 @@ impl DownloadDetails {
         self.connections_input = Some(connections_input);
     }
     pub(crate) fn apply_rate(&mut self, cx: &mut Context<Self>) {
-        if !self.snapshot.active || self.snapshot.cancelling {
+        if !self.can_configure_rate() {
             return;
         }
         let result = if self.rate_enabled {
@@ -245,8 +248,27 @@ impl DownloadDetails {
         }
         cx.notify();
     }
+    fn can_configure_rate(&self) -> bool {
+        !self.snapshot.is_torrent && self.snapshot.active && !self.snapshot.cancelling
+    }
+    fn can_pause(&self) -> bool {
+        self.snapshot.active
+            && !self.snapshot.cancelling
+            && if self.snapshot.is_torrent {
+                self.snapshot.torrent.as_ref().is_some_and(|telemetry| {
+                    matches!(
+                        telemetry.phase,
+                        ulos_core::torrent::TorrentPhase::Downloading
+                            | ulos_core::torrent::TorrentPhase::Paused
+                    )
+                })
+            } else {
+                self.snapshot.telemetry.resume == ResumeCapability::Supported
+            }
+    }
     fn can_configure_connections(&self) -> bool {
-        !self.snapshot.active
+        !self.snapshot.is_torrent
+            && !self.snapshot.active
             && self.snapshot.status != "Finished"
             && (self.snapshot.status == "Added" || self.snapshot.can_retry)
     }
@@ -318,11 +340,14 @@ impl DownloadDetails {
         if !self.snapshot.folder_display.is_empty() {
             return self.snapshot.folder_display.clone();
         }
-        let folder = self
-            .snapshot
-            .destination
-            .parent()
-            .unwrap_or(&self.snapshot.destination);
+        let folder = if self.snapshot.output_directory {
+            self.snapshot.destination.as_path()
+        } else {
+            self.snapshot
+                .destination
+                .parent()
+                .unwrap_or(&self.snapshot.destination)
+        };
         crate::platform_paths::folder_label(folder, None, None)
     }
     fn status_content(&self, cx: &App) -> AnyElement {
@@ -332,7 +357,7 @@ impl DownloadDetails {
             .filter(|rate| rate.is_finite() && *rate >= 0.0)
             .map(|rate| format!("{}/s", formatting::bytes(rate.min(u64::MAX as f64) as u64)))
             .unwrap_or_else(|| "Not available".into());
-        let fields = [
+        let mut fields = vec![
             ("Downloaded", KitIcon::Download, self.downloaded()),
             ("Rate", KitIcon::Gauge, rate),
             (
@@ -350,6 +375,10 @@ impl DownloadDetails {
             ("Folder", KitIcon::Folder, self.folder_display()),
             ("Source", KitIcon::Link, s.source.clone()),
         ];
+        if s.is_torrent {
+            fields.retain(|(label, _, _)| *label != "Resume");
+            fields.insert(0, ("Protocol", KitIcon::Link, "Torrent".into()));
+        }
         GroupBox::new()
             .outline()
             .child(
@@ -380,7 +409,47 @@ impl DownloadDetails {
             )
             .into_any_element()
     }
+    fn torrent_fields(&self) -> Vec<(&'static str, String)> {
+        let Some(telemetry) = &self.snapshot.torrent else {
+            return vec![("Telemetry", "Not available".into())];
+        };
+        let phase = match telemetry.phase {
+            ulos_core::torrent::TorrentPhase::Preparing => "Preparing",
+            ulos_core::torrent::TorrentPhase::Checking => "Checking",
+            ulos_core::torrent::TorrentPhase::Downloading => "Downloading",
+            ulos_core::torrent::TorrentPhase::Paused => "Paused",
+            ulos_core::torrent::TorrentPhase::Publishing => "Publishing",
+        };
+        vec![
+            ("Phase", phase.into()),
+            ("Peers", telemetry.peers.to_string()),
+            (
+                "Verified bytes",
+                format!(
+                    "{} of {}",
+                    formatting::bytes(telemetry.downloaded_bytes),
+                    formatting::bytes(telemetry.total_bytes)
+                ),
+            ),
+            ("Uploaded", formatting::bytes(telemetry.uploaded_bytes)),
+        ]
+    }
     fn connection_content(&self) -> AnyElement {
+        if self.snapshot.is_torrent {
+            return GroupBox::new()
+                .outline()
+                .title(Label::new("Torrent"))
+                .child(
+                    DescriptionList::horizontal()
+                        .columns(1)
+                        .bordered(false)
+                        .children(self.torrent_fields().into_iter().map(|(label, value)| {
+                            DescriptionItem::new(Label::new(label).into_any_element())
+                                .value(Label::new(value).into_any_element())
+                        })),
+                )
+                .into_any_element();
+        }
         let body = TableBody::new().children(self.snapshot.telemetry.connections.iter().map(
             |connection| {
                 let status = match connection.status {
@@ -420,7 +489,16 @@ impl DownloadDetails {
             .into_any_element()
     }
     fn speed_content(&self, cx: &mut Context<Self>) -> AnyElement {
-        let enabled = self.snapshot.active && !self.snapshot.cancelling;
+        if self.snapshot.is_torrent {
+            return GroupBox::new()
+                .outline()
+                .title(Label::new("Torrent settings"))
+                .child(Label::new(
+                    "Torrent rate limits and connection configuration are not supported.",
+                ))
+                .into_any_element();
+        }
+        let enabled = self.can_configure_rate();
         v_flex().gap_3()
             .child(GroupBox::new().outline().title(Label::new("Speed limit"))
                 .child(Checkbox::new("rate-enabled").label("Limit transfer rate").checked(self.rate_enabled).disabled(!enabled)
@@ -466,9 +544,7 @@ impl Render for DownloadDetails {
             DetailsTab::SpeedLimiter => self.speed_content(cx),
             DetailsTab::Completion => self.completion_content(cx),
         };
-        let can_pause = self.snapshot.active
-            && !self.snapshot.cancelling
-            && self.snapshot.telemetry.resume == ResumeCapability::Supported;
+        let can_pause = self.can_pause();
         let conflict = self.snapshot.can_retry
             && self
                 .snapshot
@@ -523,10 +599,11 @@ impl Render for DownloadDetails {
                                 })
                                 .text_color(status_color(self.connection_info(), cx)),
                             )
-                            .child(Label::new(format!(
-                                "{} connections",
-                                self.snapshot.telemetry.connections.len()
-                            ))),
+                            .child(Label::new(if self.snapshot.is_torrent {
+                                "Torrent".to_owned()
+                            } else {
+                                format!("{} connections", self.snapshot.telemetry.connections.len())
+                            })),
                     )
                     .child(content)
                     .when(
@@ -542,18 +619,23 @@ impl Render for DownloadDetails {
                                 .child(
                                     h_flex()
                                         .gap_2()
-                                        .child(
-                                            Button::new("retry-overwrite")
-                                                .label("Override existing")
-                                                .on_click(cx.listener(|view, _, _, cx| {
-                                                    if view.snapshot.can_retry {
-                                                        cx.emit(RetryDownload {
-                                                            id: view.snapshot.id,
-                                                            collision: CollisionPolicy::Overwrite,
-                                                        });
-                                                    }
-                                                })),
-                                        )
+                                        .when(!self.snapshot.is_torrent, |row| {
+                                            row.child(
+                                                Button::new("retry-overwrite")
+                                                    .label("Override existing")
+                                                    .on_click(cx.listener(|view, _, _, cx| {
+                                                        if view.snapshot.can_retry
+                                                            && !view.snapshot.is_torrent
+                                                        {
+                                                            cx.emit(RetryDownload {
+                                                                id: view.snapshot.id,
+                                                                collision:
+                                                                    CollisionPolicy::Overwrite,
+                                                            });
+                                                        }
+                                                    })),
+                                            )
+                                        })
                                         .child(
                                             Button::new("retry-rename")
                                                 .label("Add another file")
@@ -654,12 +736,13 @@ impl Render for DownloadDetails {
                                 "Pause"
                             })
                             .disabled(!can_pause)
-                            .tooltip("Pause requires verified byte ranges and a strong validator")
+                            .tooltip(if self.snapshot.is_torrent {
+                                "Pause or resume while downloading or paused"
+                            } else {
+                                "Pause requires verified byte ranges and a strong validator"
+                            })
                             .on_click(cx.listener(|view, _, _, cx| {
-                                if view.snapshot.active
-                                    && !view.snapshot.cancelling
-                                    && view.snapshot.telemetry.resume == ResumeCapability::Supported
-                                {
+                                if view.can_pause() {
                                     cx.emit(TogglePause(view.snapshot.id));
                                 }
                             })),
@@ -740,6 +823,99 @@ mod tests {
         assert!(!view.can_configure_connections());
         assert!(!view.snapshot.active);
         assert!(!view.snapshot.can_retry);
+    }
+
+    fn torrent_details() -> DownloadDetails {
+        let mut view = details(None);
+        view.snapshot.is_torrent = true;
+        view.snapshot.source = "Local torrent metadata".into();
+        view.snapshot.torrent = Some(ulos_core::torrent::TorrentTelemetry {
+            downloaded_bytes: 42,
+            total_bytes: 100,
+            peers: 3,
+            uploaded_bytes: 0,
+            phase: ulos_core::torrent::TorrentPhase::Downloading,
+        });
+        view
+    }
+
+    #[test]
+    fn torrent_status_uses_actual_swarm_metrics_not_http_ranges() {
+        let mut view = torrent_details();
+        assert_eq!(
+            view.torrent_fields(),
+            vec![
+                ("Phase", "Downloading".into()),
+                ("Peers", "3".into()),
+                ("Verified bytes", "42 B of 100 B".into()),
+                ("Uploaded", "0 B".into()),
+            ]
+        );
+        // Torrent details never fall through to the HTTP table, even without telemetry.
+        let _ = view.connection_content();
+        view.snapshot.torrent = None;
+        assert_eq!(
+            view.torrent_fields(),
+            vec![("Telemetry", "Not available".into())]
+        );
+        let _ = view.connection_content();
+        assert!(!view.can_pause());
+    }
+
+    #[test]
+    fn torrent_paused_slot_displays_paused_and_remains_resumable() {
+        let mut view = torrent_details();
+        assert!(view.can_pause()); // No HTTP resume capability is needed.
+        view.snapshot.paused = true;
+        view.snapshot.status = "Paused".into();
+        view.snapshot.torrent.as_mut().unwrap().phase = ulos_core::torrent::TorrentPhase::Paused;
+        assert_eq!(view.connection_info(), "Paused");
+        assert_eq!(view.torrent_fields()[0], ("Phase", "Paused".into()));
+        assert!(view.can_pause());
+        view.snapshot.torrent.as_mut().unwrap().phase =
+            ulos_core::torrent::TorrentPhase::Publishing;
+        assert!(!view.can_pause());
+        view.snapshot.active = false;
+        assert!(!view.can_pause());
+    }
+
+    #[gpui::test]
+    fn torrent_live_controls_emit_no_http_configuration_requests(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        use std::{cell::Cell, rc::Rc};
+        let events = Rc::new(Cell::new(0));
+        let (view, _rate, _connections) = cx.update(|cx| {
+            let view = cx.new(|_| torrent_details());
+            let count = events.clone();
+            let rate = cx.subscribe(&view, move |_, _: &super::SetRateLimit, _| {
+                count.set(count.get() + 1);
+            });
+            let count = events.clone();
+            let connections = cx.subscribe(&view, move |_, _: &super::SetConnections, _| {
+                count.set(count.get() + 1);
+            });
+            (view, rate, connections)
+        });
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                assert!(!view.can_configure_rate());
+                assert!(!view.can_configure_connections());
+                view.apply_rate(cx);
+                // Unsupported speed settings render without even creating inputs.
+                let _ = view.speed_content(cx);
+                assert!(view.rate_input.is_none());
+                assert!(view.connections_input.is_none());
+                view.snapshot.active = false;
+                view.snapshot.can_retry = true;
+                view.snapshot.status = "Failed".into();
+                assert!(!view.can_configure_connections());
+                view.apply_connections(cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(events.get(), 0);
     }
 
     #[test]

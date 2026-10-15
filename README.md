@@ -1,16 +1,16 @@
 # Ulos Download Manager
 
-Ulos Download Manager is a Rust desktop application for HTTP and HTTPS downloads, built with GPUI Kit. It includes a command-line downloader and a shared transfer engine that runs independently of the interface.
+Ulos Download Manager is a Rust desktop application for HTTP, HTTPS, and local `.torrent` downloads, built with GPUI Kit. It includes a command-line downloader and a shared transfer engine that runs independently of the interface.
 
-The project is in early development. The CLI retains single-stream downloads. The desktop now has a controlled transfer engine with verified parallel ranges, session pause/resume, an aggregate speed limit, explicit file-conflict choices, and confirmed completion shutdown. Durable recovery, browser integration, and torrent support remain planned. Linux is a first-class target alongside macOS and Windows, but current local verification is on macOS. Cross-platform builds do not establish native UI or accessibility support.
+The project is in early development. The CLI retains single-stream downloads. The desktop now has a controlled transfer engine with verified parallel ranges, session pause/resume, an aggregate speed limit, explicit file-conflict choices, and confirmed completion shutdown. Local v1 `.torrent` downloads are implemented; durable recovery and browser integration remain planned. Linux is a first-class target alongside macOS and Windows, but current local verification is on macOS. Cross-platform builds do not establish native UI or accessibility support.
 
 ## Current features
 
 - HTTP/HTTPS downloads streamed to disk without buffering the entire file in memory.
 - Unique temporary files beside the destination and applicable response-length checks. Reject existing files by default, optionally publish a numbered filename, or explicitly authorize replacement only after a successful staged transfer.
 - Cancellation through the CLI or desktop interface, with best-effort temporary-file cleanup.
-- A desktop manager with native macOS system menus (Ulos, Tasks, File, Edit, Downloads, View, Help); non-macOS retains in-window Kit dropdown menus. One shared action toolbar has stock icon-only Buttons except the labeled Add URL button, accessible names, built-in tooltips, and a stock search Input on the same row. A collapsible stock Kit sidebar and a viewport-virtualized Kit DataTable show nine columns total: selection checkbox, Name, Size, Status, Transfer rate, Queue, Time left, Last try, and Description, with stable-ID checkbox selection independent of row focus. The default follows system appearance; the toolbar theme selector and View menu offer Follow system, Light, and Dark using stock Kit themes.
-- A session capped at 500 records and 32 named queues (default Main queue), with one global active HTTP transfer (possibly multiple connections). A paused download retains its active slot. Scheduler supports explicit queue ordering and local once/weekly schedules while Ulos stays open; table search, filtering, sorting, and selection do not change dispatch order.
+- A desktop manager with native macOS system menus (Ulos, Tasks, File, Edit, Downloads, View, Help); non-macOS retains in-window Kit dropdown menus. One shared action toolbar has stock icon-only Buttons except the labeled Add New button, accessible names, built-in tooltips, and a stock search Input on the same row. A collapsible stock Kit sidebar and a viewport-virtualized Kit DataTable show ten columns total: selection checkbox, Name, Size, Status, Transfer rate, Queue, Time left, Last try, Description, and Type, with stable-ID checkbox selection independent of row focus. The default follows system appearance; the toolbar theme selector and View menu offer Follow system, Light, and Dark using stock Kit themes.
+- A session capped at 500 records and 32 named queues (default Main queue), with one global active HTTP or torrent transfer (possibly multiple connections). A paused download retains its active slot. Scheduler supports explicit queue ordering and local once/weekly schedules while Ulos stays open; table search, filtering, sorting, and selection do not change dispatch order.
 - Independent native Add Download windows (new draft per invocation, up to 16) with editable URL, filename, and destination, native folder/save pickers, and options to start now or queue for later.
 - Filename suggestions from the URL path, sanitized into a portable single filename. Naming itself makes no network request. Address edits automatically check advisory size with a debounced HEAD request; sizes use KB/MB/GB/TB with a filename-category icon. Clipboard-prefilled drafts remain network-free until edited or explicitly checked.
 - Stock Kit radio groups for connections and existing-file conflicts. Conflict choices appear only for an existing regular target; replacement still requires destination-specific consent.
@@ -25,7 +25,7 @@ The interface follows a traditional download-manager layout. It does not reuse I
 
 ### Requirements
 
-- Rust 1.92 or newer and Cargo.
+- Cargo and a toolchain compatible with the locked graph. The workspace declares Rust 1.92; the added torrent dependencies need a separate minimum-toolchain check before claiming that baseline works.
 - Native platform prerequisites for the desktop application. Follow the [GPUI Kit installation guide](https://gpui-kit.com/docs/installation) for the version used by this project.
 
 Desktop setup requires Xcode Command Line Tools on macOS, MSVC/C++ tooling with a Windows SDK and CMake on Windows, or the relevant development libraries on Linux. Linux also needs a graphical X11 or Wayland session and a working Vulkan driver. These are upstream requirements, not a verified Ulos support matrix. See [Research](docs/RESEARCH.md) and [Testing](docs/TESTING.md) for details.
@@ -38,11 +38,11 @@ Run the commands below from the repository root. The checked-in `Cargo.lock` pin
 cargo run --locked -p ulos-desktop
 ```
 
-Use **Add URL** to enter an HTTP/HTTPS address, review the suggested filename, and choose a destination. Choose **Start download** to start immediately when idle, or **Download later** to add the item without starting a stopped queue. If the queue is already running, it can still process items added for later.
+Use **Add New → HTTP URL** to enter an HTTP/HTTPS address, review the suggested filename, and choose a destination. Choose **Start download** to start immediately when idle, or **Download later** to add the item without starting a stopped queue. If the queue is already running, it can still process items added for later.
 
 On macOS, **⌘N** opens Add Download, **⌘,** opens Options when available, and **⌘Q** quits. Native Edit commands target the focused Kit input.
 
-The sidebar starts expanded each session. Its Downloads group contains All downloads, Finished, Unfinished, and Queue; File types contains seven flat filters: Image, Music, Video, Apps, Document, Compressed, and Other. Expanded items show real session counts; collapsed items use Kit’s icon rail and tooltips, with counts retained in accessible names. Use the stock icon button immediately before Add URL, **⌘B / Ctrl+B** in the manager, or View’s sidebar command. Collapse does not reset search, filtering, selection, or dispatch order, and is not persisted.
+The sidebar starts expanded each session. Its Downloads group contains All downloads, Finished, Unfinished, and Queue; File types contains seven flat filters: Image, Music, Video, Apps, Document, Compressed, and Other. Expanded items show real session counts; collapsed items use Kit’s icon rail and tooltips, with counts retained in accessible names. Use the stock icon button immediately before Add New, **⌘B / Ctrl+B** in the manager, or View’s sidebar command. Collapse does not reset search, filtering, selection, or dispatch order, and is not persisted.
 
 The main macOS window extends the manager into the titlebar area, with native window controls beside the action toolbar and no separate visible Ulos title strip. Add windows keep native window controls without a visible title. The macOS status window uses transparent full-content chrome and a short fixed Download title, with Kit segmented tabs in its TitleBar.
 
@@ -50,13 +50,23 @@ Click a filename Kit Link, press Enter on the focused row, double-click a row, o
 
 ### Desktop transfer controls
 
-Add Download defaults to **4 connections**, with choices **1, 2, 4, 8**. The engine supports 1–8; actual connections may be fewer for small files or a server without verified range support. A `bytes=0-0` probe must return a valid identity-encoded `206` and strong ETag before parallel downloading or pause is enabled. Unsupported servers use one full stream. No measured speed improvement is promised.
+HTTP Add Download defaults to **4 connections**, with choices **1, 2, 4, 8**. The engine supports 1–8; actual connections may be fewer for small files or a server without verified range support. A `bytes=0-0` probe must return a valid identity-encoded `206` and strong ETag before parallel downloading or pause is enabled. Unsupported servers use one full stream. No measured speed improvement is promised.
 
 Details has stock Kit **Status**, **Speed**, and **Completion** segmented tabs with icons. The same progress footer stays visible on every tab, with a Kit Label inside the 24px Kit Progress bar; unknown percentages are labeled unknown. The connection table contains actual worker telemetry, not fabricated segments. **Pause / Resume** closes and reopens verified ranges within this running session; it is disabled for unsupported servers. There are no saved checkpoints or crash resume.
 
 In **Speed**, enable the limiter, enter **1–1,048,576 KiB/s**, and apply. Disable it for unlimited output consumption. One budget covers all connections before writes; socket/TCP prefetch can still consume network bytes. This is not a wire-speed or network QoS guarantee. Live accepted changes interrupt limiter waits and appear in telemetry on subsequent updates. Connection-count changes apply only to queued or inactive failed downloads on their next start, never to active/paused workers.
 
-Add Download offers **Ask / do not overwrite** (default), **Rename**, or **Overwrite**. Overwrite requires the explicit authorization checkbox for the selected destination; changing the destination resets consent. An already-exists failure exposes **Override existing** (Kit confirmation required) and **Add another file** (fresh numbered-name retry). No retry starts automatically. Rename keeps the original and publishes `stem (1).extension`, trying further bounded candidates on collision.
+HTTP Add Download offers **Ask / do not overwrite** (default), **Rename**, or **Overwrite**. Overwrite requires the explicit authorization checkbox for the selected destination; changing the destination resets consent. An already-exists failure exposes **Override existing** (Kit confirmation required) and **Add another file** (fresh numbered-name retry). No retry starts automatically. Rename keeps the original and publishes `stem (1).extension`, trying further bounded candidates on collision.
+
+### Torrent files
+
+Choose **Add New → Torrent file**, drop local `.torrent` files on the manager, or open one through startup arguments / the OS open-file callback. Every route opens an offline native review; nothing auto-submits. Review the name, total bytes, file manifest, tracker count, destination, and Reject/Rename policy, then choose **Start download** or **Download later**. Later does not start a stopped queue, but confirmation permits an already-running queue to dispatch it.
+
+The separate core engine uses pinned `librqbit` 9.0.1 (Apache-2.0). It accepts bounded v1 metainfo and compatible v1 hybrids, not magnets or pure v2. Discovery is tracker-only after dispatch; payload upload, seeding, DHT, local discovery, inbound listeners, port forwarding, persistence and HTTP serving are off. Disabled upload can hinder reciprocal swarms. Actual session Pause/Resume is available; torrent live rate limits and connection settings are unavailable, not simulated HTTP controls.
+
+HTTP and torrents share one global active slot, named queues, schedules, status windows and post-publication completion gates. The existing table appends **Type**; there is no torrent sidebar group or dedicated torrent download folder. Single-file torrents use the payload's existing file-type category; multifile payloads use Other. Torrent completion requires engine teardown, full SHA-1 piece re-verification and file sync before no-clobber file/directory publication. Torrent Overwrite is never offered or accepted. History schema v2 retains protocol/directory flags but no metainfo, source or tracker; restored rows cannot restart/retry. Multifile directory removal is metadata-only, never recursive deletion.
+
+Development opener metadata and a local unsigned `.app` bundling script are in [packaging](packaging/README.md). macOS declares a torrent Viewer/imported UTI; Linux supplies a desktop Open With entry; Windows supplies an explicitly invoked per-user Open With registration script. These are not installed associations or automatic default changes, signed installers, or verified native launches. No Windows registration script was executed for this update. See [Torrent contract](docs/TORRENTS.md) for limits and privacy.
 
 ### Scheduling & queues
 
@@ -85,7 +95,7 @@ Press `Ctrl+C` to request cancellation. The CLI reports success or failure throu
 
 ## File safety and privacy
 
-Transfers write into an exclusively created `.part` file beside the destination. The CLI and default desktop policy publish without clobbering. Desktop Rename uses no-clobber numbered publication; explicit Overwrite is the only exception, replacing an existing regular file only after staging succeeds. Overwrite refuses symlinks and directories, and preserves the old file on transfer failure. Failure and cancellation trigger best-effort cleanup of the transfer's own temporary file.
+HTTP transfers write into an exclusively created `.part` file beside the destination. Torrents use a unique same-parent staging directory and Reject/Rename only; see the torrent contract above. The CLI and default desktop policy publish without clobbering. HTTP desktop Rename uses no-clobber numbered publication; explicit Overwrite is the only exception, replacing an existing regular file only after staging succeeds. Overwrite refuses symlinks and directories, and preserves the old file on transfer failure. Failure and cancellation trigger best-effort cleanup of the transfer's own temporary file.
 
 Cancellation can race with final publication, so a completed file may exist even after cancellation is requested. Abrupt termination can leave temporary files; crash recovery and resumable checkpoints are not implemented.
 
@@ -98,9 +108,9 @@ Ulos does not provide DRM, captcha, or access-control bypass.
 - Durable checkpoints and pause/resume across application restarts (session pause/resume is implemented for verified range transfers).
 - Durable source-bearing queues, checkpoints, and startup recovery (current SQLite history is metadata-only).
 - Automatic retries (manual failed-download retry is available).
-- Background/closed-app scheduling, site grabbing, and completion actions beyond confirmed shutdown.
+- Background/closed-app scheduling, and completion actions beyond confirmed shutdown.
 - Browser extensions and native-messaging integration.
-- Torrent downloads, including magnet links and `.torrent` files.
+- Magnet links, pure v2 torrents, torrent live rate/connection controls, and durable torrent recovery.
 - Installers and automatic updates.
 
 Unsupported desktop controls are disabled or explain their limitations. Native accessibility, keyboard/focus behavior, and Linux/Windows graphical validation still need review. See [Status](docs/STATUS.md) for recorded verification and known limits, and [Roadmap](docs/ROADMAP.md) for planned work.
@@ -109,7 +119,7 @@ Unsupported desktop controls are disabled or explain their limitations. Native a
 
 | Crate | Responsibility |
 | --- | --- |
-| [`ulos-core`](crates/ulos-core) | HTTP transfer logic, request validation, safe file lifecycle, filename sanitization, and task state. No GPUI dependency. |
+| [`ulos-core`](crates/ulos-core) | HTTP and torrent transfer logic, request validation, safe file lifecycle, filename sanitization, and task state. No GPUI dependency. |
 | [`ulos-cli`](crates/ulos-cli) | Command-line downloader and diagnostic consumer of the shared engine. Builds the `ulos` binary. |
 | [`ulos-desktop`](crates/ulos-desktop) | GPUI Kit interface, session queue, windows, clipboard consent, and transfer orchestration. |
 
@@ -133,7 +143,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo build --locked -p ulos-desktop
 ```
 
-Tests use local HTTP fixtures and temporary files. Changes to transfers should cover errors, cancellation, and no-overwrite behavior as well as successful downloads. Passing tests do not replace native rendering or accessibility checks. Read [AGENTS.md](AGENTS.md) before contributing.
+Tests use local HTTP/tracker/handcrafted-peer fixtures and temporary files, never public swarms. Changes to transfers should cover errors, cancellation, and no-overwrite behavior as well as successful downloads. Passing tests do not replace native rendering or accessibility checks. Read [AGENTS.md](AGENTS.md) before contributing.
 
 ## Documentation
 
@@ -144,7 +154,7 @@ Tests use local HTTP fixtures and temporary files. Changes to transfers should c
 - [Testing and platform matrix](docs/TESTING.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Research and dependency references](docs/RESEARCH.md)
-- [Future torrent scope](docs/TORRENTS.md)
+- [Torrent implementation and limits](docs/TORRENTS.md)
 
 ## License
 

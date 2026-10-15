@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Ulos
+Comment=Download manager
+Exec=ulos-desktop %F
+TryExec=ulos-desktop
+Terminal=false
+Categories=Network;FileTransfer;
+MimeType=application/x-bittorrent;
+StartupNotify=true

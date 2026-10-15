@@ -208,9 +208,26 @@ impl DownloadManager {
                 .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx))),
             )
             .content(
-                toolbar_button("add-url", "Add URL", AssetIcon::Plus)
-                    .label("Add URL")
-                    .on_click(cx.listener(|view, _, window, cx| view.open_add(window, cx))),
+                toolbar_button("add-url", "Add New", AssetIcon::Plus)
+                    .label("Add New")
+                    .dropdown_menu({
+                        let owner = cx.weak_entity();
+                        move |menu, _, _| {
+                            let http = owner.clone();
+                            let torrent = owner.clone();
+                            menu.item(PopupMenuItem::new("HTTP / HTTPS URL…").on_click(
+                                move |_, window, cx| {
+                                    let _ = http.update(cx, |view, cx| view.open_add(window, cx));
+                                },
+                            ))
+                            .item(
+                                PopupMenuItem::new("Torrent file…").on_click(move |_, _, cx| {
+                                    let _ =
+                                        torrent.update(cx, |view, cx| view.open_torrent(None, cx));
+                                }),
+                            )
+                        }
+                    }),
             )
             .content(
                 toolbar_button("start-queue", "Start Queue", AssetIcon::Play)
@@ -248,11 +265,6 @@ impl DownloadManager {
             .content(
                 toolbar_button("scheduler", "Scheduler", AssetIcon::Calendar)
                     .on_click(cx.listener(|view, _, window, cx| view.open_scheduler(window, cx))),
-            )
-            .content(
-                toolbar_button("grabber", "Grabber", AssetIcon::Globe)
-                    .disabled(true)
-                    .tooltip("Site grabbing is not implemented yet"),
             )
             .content(
                 toolbar_button("options", "Options", AssetIcon::Settings)
@@ -569,6 +581,10 @@ impl Render for DownloadManager {
             .debug_selector(|| "manager-shell".into())
             .track_focus(&self.focus)
             .key_context("DownloadManager")
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                view.offer_torrent_paths(paths.paths().to_vec(), cx);
+            }))
             .on_action(cx.listener(|view, _: &AddUrl, window, cx| view.open_add(window, cx)))
             .on_action(cx.listener(|view, _: &StartQueue, _, cx| view.start_queue(cx)))
             .on_action(cx.listener(|view, _: &StopAll, _, cx| view.stop_all(cx)))

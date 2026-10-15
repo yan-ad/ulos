@@ -2031,7 +2031,6 @@ fn native_menu_toolbar_uses_stock_sizes_and_one_row_at_minimum_width(cx: &mut Te
         "remove-selected",
         "clear-finished",
         "scheduler",
-        "grabber",
         "selected-details",
     ] {
         let button = cx.debug_bounds(selector).expect("toolbar control");

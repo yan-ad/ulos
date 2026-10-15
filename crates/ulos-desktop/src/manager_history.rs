@@ -75,7 +75,7 @@ impl DownloadManager {
             .queue
             .items
             .iter()
-            .any(|item| ids.contains(&item.id) && item.is_finished());
+            .any(|item| ids.contains(&item.id) && item.is_finished() && !item.output_directory);
         self.pending_removal = Some(ids.clone());
         self.removal_open = true;
         let owner = cx.weak_entity();
@@ -87,7 +87,7 @@ impl DownloadManager {
             let record_ids = ids.clone();
             let delete_ids = ids.clone();
             alert.title("Remove downloads?")
-                .description("Remove records only to keep files. Delete files permanently deletes completed destinations and removes their records. Active and paused downloads are excluded; failed deletions keep their records.")
+                .description("Remove records only to keep files. Delete files permanently deletes completed regular files and removes their records. Torrent directories are kept. Active and paused downloads are excluded; failed deletions keep their records.")
                 .width(px(540.))
                 .on_close(move |_, _, cx| {
                     let _ = close_owner.update(cx, |view, cx| {
@@ -154,6 +154,9 @@ impl DownloadManager {
             .into_iter()
             .filter_map(|id| {
                 let item = self.queue.item(id)?;
+                if item.output_directory {
+                    return None;
+                }
                 (self.active != Some(id) && !item.is_active())
                     .then(|| (id, item.destination.clone(), item.is_finished()))
             })

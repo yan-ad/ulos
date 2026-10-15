@@ -19,15 +19,15 @@ No Linux/Windows runtime or visual/accessibility results are inferred from macOS
 **Implemented foundation; verification is tracked separately in [Status](STATUS.md).** Initialization was committed as `7bf99c6`; do not infer later commit or test outcomes from this roadmap.
 
 - Shared UI-independent `HttpDownloadTask`, bounded coalescing state, caller-supplied Tokio handle, and cancellation on drop.
-- Light IDM 6.28-inspired manager structure using GPUI Kit, native titlebar, macOS system menus/non-macOS Kit dropdowns, stock icon toolbar and grouped collapsible sidebar, viewport-virtualized borderless Kit DataTable with nine columns total: selection checkbox, Name, Size, Status, Transfer rate, Queue, Time left, Last try, and Description, 36px rows and a 32px header, and StatusBar. This supersedes the earlier dark AB reference, without copied branding/source or an exact-pixel-match promise.
-- Real 500-record session queue with one active HTTP transfer, explicit queue-order advancement, presentation-only search/filter/sort, stable selection, metadata-only removal/clear, and finished-file reveal.
+- Light IDM 6.28-inspired manager structure using GPUI Kit, native titlebar, macOS system menus/non-macOS Kit dropdowns, stock icon toolbar and grouped collapsible sidebar, viewport-virtualized borderless Kit DataTable with ten columns total: selection checkbox, Name, Size, Status, Transfer rate, Queue, Time left, Last try, Description, and Type, 36px rows and a 32px header, and StatusBar. This supersedes the earlier dark AB reference, without copied branding/source or an exact-pixel-match promise.
+- Real 500-record session queue with one active HTTP or torrent transfer, explicit queue-order advancement, presentation-only search/filter/sort, stable selection, metadata-only removal/clear, and finished-file reveal.
 - Independent native Add windows (new draft per invocation, maximum 16) with URL-path name suggestion, portable sanitization, native folder/save pickers, manual-name preservation, Start download / Download later.
 - Native status windows (one reused/activated window per download, different IDs concurrent), real per-connection telemetry, Hide details, active cancellation, verified session Pause/Resume, functional Speed/Completion tabs, and persistent shared progress footer.
 - Options copied-link detection: explicit off-by-default session opt-in, main-window-active one-second async checks suppressed by any Add/status/Scheduler window or Options dialog and rechecked after reads, bounded one-URL proposals and fingerprint deduplication, no autonomous downloads or non-URL retention/logging.
 - Kit-only widgets, text and panels, with layout-only Kit `div`/`v_flex`/`h_flex`; Options remains a Kit modal. Child roots own their inputs/subscriptions and a strong shared manager handle, while manager registries keep weak child content. Main close leaves children usable; last-window close quits. Picker guards prevent Add dismissal/submission while outstanding. Record removal closes related status windows without file deletion.
 - Change-gated 100ms watch observation and stale-rate refresh, unchanged-status snapshot suppression, and structural 500-record viewport/child-input render regressions. No measured latency or FPS claim.
 
-Metadata-only SQLite destination/status/bytes history and session scheduling are implemented; durable source-bearing queues/checkpoints, site grabber, browser bridge, and completion actions beyond confirmed shutdown remain future work. Grabber remains disabled. Restored source-less history cannot start/retry. Keyboard/focus, accessibility, complete runtime teardown, and native Linux/Windows validation remain pending; a test adapter is not native-platform evidence.
+Metadata-only SQLite destination/status/bytes history and session scheduling are implemented; durable source-bearing queues/checkpoints, browser bridge, and completion actions beyond confirmed shutdown remain future work. Restored source-less history cannot start/retry. Keyboard/focus, accessibility, complete runtime teardown, and native Linux/Windows validation remain pending; a test adapter is not native-platform evidence.
 
 ## Current continuation — controlled advanced transfers
 
@@ -48,7 +48,7 @@ Outstanding: adversarial range/limiter/publication integration, latest full-work
 
 Once/weekly local schedules require Ulos open: future Once `YYYY-MM-DD` / `HH:MM`, nonempty weekly weekdays, optional unequal stop with overnight handling. Skip nonexistent DST occurrences/use the earlier fold instant; wake only catches an unexpired window, never replays ended windows (no-stop catch-up only on its local start day). Repeated ticks/manual stop cannot restart an occurrence and recurrence cannot retry terminal rows. Reused Scheduler native Root survives main close, gates both clipboard phases, and schedule enablement cancels/blocks completion shutdown.
 
-The nine-column table uses checkbox selection independent of row focus, Kit filename Links with colored category icons, focused-row Enter/double-click Details, actual-rate ETA, local actual-worker Last try, and explicit Description; unknown metadata stays blank. No Button variant or decorative rounded border. Queue names, schedules, membership/order, descriptions, and attempt times remain session-only; metadata history contains neither sources nor schedules and is not durable recovery. Keep network secrets out of logs. See Testing for planned verification; no new run/result is claimed here.
+The ten-column table uses checkbox selection independent of row focus, Kit filename Links with colored category icons, focused-row Enter/double-click Details, actual-rate ETA, local actual-worker Last try, and explicit Description; unknown metadata stays blank. No Button variant or decorative rounded border. Queue names, schedules, membership/order, descriptions, and attempt times remain session-only; metadata history contains neither sources nor schedules and is not durable recovery. Keep network secrets out of logs. See Testing for planned verification; no new run/result is claimed here.
 
 ## Milestone 2 — Reliable HTTP transfers and persistence
 
@@ -76,11 +76,17 @@ Implement a small JS/TS extension and native messaging hosts for agreed Chromium
 
 Exit evidence: end-to-end desktop/browser scenarios on named platforms/versions, including failures and clean-install packaging checks. A development window is not a distributable release.
 
-## Later milestone — Torrent support
+## Current continuation — Torrent files
 
-**Planned; no torrent dependencies or UI controls today.**
+**Source-implemented; verification and native packaging acceptance remain separate.**
 
-Research engine suitability and licensing before selection; implement a separate core engine only after HTTP reliability and desktop integration. Validate magnet/`.torrent` metadata with bounded parsing, safe no-overwrite multifile destinations, and piece-hash integrity. Decide tracker/DHT privacy, seeding consent/defaults, bandwidth limits, and storage allocation/cleanup before exposing controls. Use deterministic fixtures and legal payloads. Introduce shared abstractions only when the second concrete backend needs them; persist protocol-tagged sources when source-bearing persistence is implemented. See [Torrent scope](TORRENTS.md).
+- Separate UI-independent `torrent.rs` backend using reviewed Apache-2.0 `librqbit` 9.0.1; Ulos remains MIT and retains third-party notices.
+- Offline bounded v1 / compatible v1-hybrid metainfo review, strict portable paths, tracker-only explicitly dispatched downloads, payload upload disabled, joined engine teardown and full piece re-verification before no-clobber Reject/Rename publication.
+- Add New → HTTP URL / Torrent file; `.torrent` picker/drop/startup/OS-open confirmation; same categories, shared queue/table with appended Type, no torrent sidebar group or special download folder.
+- Shared global slot, named queues, session scheduler and post-publication completion; honest unavailable torrent live rate/connection controls, actual session pause, metadata-only v2 history and no recursive multifile directory removal.
+- Development macOS bundle/imported UTI, Linux desktop entry and explicit per-user Windows Open With registration aid; none forces defaults or establishes an installed/verified association.
+
+Pending: execute the local handcrafted-peer/integrity/cancel/pause and mixed-queue test plan, native open/drop/association checks, package notice audit and locked-graph MSRV checks. Magnets, pure v2, durable source/checkpoint recovery and torrent rate/connection controls remain unimplemented. See [Torrent contract](TORRENTS.md) and [Testing](TESTING.md). No public trackers/initial peers are used in tests; no native distribution or cross-compilation result follows from source implementation.
 
 ## Decisions before release
 

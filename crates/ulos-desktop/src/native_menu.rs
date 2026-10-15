@@ -17,6 +17,7 @@ gpui_kit::actions!(
     native_commands,
     [
         NewDownload,
+        OpenTorrentFile,
         StartDownloads,
         StopDownloadsQueue,
         StopDownloads,
@@ -43,6 +44,7 @@ gpui_kit::actions!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Add,
+    Torrent,
     Start,
     StopQueue,
     StopAll,
@@ -87,6 +89,7 @@ impl Command {
     pub fn enabled(self, state: &MenuState) -> bool {
         match self {
             Self::Add => state.can_add,
+            Self::Torrent => state.can_add,
             Self::Start => state.can_start,
             Self::StopQueue => state.queue_running,
             Self::StopAll => state.can_stop,
@@ -139,6 +142,7 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
             item("Add URL…", NewDownload, Command::Add, state),
             item("Details…", ShowDownloadDetails, Command::Details, state),
             item("Show in Folder", RevealDownloads, Command::Reveal, state),
+            item("Open Torrent…", OpenTorrentFile, Command::Torrent, state),
         ]),
         // These are the input component's real responder-chain actions, not
         // application handlers: editing stays with the focused input control.
@@ -258,6 +262,7 @@ pub fn install(
     main: AnyWindowHandle,
 ) -> Vec<Subscription> {
     register::<NewDownload>(cx, &owner, main, Command::Add);
+    register::<OpenTorrentFile>(cx, &owner, main, Command::Torrent);
     register::<StartDownloads>(cx, &owner, main, Command::Start);
     register::<StopDownloadsQueue>(cx, &owner, main, Command::StopQueue);
     register::<StopDownloads>(cx, &owner, main, Command::StopAll);

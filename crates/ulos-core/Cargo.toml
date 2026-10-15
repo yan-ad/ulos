@@ -7,6 +7,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+librqbit = { version = "=9.0.1", default-features = false, features = ["rust-tls", "disable-upload"] }
+rustix = { version = "1", features = ["fs"] }
+sha1 = "0.10"
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
+tracing = "0.1"
 percent-encoding = "2"
 reqwest.workspace = true
 tempfile.workspace = true

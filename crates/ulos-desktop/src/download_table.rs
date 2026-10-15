@@ -25,6 +25,7 @@ use crate::{
 /// Presentation data, refreshed by the manager when queue state changes.
 #[derive(Clone, Debug)]
 pub struct DownloadRow {
+    pub is_torrent: bool,
     pub id: DownloadId,
     pub name: String,
     pub category: Category,
@@ -92,6 +93,9 @@ fn columns() -> Vec<Column> {
             .movable(false),
         Column::new("description", "Description")
             .width(px(240.))
+            .movable(false),
+        Column::new("protocol", "Type")
+            .width(px(100.))
             .movable(false),
     ]
 }
@@ -245,6 +249,7 @@ impl TableDelegate for DownloadTable {
             6 => Label::new(row.time_left_label()).into_any_element(),
             7 => Label::new(row.last_try_label()).into_any_element(),
             8 => Label::new(row.description.clone()).into_any_element(),
+            9 => Label::new(if row.is_torrent { "Torrent" } else { "HTTP" }).into_any_element(),
             _ => unreachable!("unknown download table column"),
         }
     }
@@ -274,6 +279,7 @@ mod tests {
 
     fn snapshot() -> DownloadRow {
         DownloadRow {
+            is_torrent: false,
             id: 7,
             name: "archive.zip".into(),
             category: Category::Compressed,
@@ -302,6 +308,7 @@ mod tests {
             ("time-left", "Time left", 100.),
             ("last-try", "Last try", 160.),
             ("description", "Description", 240.),
+            ("protocol", "Type", 100.),
         ];
         assert_eq!(columns.len(), contract.len());
         for (index, (column, (key, label, width))) in columns.iter().zip(contract).enumerate() {

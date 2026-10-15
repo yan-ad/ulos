@@ -34,6 +34,8 @@ pub struct HistoryRecord {
     pub status: HistoryStatus,
     pub downloaded: u64,
     pub total: Option<u64>,
+    pub is_torrent: bool,
+    pub output_directory: bool,
 }
 
 impl HistoryStatus {
@@ -158,10 +160,15 @@ impl HistoryStore {
         match version {
             0 => {
                 let tx = connection.transaction().map_err(sql_error)?;
-                tx.execute_batch("CREATE TABLE history (id TEXT PRIMARY KEY NOT NULL, path BLOB NOT NULL, added_secs TEXT NOT NULL, added_nanos INTEGER NOT NULL, status TEXT NOT NULL, downloaded TEXT NOT NULL, total TEXT); PRAGMA user_version=1;").map_err(sql_error)?;
+                tx.execute_batch("CREATE TABLE history (id TEXT PRIMARY KEY NOT NULL, path BLOB NOT NULL, added_secs TEXT NOT NULL, added_nanos INTEGER NOT NULL, status TEXT NOT NULL, downloaded TEXT NOT NULL, total TEXT, is_torrent INTEGER NOT NULL DEFAULT 0 CHECK(is_torrent IN (0,1)), output_directory INTEGER NOT NULL DEFAULT 0 CHECK(output_directory IN (0,1))); PRAGMA user_version=2;").map_err(sql_error)?;
                 tx.commit().map_err(sql_error)?;
             }
-            1 => (),
+            1 => {
+                let tx = connection.transaction().map_err(sql_error)?;
+                tx.execute_batch("ALTER TABLE history ADD COLUMN is_torrent INTEGER NOT NULL DEFAULT 0 CHECK(is_torrent IN (0,1)); ALTER TABLE history ADD COLUMN output_directory INTEGER NOT NULL DEFAULT 0 CHECK(output_directory IN (0,1)); PRAGMA user_version=2;").map_err(sql_error)?;
+                tx.commit().map_err(sql_error)?;
+            }
+            2 => (),
             _ => return Err("History was created by an unsupported application version.".into()),
         }
         Ok(Self { connection })
@@ -200,7 +207,7 @@ impl HistoryStore {
         tx.execute("DELETE FROM history", []).map_err(sql_error)?;
         for (record, elapsed, path) in prepared {
             tx.execute(
-                "INSERT INTO history VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO history (id,path,added_secs,added_nanos,status,downloaded,total,is_torrent,output_directory) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     format!("{:020}", record.id),
                     path,
@@ -208,7 +215,9 @@ impl HistoryStore {
                     elapsed.subsec_nanos(),
                     record.status.encoded(),
                     record.downloaded.to_string(),
-                    record.total.map(|v| v.to_string())
+                    record.total.map(|v| v.to_string()),
+                    record.is_torrent,
+                    record.output_directory
                 ],
             )
             .map_err(sql_error)?;
@@ -216,7 +225,7 @@ impl HistoryStore {
         tx.commit().map_err(sql_error)
     }
     pub fn load(&self) -> Result<Vec<HistoryRecord>, String> {
-        let mut statement = self.connection.prepare("SELECT id,path,added_secs,added_nanos,status,downloaded,total FROM history ORDER BY id LIMIT 501").map_err(sql_error)?;
+        let mut statement = self.connection.prepare("SELECT id,path,added_secs,added_nanos,status,downloaded,total,is_torrent,output_directory FROM history ORDER BY id LIMIT 501").map_err(sql_error)?;
         let mut rows = statement.query([]).map_err(sql_error)?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().map_err(sql_error)? {
@@ -230,6 +239,11 @@ impl HistoryStore {
             let status: String = row.get(4).map_err(sql_error)?;
             let downloaded: String = row.get(5).map_err(sql_error)?;
             let total: Option<String> = row.get(6).map_err(sql_error)?;
+            let is_torrent: i64 = row.get(7).map_err(sql_error)?;
+            let output_directory: i64 = row.get(8).map_err(sql_error)?;
+            if ![0, 1].contains(&is_torrent) || ![0, 1].contains(&output_directory) {
+                return Err("History contains invalid output flags.".into());
+            }
             if !(0..1_000_000_000).contains(&nanos) {
                 return Err("History contains an invalid timestamp.".into());
             }
@@ -243,6 +257,8 @@ impl HistoryStore {
                 status: HistoryStatus::restored(&status)?,
                 downloaded: parse_number(&downloaded)?,
                 total: total.as_deref().map(parse_number).transpose()?,
+                is_torrent: is_torrent != 0,
+                output_directory: output_directory != 0,
             });
         }
         Ok(records)
@@ -365,6 +381,8 @@ mod tests {
             status: HistoryStatus::Completed,
             downloaded: u64::MAX,
             total: Some(u64::MAX),
+            is_torrent: false,
+            output_directory: false,
         }
     }
     #[test]
@@ -381,6 +399,77 @@ mod tests {
             vec![original]
         );
     }
+    #[test]
+    fn version_one_migration_preserves_rows_and_defaults_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE history (id TEXT PRIMARY KEY NOT NULL, path BLOB NOT NULL, added_secs TEXT NOT NULL, added_nanos INTEGER NOT NULL, status TEXT NOT NULL, downloaded TEXT NOT NULL, total TEXT); PRAGMA user_version=1;").unwrap();
+        let original = record(dir.path().join("old.bin"));
+        connection
+            .execute(
+                "INSERT INTO history VALUES (?1,?2,'123',456,'completed',?3,?3)",
+                params![
+                    format!("{:020}", original.id),
+                    encode_path(&original.destination),
+                    u64::MAX.to_string()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let mut store = HistoryStore::open(&path).unwrap();
+        assert_eq!(store.load().unwrap(), vec![original.clone()]);
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        let mut torrent = original;
+        torrent.is_torrent = true;
+        torrent.output_directory = true;
+        torrent.destination = dir.path().join("absent-directory");
+        store.replace(std::slice::from_ref(&torrent)).unwrap();
+        assert_eq!(store.load().unwrap(), vec![torrent]);
+        for column in ["is_torrent", "output_directory"] {
+            assert!(
+                store
+                    .connection
+                    .execute(&format!("UPDATE history SET {column}=2"), [])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_columns_and_version_without_losing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-v1.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE history (id TEXT, output_directory INTEGER); INSERT INTO history VALUES ('preserved',0); PRAGMA user_version=1;").unwrap();
+        drop(connection);
+        assert!(HistoryStore::open(&path).is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT id FROM history", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+        assert!(
+            connection
+                .prepare("SELECT is_torrent FROM history")
+                .is_err()
+        );
+    }
+
     #[test]
     fn duplicate_and_invalid_time_preserve_old_records() {
         let dir = tempfile::tempdir().unwrap();
@@ -418,7 +507,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.sqlite");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE preserved (value TEXT); INSERT INTO preserved VALUES ('old rows');",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
         let before = std::fs::read(&path).unwrap();
         assert!(HistoryStore::open(&path).is_err());
@@ -462,7 +556,16 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        for forbidden in ["source", "url", "cookie", "authorization", "validator"] {
+        for forbidden in [
+            "source",
+            "url",
+            "cookie",
+            "authorization",
+            "validator",
+            "tracker",
+            "hash",
+            "metainfo",
+        ] {
             assert!(!sql.contains(forbidden));
         }
     }

@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use ulos_core::torrent::{TorrentPhase, TorrentSource, TorrentTelemetry};
 use ulos_core::transfer::{CollisionPolicy, ConnectionStatus, TransferOptions, TransferTelemetry};
 use ulos_core::{DownloadProgress, tasks::TransferState};
 
@@ -108,6 +109,10 @@ pub struct QueueItem {
     pub cancelling: bool,
     pub options: TransferOptions,
     pub telemetry: TransferTelemetry,
+    pub torrent_source: Option<TorrentSource>,
+    pub torrent_telemetry: Option<TorrentTelemetry>,
+    pub is_torrent: bool,
+    pub output_directory: bool,
     pub completion: CompletionGate,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
@@ -130,12 +135,21 @@ impl QueueItem {
     }
 
     pub fn has_source(&self) -> bool {
-        !self.source.is_empty()
+        !self.source.is_empty() || self.torrent_source.is_some()
     }
 
     pub fn status(&self) -> &str {
         if self.cancelling && self.is_active() {
             return "Cancelling";
+        }
+        if self.is_torrent && self.is_active() {
+            return match self.torrent_telemetry.as_ref().map(|value| &value.phase) {
+                Some(TorrentPhase::Checking) => "Checking",
+                Some(TorrentPhase::Publishing) => "Verifying / publishing",
+                _ if matches!(self.state, Some(TransferState::Paused(_))) => "Paused",
+                _ if matches!(self.state, Some(TransferState::Downloading(_))) => "Downloading",
+                _ => "Preparing torrent",
+            };
         }
         match self.state.as_ref() {
             None => "Added",
@@ -237,7 +251,11 @@ impl QueueItem {
             }
             TransferState::Completed(receipt) => {
                 self.destination = receipt.destination.clone();
-                self.category = Category::from_path(&self.destination);
+                self.category = if self.output_directory {
+                    Category::Other
+                } else {
+                    Category::from_path(&self.destination)
+                };
                 self.downloaded_bytes = receipt.downloaded_bytes;
                 self.total_bytes = Some(receipt.downloaded_bytes);
                 self.telemetry.destination = self.destination.clone();
@@ -267,9 +285,28 @@ impl QueueItem {
     /// Copy observed worker metadata, not user-selected settings or state.
     /// Late snapshots cannot replace a terminal receipt or its final metadata.
     pub fn apply_telemetry(&mut self, telemetry: TransferTelemetry) {
-        if !self.state.as_ref().is_some_and(TransferState::is_terminal) {
+        if !self.is_torrent && !self.state.as_ref().is_some_and(TransferState::is_terminal) {
             self.telemetry = telemetry;
         }
+    }
+
+    /// Torrent observations stay separate from HTTP ranges, connections and resume metadata.
+    pub fn apply_torrent_telemetry(&mut self, mut value: TorrentTelemetry) {
+        if !self.is_torrent || self.state.as_ref().is_some_and(TransferState::is_terminal) {
+            return;
+        }
+        // Checking is not downloaded/verified progress, even if an engine reports bytes scanned.
+        if value.phase == TorrentPhase::Checking {
+            value.downloaded_bytes = 0;
+        }
+        value.downloaded_bytes = value.downloaded_bytes.min(value.total_bytes);
+        self.downloaded_bytes = value.downloaded_bytes;
+        self.total_bytes = Some(value.total_bytes);
+        self.telemetry.progress = DownloadProgress {
+            downloaded_bytes: value.downloaded_bytes,
+            total_bytes: Some(value.total_bytes),
+        };
+        self.torrent_telemetry = Some(value);
     }
 
     pub fn can_retry(&self) -> bool {
@@ -282,7 +319,7 @@ impl QueueItem {
 
     /// Reset metadata for a new attempt; never touch files or start a worker.
     pub fn reset_for_retry(&mut self, collision: CollisionPolicy) -> bool {
-        if !self.can_retry() {
+        if !self.can_retry() || (self.is_torrent && collision == CollisionPolicy::Overwrite) {
             return false;
         }
         self.completion.cancel();
@@ -290,11 +327,16 @@ impl QueueItem {
         self.state = None;
         self.cancelling = false;
         self.downloaded_bytes = 0;
-        self.total_bytes = None;
+        self.total_bytes = self.torrent_source.as_ref().map(TorrentSource::total_bytes);
+        self.torrent_telemetry = self.total_bytes.map(initial_torrent_telemetry);
         self.last_sample = None;
         self.measured_rate = None;
         self.telemetry = TransferTelemetry {
             destination: self.destination.clone(),
+            progress: DownloadProgress {
+                downloaded_bytes: 0,
+                total_bytes: self.total_bytes,
+            },
             ..TransferTelemetry::default()
         };
         self.options.collision = collision;
@@ -308,6 +350,16 @@ impl QueueItem {
         }
         self.cancelling = true;
         true
+    }
+}
+
+fn initial_torrent_telemetry(total_bytes: u64) -> TorrentTelemetry {
+    TorrentTelemetry {
+        downloaded_bytes: 0,
+        total_bytes,
+        peers: 0,
+        uploaded_bytes: 0,
+        phase: TorrentPhase::Preparing,
     }
 }
 
@@ -342,6 +394,8 @@ impl SessionQueue {
                 },
                 downloaded: item.downloaded_bytes,
                 total: item.total_bytes,
+                is_torrent: item.is_torrent,
+                output_directory: item.output_directory,
             })
             .collect()
     }
@@ -398,7 +452,15 @@ impl SessionQueue {
                     queue_order: record.id,
                     last_try: None,
                     description: String::new(),
-                    category: Category::from_path(&record.destination),
+                    category: if record.output_directory {
+                        Category::Other
+                    } else {
+                        Category::from_path(&record.destination)
+                    },
+                    is_torrent: record.is_torrent,
+                    output_directory: record.output_directory,
+                    torrent_source: None,
+                    torrent_telemetry: None,
                     telemetry: TransferTelemetry {
                         destination: record.destination.clone(),
                         progress: DownloadProgress {
@@ -435,6 +497,26 @@ impl SessionQueue {
         if url.trim().is_empty() || destination.as_os_str().is_empty() {
             return Err("A source and destination are required");
         }
+        self.add_source(url, None, destination)
+    }
+
+    pub fn add_torrent(
+        &mut self,
+        source: TorrentSource,
+        destination: PathBuf,
+    ) -> Result<DownloadId, &'static str> {
+        self.add_source(String::new(), Some(source), destination)
+    }
+
+    fn add_source(
+        &mut self,
+        url: String,
+        torrent_source: Option<TorrentSource>,
+        destination: PathBuf,
+    ) -> Result<DownloadId, &'static str> {
+        if destination.as_os_str().is_empty() {
+            return Err("A source and destination are required");
+        }
         if self.items.len() >= MAX_ITEMS {
             return Err("The session queue is full");
         }
@@ -451,13 +533,26 @@ impl SessionQueue {
             .checked_add(1)
             .ok_or("Download identifiers exhausted")?;
         self.next_id = id;
+        let is_torrent = torrent_source.is_some();
+        let output_directory = torrent_source
+            .as_ref()
+            .is_some_and(TorrentSource::is_multi_file);
+        let total_bytes = torrent_source.as_ref().map(TorrentSource::total_bytes);
         self.items.push(QueueItem {
             id,
             queue_id: DEFAULT_QUEUE,
             queue_order: id,
             last_try: None,
             description: String::new(),
-            category: Category::from_path(&destination),
+            category: if output_directory {
+                Category::Other
+            } else {
+                Category::from_path(&destination)
+            },
+            is_torrent,
+            output_directory,
+            torrent_telemetry: total_bytes.map(initial_torrent_telemetry),
+            torrent_source,
             // Four HTTP connections, not CPU workers; core's default stays one.
             options: TransferOptions {
                 connections: 4,
@@ -465,6 +560,10 @@ impl SessionQueue {
             },
             telemetry: TransferTelemetry {
                 destination: destination.clone(),
+                progress: DownloadProgress {
+                    downloaded_bytes: 0,
+                    total_bytes,
+                },
                 ..TransferTelemetry::default()
             },
             completion: CompletionGate::default(),
@@ -473,7 +572,7 @@ impl SessionQueue {
             state: None,
             cancelling: false,
             downloaded_bytes: 0,
-            total_bytes: None,
+            total_bytes,
             source: url,
             last_sample: None,
             measured_rate: None,
@@ -705,7 +804,107 @@ mod tests {
             status,
             downloaded: 17,
             total: Some(100),
+            is_torrent: false,
+            output_directory: false,
         }
+    }
+
+    fn torrent(multi: bool) -> TorrentSource {
+        let layout = if multi {
+            "5:filesld6:lengthi3e4:pathl8:file.txteee"
+        } else {
+            "6:lengthi3e"
+        };
+        let mut bytes =
+            format!("d4:infod{layout}4:name8:file.txt12:piece lengthi16384e6:pieces20:")
+                .into_bytes();
+        bytes.extend_from_slice(&[0; 20]);
+        bytes.extend_from_slice(b"ee");
+        ulos_core::torrent::parse(bytes).unwrap()
+    }
+
+    #[test]
+    fn torrents_share_queue_safety_without_http_source_or_connections() {
+        let mut queue = SessionQueue::default();
+        let id = queue
+            .add_torrent(torrent(false), "file.txt".into())
+            .unwrap();
+        let item = queue.item_mut(id).unwrap();
+        assert!(item.is_torrent && item.has_source());
+        assert!(!item.output_directory);
+        assert_eq!(item.source(), "");
+        assert_eq!(item.total_bytes, Some(3));
+        assert_eq!(item.category, Category::Document);
+        item.apply_state(TransferState::Preparing, Instant::now());
+        assert_eq!(item.status(), "Preparing torrent");
+        let mut telemetry = initial_torrent_telemetry(3);
+        telemetry.phase = TorrentPhase::Checking;
+        telemetry.downloaded_bytes = 3;
+        telemetry.peers = 7;
+        item.apply_torrent_telemetry(telemetry.clone());
+        assert_eq!(item.status(), "Checking");
+        assert_eq!(item.downloaded_bytes, 0);
+        assert!(item.telemetry.connections.is_empty());
+        telemetry.phase = TorrentPhase::Publishing;
+        item.apply_torrent_telemetry(telemetry);
+        assert_eq!(item.status(), "Verifying / publishing");
+        item.apply_state(TransferState::Cancelled, Instant::now());
+        item.apply_torrent_telemetry(initial_torrent_telemetry(100));
+        assert_eq!(item.total_bytes, Some(3));
+        assert!(item.can_retry());
+        assert!(!item.reset_for_retry(CollisionPolicy::Overwrite));
+        assert!(item.reset_for_retry(CollisionPolicy::Rename));
+        assert_eq!(item.total_bytes, Some(3));
+        assert_eq!(item.torrent_telemetry.as_ref().unwrap().peers, 0);
+        assert!(
+            queue
+                .add_torrent(torrent(false), "file.txt".into())
+                .is_err()
+        );
+        assert!(
+            queue
+                .add("https://example.invalid".into(), "file.txt".into())
+                .is_err()
+        );
+        assert!(queue.add_torrent(torrent(false), PathBuf::new()).is_err());
+        let http = queue
+            .add("https://example.invalid".into(), "http.txt".into())
+            .unwrap();
+        let http = queue.item_mut(http).unwrap();
+        http.apply_torrent_telemetry(initial_torrent_telemetry(123));
+        assert!(http.torrent_telemetry.is_none());
+        assert_eq!(http.total_bytes, None);
+        queue.next_id = u64::MAX;
+        assert!(queue.add_torrent(torrent(false), "other".into()).is_err());
+    }
+
+    #[test]
+    fn torrent_directory_history_is_metadata_only_and_never_retryable() {
+        let mut queue = SessionQueue::default();
+        let id = queue
+            .add_torrent(torrent(true), "directory.pdf".into())
+            .unwrap();
+        queue.item_mut(id).unwrap().apply_state(
+            TransferState::Completed(DownloadReceipt {
+                destination: "renamed-directory.pdf".into(),
+                downloaded_bytes: 3,
+            }),
+            Instant::now(),
+        );
+        assert_eq!(queue.item(id).unwrap().category, Category::Other);
+        let records = queue.history_records();
+        assert!(records[0].is_torrent && records[0].output_directory);
+        let mut restored = SessionQueue::default();
+        restored.restore_history(records).unwrap();
+        let item = restored.item_mut(id).unwrap();
+        assert_eq!(item.destination, Path::new("renamed-directory.pdf"));
+        assert!(item.is_finished() && item.is_torrent && item.output_directory);
+        assert_eq!(item.category, Category::Other);
+        assert!(item.torrent_source.is_none() && item.torrent_telemetry.is_none());
+        assert!(!item.has_source() && !item.can_retry());
+        assert!(!item.reset_for_retry(CollisionPolicy::Rename));
+        item.state = Some(TransferState::Cancelled);
+        assert!(!item.can_retry());
     }
 
     #[test]
