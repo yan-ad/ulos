@@ -12,16 +12,22 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     *,
 };
-use ulos_core::tasks::{HttpDownloadTask, TransferState};
+use ulos_core::{
+    tasks::{HttpDownloadTask, TransferState},
+    transfer::{CollisionPolicy, MAX_CONNECTIONS, TransferOptions, TransferTelemetry},
+};
 
 use crate::{
     add_download::AddDownload,
     clipboard::ClipboardDetector,
+    completion::{self, CompletionAction},
     download_details::{DetailsSnapshot, DownloadDetails},
     download_table::{DownloadRow, DownloadTable},
     formatting,
-    native_windows::{ChildWindow, NativeAddWindow, StatusWindow, child_options},
+    native_windows::{ChildWindow, NativeAddWindow, StatusWindow, add_options, status_options},
+    platform_paths::PlatformPaths,
     queue::{DownloadId, Filter, SessionQueue, SortColumn},
+    storage::{HistoryRecord, HistoryWriter},
 };
 
 actions!(
@@ -49,12 +55,24 @@ pub struct DownloadManager {
     last_rate: Option<f64>,
     _subscriptions: Vec<Subscription>,
     _updates: Option<Task<()>>,
+    _shutdown_countdown: Option<Task<()>>,
+    shutdown_id: Option<DownloadId>,
+    shutdown_remaining: Option<u64>,
+    completion_error: Option<String>,
     clipboard_enabled: bool,
     clipboard: ClipboardDetector,
     _clipboard_task: Option<Task<()>>,
     options_open: bool,
     sidebar_collapsed: bool,
     main_window: AnyWindowHandle,
+    paths: Option<PlatformPaths>,
+    history: Option<HistoryWriter>,
+    history_error: Option<String>,
+    _history_updates: Option<Task<()>>,
+    removal_open: bool,
+    removal_busy: bool,
+    pending_removal: Option<Vec<DownloadId>>,
+    _file_removal: Option<Task<()>>,
     #[cfg(any(target_os = "macos", test))]
     pub(crate) native_menu_subscriptions: Vec<Subscription>,
     #[cfg(test)]
@@ -99,10 +117,29 @@ impl DownloadManager {
         let window_closed = cx.on_window_closed(move |cx, closed| {
             let owner = owner.clone();
             cx.defer(move |cx| {
-                let _ = owner.update(cx, |view, _| {
+                let _ = owner.update(cx, |view, cx| {
+                    if cx.windows().is_empty() {
+                        view.cancel_all_shutdowns(cx);
+                    }
                     view.add_windows.remove(&closed);
+                    let shutdown_ids: Vec<_> = view
+                        .detail_windows
+                        .iter()
+                        .filter(|(_, child)| child.handle.window_id() == closed)
+                        .map(|(id, _)| *id)
+                        .collect();
                     view.detail_windows
                         .retain(|_, child| child.handle.window_id() != closed);
+                    for id in shutdown_ids {
+                        if view.shutdown_id == Some(id)
+                            || view
+                                .queue
+                                .item(id)
+                                .is_some_and(|item| item.completion.is_armed())
+                        {
+                            view.cancel_shutdown(id, cx);
+                        }
+                    }
                 });
             });
         });
@@ -115,6 +152,8 @@ impl DownloadManager {
                         && view.add_windows.is_empty()
                         && view.detail_windows.is_empty()
                         && !view.options_open
+                        && !view.removal_open
+                        && !view.removal_busy
                 });
                 match enabled {
                     Ok(false) => continue,
@@ -155,12 +194,24 @@ impl DownloadManager {
                 crate::palette::observe_window(window, cx),
             ],
             _updates: None,
+            _shutdown_countdown: None,
+            shutdown_id: None,
+            shutdown_remaining: None,
+            completion_error: None,
             clipboard_enabled: false,
             clipboard: ClipboardDetector::default(),
             _clipboard_task: Some(clipboard_task),
             options_open: false,
             sidebar_collapsed: false,
             main_window: window.window_handle(),
+            paths: None,
+            history: None,
+            history_error: None,
+            _history_updates: None,
+            removal_open: false,
+            removal_busy: false,
+            pending_removal: None,
+            _file_removal: None,
             #[cfg(any(target_os = "macos", test))]
             native_menu_subscriptions: Vec::new(),
             #[cfg(test)]
@@ -199,11 +250,14 @@ impl DownloadManager {
             return;
         }
         let owner = cx.entity();
-        match gpui_kit::open_window(
-            child_options("Add a download", 560., 520., cx),
-            cx,
-            move |window, cx| cx.new(|cx| NativeAddWindow::new(owner, source, window, cx)),
-        ) {
+        let directory = self
+            .paths
+            .as_ref()
+            .and_then(|paths| paths.downloads.clone());
+        let runtime = self.runtime.clone();
+        match gpui_kit::open_window(add_options(cx), cx, move |window, cx| {
+            cx.new(|cx| NativeAddWindow::new(owner, source, directory, runtime, window, cx))
+        }) {
             Ok((handle, wrapper)) => {
                 let content = wrapper.read(cx).content.downgrade();
                 self.add_windows
@@ -216,6 +270,7 @@ impl DownloadManager {
         cx.emit(MenuStateChanged);
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue(
         &mut self,
         source: String,
@@ -223,7 +278,37 @@ impl DownloadManager {
         start_now: bool,
         cx: &mut Context<Self>,
     ) -> Result<DownloadId, &'static str> {
+        self.enqueue_with_options(
+            source,
+            destination,
+            start_now,
+            TransferOptions {
+                connections: 4,
+                ..TransferOptions::default()
+            },
+            cx,
+        )
+    }
+
+    pub(crate) fn enqueue_with_options(
+        &mut self,
+        source: String,
+        destination: std::path::PathBuf,
+        start_now: bool,
+        options: TransferOptions,
+        cx: &mut Context<Self>,
+    ) -> Result<DownloadId, &'static str> {
+        if self.removal_busy {
+            return Err("Wait for file deletion to finish.");
+        }
+        if !(1..=MAX_CONNECTIONS).contains(&options.connections)
+            || options.bytes_per_second == Some(0)
+        {
+            return Err("Invalid transfer settings.");
+        }
         let id = self.queue.add(source, destination)?;
+        self.cancel_all_shutdowns(cx);
+        self.queue.item_mut(id).unwrap().options = options;
         self.notice = None;
         if start_now && self.active.is_none() {
             self.start_item(id, cx);
@@ -234,12 +319,13 @@ impl DownloadManager {
             self.advance(cx);
         }
         self.sync_table(cx);
+        self.save_history();
         cx.notify();
         Ok(id)
     }
 
     fn start_item(&mut self, id: DownloadId, cx: &mut Context<Self>) {
-        if self.active.is_some() {
+        if self.active.is_some() || self.removal_busy {
             return;
         }
         let Some(item) = self.queue.item_mut(id).filter(|item| item.is_queued()) else {
@@ -248,21 +334,37 @@ impl DownloadManager {
         let source = item.source().to_owned();
         let destination = item.destination.clone();
         item.apply_state(TransferState::Preparing, Instant::now());
+        let options = item.options.clone();
         self.active = Some(id);
+        self.save_history();
         self._updates = None;
-        let task = HttpDownloadTask::start(&self.runtime, source, destination);
+        let task =
+            HttpDownloadTask::start_with_options(&self.runtime, source, destination, options);
+        let mut telemetry = task.telemetry();
         let mut receiver = task.subscribe();
         self.transfer = Some(task);
         self._updates = Some(cx.spawn(async move |view, cx| {
             let mut first = true;
             loop {
                 let changed = receiver.has_changed();
-                if first || matches!(changed, Ok(true)) {
+                let metadata_changed = telemetry
+                    .as_ref()
+                    .is_some_and(|receiver| matches!(receiver.has_changed(), Ok(true)));
+                if first || matches!(changed, Ok(true)) || metadata_changed {
                     first = false;
                     let state = receiver.borrow_and_update().clone();
                     let terminal = state.is_terminal();
                     if view
-                        .update(cx, |view, cx| view.apply_state(id, state, cx))
+                        .update(cx, |view, cx| {
+                            view.apply_observation(
+                                id,
+                                state,
+                                telemetry
+                                    .as_mut()
+                                    .map(|receiver| receiver.borrow_and_update().clone()),
+                                cx,
+                            )
+                        })
                         .is_err()
                     {
                         break;
@@ -278,7 +380,16 @@ impl DownloadManager {
                     } else {
                         TransferState::Failed("Transfer worker stopped unexpectedly".into())
                     };
-                    let _ = view.update(cx, |view, cx| view.apply_state(id, terminal, cx));
+                    let _ = view.update(cx, |view, cx| {
+                        view.apply_observation(
+                            id,
+                            terminal,
+                            telemetry
+                                .as_mut()
+                                .map(|receiver| receiver.borrow_and_update().clone()),
+                            cx,
+                        )
+                    });
                     break;
                 }
                 cx.background_executor()
@@ -306,13 +417,38 @@ impl DownloadManager {
         cx.notify();
     }
 
+    fn apply_observation(
+        &mut self,
+        id: DownloadId,
+        state: TransferState,
+        telemetry: Option<TransferTelemetry>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active != Some(id) {
+            return;
+        }
+        if let Some(item) = self.queue.item_mut(id)
+            && let Some(telemetry) = telemetry
+        {
+            item.apply_telemetry(telemetry);
+        }
+        self.apply_state(id, state, cx);
+    }
+
     fn apply_state(&mut self, id: DownloadId, state: TransferState, cx: &mut Context<Self>) {
         if self.active != Some(id) {
             return;
         }
         let terminal = state.is_terminal();
+        let success = matches!(state, TransferState::Completed(_));
+        let changed_kind = self.queue.item(id).is_some_and(|item| {
+            item.state.as_ref().map(std::mem::discriminant) != Some(std::mem::discriminant(&state))
+        });
         if let Some(item) = self.queue.item_mut(id) {
             item.apply_state(state, Instant::now());
+        }
+        if changed_kind || terminal {
+            self.save_history();
         }
         self.last_rate = self.measured_rate();
         self.refresh_details(cx);
@@ -320,6 +456,25 @@ impl DownloadManager {
         if terminal {
             self.active = None;
             self.transfer = None;
+            if success {
+                let countdown = self
+                    .queue
+                    .item_mut(id)
+                    .is_some_and(|item| item.completion.on_success(Instant::now()));
+                if countdown {
+                    if self.queue.items.iter().all(|item| item.is_finished()) {
+                        self.start_shutdown_countdown(id, cx);
+                    } else {
+                        self.cancel_all_shutdowns(cx);
+                        self.completion_error = Some(
+                            "Shutdown cancelled because other downloads are unfinished.".into(),
+                        );
+                    }
+                }
+            } else {
+                self.cancel_all_shutdowns(cx);
+            }
+            self.refresh_details(cx);
             // Schedule the next receiver after this receiver task returns.
             let owner = cx.weak_entity();
             cx.defer(move |cx| {
@@ -361,6 +516,7 @@ impl DownloadManager {
     }
 
     fn cancel_active(&mut self, cx: &mut Context<Self>) {
+        self.cancel_all_shutdowns(cx);
         if let Some(id) = self.active
             && let Some(item) = self.queue.item_mut(id)
             && item.request_cancel()
@@ -387,14 +543,8 @@ impl DownloadManager {
         }
     }
 
-    fn remove_selected(&mut self, cx: &mut Context<Self>) {
-        let removed = self.queue.remove_selected();
-        self.close_orphaned_status_windows(cx);
-        self.sync_table(cx);
-        self.notice = Some(format!(
-            "Removed {removed} session record(s). Files were not deleted."
-        ));
-        cx.notify();
+    fn remove_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_record_removal(self.queue.selected.iter().copied().collect(), window, cx);
     }
 
     fn reveal_selected(&self, cx: &mut Context<Self>) {
@@ -410,6 +560,8 @@ impl DownloadManager {
             || !self.add_windows.is_empty()
             || !self.detail_windows.is_empty()
             || self.options_open
+            || self.removal_open
+            || self.removal_busy
         {
             return;
         }
@@ -428,6 +580,7 @@ impl DownloadManager {
                 let _ = url.set_password(None);
                 url.to_string()
             }
+            Err(_) if !item.has_source() => "Source not retained".into(),
             Err(_) => "Invalid source URL".into(),
         };
         Some(DetailsSnapshot {
@@ -435,14 +588,42 @@ impl DownloadManager {
             name: item.name(),
             source,
             destination: item.destination.clone(),
+            folder_display: self
+                .paths
+                .as_ref()
+                .map(|paths| {
+                    paths.folder_label(item.destination.parent().unwrap_or(&item.destination))
+                })
+                .unwrap_or_default(),
             status: item.status().into(),
             progress: item.progress(),
             speed: item.speed_bytes_per_second(),
             eta: item.eta(),
             active: item.is_active(),
             cancelling: item.cancelling,
+            telemetry: item.telemetry.clone(),
+            options: item.options.clone(),
+            can_retry: item.can_retry(),
+            shutdown_armed: item.completion.is_armed(),
+            shutdown_remaining: if self.shutdown_id == Some(id) {
+                self.shutdown_remaining
+            } else {
+                None
+            },
+            completion_error: self.completion_error.clone(),
+            paused: matches!(item.state, Some(TransferState::Paused(_))),
             error: match &item.state {
-                Some(TransferState::Failed(error)) => Some(error.clone()),
+                Some(TransferState::Failed(error)) => {
+                    Some(if error.starts_with("Network request failed:") {
+                        "Network request failed. Check the connection and retry.".into()
+                    } else {
+                        error
+                            .chars()
+                            .filter(|character| !character.is_control())
+                            .take(512)
+                            .collect()
+                    })
+                }
                 _ => None,
             },
         })
@@ -483,13 +664,10 @@ impl DownloadManager {
         let Some(snapshot) = self.snapshot(id) else {
             return;
         };
-        let title = format!("Download — {}", snapshot.name);
         let owner = cx.entity();
-        match gpui_kit::open_window(
-            child_options(&title, 680., 640., cx),
-            cx,
-            move |window, cx| cx.new(|cx| StatusWindow::new(owner, snapshot, window, cx)),
-        ) {
+        match gpui_kit::open_window(status_options(cx), cx, move |window, cx| {
+            cx.new(|cx| StatusWindow::new(owner, snapshot, window, cx))
+        }) {
             Ok((handle, wrapper)) => {
                 let content = wrapper.read(cx).content.downgrade();
                 self.detail_windows
@@ -505,6 +683,280 @@ impl DownloadManager {
         if self.active == Some(id) {
             self.cancel_active(cx);
         }
+    }
+
+    pub(crate) fn toggle_pause(&mut self, id: DownloadId, cx: &mut Context<Self>) {
+        if self.active != Some(id) {
+            return;
+        }
+        let paused = self
+            .queue
+            .item(id)
+            .is_some_and(|item| matches!(item.state, Some(TransferState::Paused(_))));
+        let accepted = self
+            .transfer
+            .as_ref()
+            .is_some_and(|task| if paused { task.resume() } else { task.pause() });
+        self.notice = Some(
+            if accepted {
+                "Transfer control requested."
+            } else {
+                "Pause/resume is unavailable until verified range support is observed."
+            }
+            .into(),
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn set_rate_limit(
+        &mut self,
+        id: DownloadId,
+        rate: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        if rate == Some(0) {
+            self.notice = Some("Rate must be greater than zero.".into());
+            cx.notify();
+            return;
+        }
+        let Some(item) = self.queue.item(id) else {
+            return;
+        };
+        if self.active == Some(id) {
+            if !self
+                .transfer
+                .as_ref()
+                .is_some_and(|task| task.set_rate_limit(rate))
+            {
+                self.notice = Some("The transfer cannot accept a rate change.".into());
+                cx.notify();
+                return;
+            }
+        } else if !item.is_queued() && !item.can_retry() {
+            return;
+        }
+        if let Some(item) = self.queue.item_mut(id) {
+            item.options.bytes_per_second = rate;
+        }
+        self.refresh_details(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_connections(
+        &mut self,
+        id: DownloadId,
+        connections: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if !(1..=MAX_CONNECTIONS).contains(&connections) {
+            self.notice = Some(format!(
+                "Connections must be between 1 and {MAX_CONNECTIONS}."
+            ));
+            cx.notify();
+            return;
+        }
+        if let Some(item) = self
+            .queue
+            .item_mut(id)
+            .filter(|item| item.is_queued() || item.can_retry())
+        {
+            item.options.connections = connections;
+            self.refresh_details(cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn retry_download(
+        &mut self,
+        id: DownloadId,
+        collision: CollisionPolicy,
+        cx: &mut Context<Self>,
+    ) {
+        if self.removal_busy || !self.queue.item(id).is_some_and(|item| item.can_retry()) {
+            return;
+        }
+        self.cancel_all_shutdowns(cx);
+        if !self
+            .queue
+            .item_mut(id)
+            .is_some_and(|item| item.reset_for_retry(collision))
+        {
+            return;
+        }
+        if self.active.is_none() {
+            self.start_item(id, cx);
+        } else {
+            self.queue_running = true;
+        }
+        self.refresh_details(cx);
+        self.sync_table(cx);
+        self.save_history();
+        cx.notify();
+    }
+
+    pub(crate) fn request_retry(
+        &mut self,
+        id: DownloadId,
+        collision: CollisionPolicy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if collision != CollisionPolicy::Overwrite {
+            self.retry_download(id, collision, cx);
+            return;
+        }
+        let owner = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let owner = owner.clone();
+            dialog.title("Replace existing file?")
+                .child(gpui_kit::component::label::Label::new("Retry will replace the destination file after a successful download. This cannot be undone."))
+                .footer(gpui_kit::component::h_flex()
+                    .child(gpui_kit::component::button::Button::new("cancel-retry").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(gpui_kit::component::button::Button::new("confirm-retry").debug_selector(|| "confirm-retry".into()).label("Replace and retry").on_click(move |_, window, cx| {
+                        let _ = owner.update(cx, |view, cx| view.retry_download(id, collision, cx));
+                        window.close_dialog(cx);
+                    })))
+        });
+    }
+
+    pub(crate) fn request_shutdown(
+        &mut self,
+        id: DownloadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !completion::shutdown_supported()
+            || !self
+                .queue
+                .item(id)
+                .is_some_and(|item| !item.state.as_ref().is_some_and(TransferState::is_terminal))
+        {
+            return;
+        }
+        let owner = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let owner = owner.clone();
+            dialog.title("Turn off computer after completion?")
+                .child(gpui_kit::component::label::Label::new("After this download finishes successfully, a cancellable 30-second countdown will turn off your computer. Save work in other applications. Other unfinished downloads or new work cancel shutdown. Operating system permissions may be required."))
+                .footer(gpui_kit::component::h_flex()
+                    .child(gpui_kit::component::button::Button::new("cancel-poweroff").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(gpui_kit::component::button::Button::new("confirm-poweroff").debug_selector(|| "confirm-poweroff".into()).label("Turn off after completion").on_click(move |_, window, cx| {
+                        let _ = owner.update(cx, |view, cx| view.arm_shutdown(id, cx));
+                        window.close_dialog(cx);
+                    })))
+        });
+    }
+
+    fn arm_shutdown(&mut self, id: DownloadId, cx: &mut Context<Self>) {
+        if !completion::shutdown_supported()
+            || !self
+                .queue
+                .item(id)
+                .is_some_and(|item| !item.state.as_ref().is_some_and(TransferState::is_terminal))
+        {
+            return;
+        }
+        self.cancel_all_shutdowns(cx);
+        if let Some(item) = self.queue.item_mut(id) {
+            item.completion.arm(CompletionAction::Shutdown);
+        }
+        self.completion_error = None;
+        self.refresh_details(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_shutdown(&mut self, id: DownloadId, cx: &mut Context<Self>) {
+        if let Some(item) = self.queue.item_mut(id) {
+            item.completion.cancel();
+        }
+        if self.shutdown_id == Some(id) {
+            self._shutdown_countdown = None;
+            self.shutdown_id = None;
+            self.shutdown_remaining = None;
+        }
+        self.completion_error = None;
+        self.refresh_details(cx);
+        cx.notify();
+    }
+
+    fn cancel_all_shutdowns(&mut self, cx: &mut Context<Self>) {
+        for item in &mut self.queue.items {
+            item.completion.on_failure_or_cancel();
+        }
+        self._shutdown_countdown = None;
+        self.shutdown_id = None;
+        self.shutdown_remaining = None;
+        self.refresh_details(cx);
+    }
+
+    /// Recheck every safety condition immediately before consuming the single-use gate.
+    fn completion_tick(&mut self, now: Instant, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.shutdown_id else {
+            return false;
+        };
+        if cx.windows().is_empty()
+            || !self
+                .detail_windows
+                .get(&id)
+                .is_some_and(|child| cx.windows().contains(&child.handle))
+            || self.active.is_some()
+            || !self.queue.items.iter().all(|item| item.is_finished())
+        {
+            self.cancel_all_shutdowns(cx);
+            cx.notify();
+            return false;
+        }
+        let Some(item) = self.queue.item_mut(id) else {
+            self.cancel_all_shutdowns(cx);
+            return false;
+        };
+        self.shutdown_remaining = item
+            .completion
+            .remaining(now)
+            .map(|duration| duration.as_secs() + u64::from(duration.subsec_nanos() != 0));
+        let due = item.completion.take_due(now);
+        if due {
+            self.shutdown_id = None;
+            self.shutdown_remaining = None;
+        }
+        self.refresh_details(cx);
+        cx.notify();
+        due
+    }
+
+    fn start_shutdown_countdown(&mut self, id: DownloadId, cx: &mut Context<Self>) {
+        self.shutdown_id = Some(id);
+        self.shutdown_remaining = Some(30);
+        let runtime = self.runtime.clone();
+        self._shutdown_countdown = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let result = view.update(cx, |view, cx| {
+                    let due = view.completion_tick(Instant::now(), cx);
+                    (due, view.shutdown_id.is_some())
+                });
+                match result {
+                    Ok((true, _)) => {
+                        #[cfg(not(test))]
+                        let result = runtime.spawn(completion::shutdown()).await.unwrap_or_else(|_| Err("Shutdown worker failed.".into()));
+                        #[cfg(test)]
+                        let result: Result<(), String> = {
+                            let _ = (&runtime, completion::shutdown);
+                            Err("OS shutdown is suppressed in test builds.".into())
+                        };
+                        let _ = view.update(cx, |view, cx| {
+                            view.completion_error = result.err();
+                            view.notice = Some(view.completion_error.clone().unwrap_or_else(|| "Shutdown requested; the operating system may still wait for open applications to close.".into()));
+                            view.refresh_details(cx);
+                            cx.notify();
+                        });
+                        break;
+                    }
+                    Ok((false, true)) => {},
+                    _ => break,
+                }
+            }
+        }));
     }
 
     fn measured_rate(&self) -> Option<f64> {
@@ -529,6 +981,7 @@ impl DownloadManager {
                 rate: item.speed_bytes_per_second(),
                 selected: self.queue.selected.contains(&item.id),
                 destination: item.destination.clone(),
+                progress: item.progress(),
             })
             .collect();
         let all_selected = self.queue.all_visible_selected();
@@ -567,7 +1020,7 @@ impl DownloadManager {
         cx.notify();
     }
 
-    fn clear_finished(&mut self, cx: &mut Context<Self>) {
+    fn clear_finished(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let keep: Vec<_> = self
             .queue
             .items
@@ -575,12 +1028,7 @@ impl DownloadManager {
             .filter(|item| item.is_finished())
             .map(|item| item.id)
             .collect();
-        self.queue.items.retain(|item| !keep.contains(&item.id));
-        self.queue.selected.retain(|id| !keep.contains(id));
-        self.close_orphaned_status_windows(cx);
-        self.sync_table(cx);
-        self.notice = Some("Cleared finished records. Downloaded files were not deleted.".into());
-        cx.notify();
+        self.confirm_record_removal(keep, window, cx);
     }
 
     fn close_orphaned_status_windows(&mut self, cx: &mut Context<Self>) {
@@ -677,8 +1125,8 @@ impl DownloadManager {
             Command::StopQueue => self.stop_queue(cx),
             Command::StopAll => self.stop_all(cx),
             Command::StopSelected => self.stop_selected(cx),
-            Command::Remove => self.remove_selected(cx),
-            Command::Clear => self.clear_finished(cx),
+            Command::Remove => self.remove_selected(window, cx),
+            Command::Clear => self.clear_finished(window, cx),
             Command::Options => self.open_options(window, cx),
             Command::Details => self.open_selected_details(window, cx),
             Command::Reveal => self.reveal_selected(cx),
@@ -706,6 +1154,8 @@ impl DownloadManager {
     }
 }
 
+#[path = "manager_history.rs"]
+mod history;
 #[path = "manager_render.rs"]
 mod rendering;
 

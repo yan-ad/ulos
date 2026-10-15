@@ -22,7 +22,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 #[gpui::test]
-fn manual_save_path_overrides_a_previously_selected_folder(cx: &mut TestAppContext) {
+fn manual_save_path_overrides_a_previously_selected_path(cx: &mut TestAppContext) {
     let runtime = runtime();
     let directory = tempfile::tempdir().unwrap();
     let destination = directory.path().join("manual.zip");
@@ -36,10 +36,10 @@ fn manual_save_path_overrides_a_previously_selected_folder(cx: &mut TestAppConte
     child.update(|window, cx| {
         form.update(cx, |form, cx| {
             form.prefill("https://example.org/automatic.zip".into(), window, cx);
-            form.choose_folder(window, cx);
+            form.choose_path(window, cx);
         })
     });
-    child.simulate_path_prompt_response(|_| Some(vec![directory.path().join("previous")]));
+    child.simulate_new_path_selection(|_| Some(directory.path().join("previous.zip")));
     draw(&mut child);
     child.update(|window, cx| {
         form.read(cx)
@@ -51,33 +51,28 @@ fn manual_save_path_overrides_a_previously_selected_folder(cx: &mut TestAppConte
     child.simulate_keystrokes("secondary-a");
     child.simulate_input(destination.to_str().unwrap());
     draw(&mut child);
-    form.read_with(cx, |form, cx| {
-        assert_eq!(form.filename.read(cx).value().as_ref(), "manual.zip")
-    });
     child.update(|window, cx| {
-        form.read(cx)
-            .filename
-            .clone()
-            .update(cx, |input, cx| input.focus(window, cx))
+        form.update(cx, |form, cx| {
+            form.prefill("https://example.org/another.png".into(), window, cx);
+            assert_eq!(
+                form.destination.read(cx).value().as_ref(),
+                destination.to_str().unwrap()
+            );
+        })
     });
-    draw(&mut child);
-    child.simulate_keystrokes("secondary-a");
-    child.simulate_input("final?.zip");
-    draw(&mut child);
-    form.read_with(cx, |form, cx| {
-        assert_eq!(
-            form.destination.read(cx).value().as_ref(),
-            directory.path().join("final_.zip").to_str().unwrap()
-        )
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
     });
     form.update(cx, |form, cx| form.submit(false, cx));
     draw(cx);
     view.read_with(cx, |view, _| {
+        assert_eq!(view.queue.items[0].destination, destination);
         assert_eq!(
-            view.queue.items[0].destination,
-            directory.path().join("final_.zip")
-        )
+            view.queue.items[0].source(),
+            "https://example.org/another.png"
+        );
     });
+    assert!(!destination.exists());
 }
 
 fn mount<'a>(
@@ -421,7 +416,8 @@ fn search_select_visible_and_remove_only_change_session_metadata(cx: &mut TestAp
         view.queue.select_visible(true);
         assert!(view.queue.all_visible_selected());
         assert!(!view.queue.selected.contains(&hidden));
-        view.remove_selected(cx);
+        let ids = view.queue.selected.iter().copied().collect::<Vec<_>>();
+        view.finish_record_removal(&ids, cx);
         assert!(view.queue.item(finished).is_none());
         assert!(view.queue.item(hidden).unwrap().is_queued());
         assert!(view.queue.selected.is_empty());
@@ -433,6 +429,63 @@ fn search_select_visible_and_remove_only_change_session_metadata(cx: &mut TestAp
         );
     });
     assert_eq!(std::fs::read(saved).unwrap(), b"keep these bytes");
+}
+
+#[gpui::test]
+fn cancelling_record_removal_and_clear_finished_preserves_records_and_files(
+    cx: &mut TestAppContext,
+) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let saved = directory.path().join("saved.bin");
+    std::fs::write(&saved, b"preserve me").unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = view.update(cx, |view, cx| {
+        let id = view
+            .enqueue(
+                "https://example.invalid/saved.bin".into(),
+                saved.clone(),
+                false,
+                cx,
+            )
+            .unwrap();
+        view.queue.item_mut(id).unwrap().apply_state(
+            TransferState::Completed(DownloadReceipt {
+                destination: saved.clone(),
+                downloaded_bytes: 11,
+            }),
+            Instant::now(),
+        );
+        view.queue.selected.insert(id);
+        id
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_details(id, window, cx);
+            view.remove_selected(window, cx);
+        })
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| assert!(view.queue.item(id).is_some()));
+    let cancel = cx.debug_bounds("cancel-removal").unwrap().center();
+    cx.simulate_click(cancel, gpui::Modifiers::default());
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.queue.item(id).unwrap().is_finished());
+        assert!(view.queue.selected.contains(&id));
+        assert!(view.detail_windows.contains_key(&id));
+    });
+    cx.update(|window, cx| view.update(cx, |view, cx| view.clear_finished(window, cx)));
+    draw(cx);
+    let cancel = cx.debug_bounds("cancel-removal").unwrap().center();
+    cx.simulate_click(cancel, gpui::Modifiers::default());
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.queue.items.len(), 1);
+        assert!(view.queue.item(id).unwrap().is_finished());
+        assert!(view.detail_windows.contains_key(&id));
+    });
+    assert_eq!(std::fs::read(&saved).unwrap(), b"preserve me");
 }
 
 #[gpui::test]
@@ -473,7 +526,9 @@ fn add_dialog_retains_inputs_handles_save_prompt_and_emits_queue_request(cx: &mu
     draw(&mut child);
     child.update(|window, cx| form.update(cx, |form, cx| form.choose_path(window, cx)));
     child.simulate_new_path_selection(|_| None);
-    draw(&mut child);
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
+    });
     form.read_with(cx, |form, cx| {
         assert!(!form.choosing_path);
         assert_eq!(
@@ -657,7 +712,8 @@ fn clipboard_offer_is_opt_in_and_dismissed_candidates_do_not_reopen(cx: &mut Tes
     });
     form.read_with(cx, |form, cx| {
         assert_eq!(form.source.read(cx).value().as_ref(), source);
-        assert_eq!(form.filename.read(cx).value().as_ref(), "My Photo_.png");
+        assert!(form.destination.read(cx).value().is_empty());
+        assert!(!form.can_submit(cx));
     });
     form.update(cx, |_, cx| cx.emit(crate::add_download::DismissAdd));
     draw(cx);
@@ -677,18 +733,23 @@ fn clipboard_offer_is_opt_in_and_dismissed_candidates_do_not_reopen(cx: &mut Tes
         view.add_windows.values().next().unwrap().upgrade().unwrap()
     });
     next.read_with(cx, |form, cx| {
-        assert_eq!(form.filename.read(cx).value().as_ref(), "new.zip");
+        assert_eq!(
+            form.source.read(cx).value().as_ref(),
+            "https://example.org/new.zip"
+        );
+        assert!(form.destination.read(cx).value().is_empty());
     });
     next.update(cx, |_, cx| cx.emit(crate::add_download::DismissAdd));
     draw(cx);
 }
 
 #[gpui::test]
-fn url_prefill_suggests_safe_names_synchronously_and_preserves_manual_names(
+fn url_prefill_preserves_manual_full_path_and_submission_sanitizes_only_basename(
     cx: &mut TestAppContext,
 ) {
     let runtime = runtime();
     let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("CON?.txt");
     let (_root, view, cx) = mount(cx, &runtime);
     cx.update(|window, cx| view.update(cx, |view, cx| view.open_add(window, cx)));
     draw(cx);
@@ -698,28 +759,28 @@ fn url_prefill_suggests_safe_names_synchronously_and_preserves_manual_names(
     let mut child = add_context(&view, cx);
     child.update(|window, cx| {
         form.update(cx, |form, cx| {
-            form.prefill(
-                "https://example.org/CON%3F.txt?token=secret".into(),
-                window,
-                cx,
-            );
-            assert_eq!(form.filename.read(cx).value().as_ref(), "CON_.txt");
             form.prefill("https://example.org/automatic.zip".into(), window, cx);
-            assert_eq!(form.filename.read(cx).value().as_ref(), "automatic.zip");
-            form.filename.update(cx, |input, cx| {
-                input.set_value("my custom.zip", window, cx);
-            });
-            form.prefill("https://example.org/another.png".into(), window, cx);
-            assert_eq!(form.filename.read(cx).value().as_ref(), "my custom.zip");
+            // A manager without platform paths cannot invent a save directory.
+            assert!(form.destination.read(cx).value().is_empty());
+            assert!(!form.can_submit(cx));
             form.destination.update(cx, |input, cx| {
-                input.set_value(
-                    directory.path().join("CON?.txt").to_str().unwrap(),
-                    window,
-                    cx,
-                );
+                input.set_value(destination.to_str().unwrap(), window, cx);
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
             });
-            assert!(form.can_submit(cx));
         });
+    });
+    draw(&mut child);
+    child.update(|window, cx| {
+        form.update(cx, |form, cx| {
+            form.prefill("https://example.org/another.png".into(), window, cx);
+            assert_eq!(
+                form.destination.read(cx).value().as_ref(),
+                destination.to_str().unwrap()
+            );
+        });
+    });
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
     });
     view.read_with(cx, |view, _| assert!(view.queue.items.is_empty()));
     form.update(cx, |form, cx| form.submit(false, cx));
@@ -743,9 +804,10 @@ fn url_prefill_suggests_safe_names_synchronously_and_preserves_manual_names(
 }
 
 #[gpui::test]
-fn folder_picker_uses_url_name_and_submission_resanitizes_edited_filename(cx: &mut TestAppContext) {
+fn save_as_picker_full_path_is_preserved_when_source_changes(cx: &mut TestAppContext) {
     let runtime = runtime();
     let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("My Photo.png");
     let (_root, view, cx) = mount(cx, &runtime);
     cx.update(|window, cx| view.update(cx, |view, cx| view.open_add(window, cx)));
     draw(cx);
@@ -760,45 +822,38 @@ fn folder_picker_uses_url_name_and_submission_resanitizes_edited_filename(cx: &m
                 window,
                 cx,
             );
-            assert_eq!(form.filename.read(cx).value().as_ref(), "My Photo.png");
-            form.choose_folder(window, cx);
+            form.choose_path(window, cx);
             assert!(form.choosing_path);
             assert!(!form.can_submit(cx));
         });
     });
-    child.simulate_path_prompt_response(|_| Some(vec![directory.path().to_path_buf()]));
+    child.simulate_new_path_selection(|_| Some(destination.clone()));
     draw(&mut child);
-    form.read_with(cx, |form, cx| {
-        assert!(!form.choosing_path);
-        assert_eq!(form.filename.read(cx).value().as_ref(), "My Photo.png");
-        assert_eq!(
-            form.destination.read(cx).value().as_ref(),
-            directory.path().join("My Photo.png").to_str().unwrap()
-        );
-        assert!(form.can_submit(cx));
-    });
-    let unsafe_name = "../AUX.txt";
     child.update(|window, cx| {
         form.update(cx, |form, cx| {
-            form.filename
-                .update(cx, |input, cx| input.set_value(unsafe_name, window, cx));
+            assert!(!form.choosing_path);
+            form.prefill("https://example.org/replacement.zip".into(), window, cx);
+            assert_eq!(
+                form.destination.read(cx).value().as_ref(),
+                destination.to_str().unwrap()
+            );
         });
+    });
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
     });
     form.update(cx, |form, cx| form.submit(false, cx));
     draw(cx);
     view.read_with(cx, |view, _| {
         assert!(view.add_windows.is_empty());
         assert_eq!(view.queue.items.len(), 1);
-        let item = &view.queue.items[0];
+        assert_eq!(view.queue.items[0].destination, destination);
         assert_eq!(
-            item.destination,
-            directory
-                .path()
-                .join(ulos_core::naming::sanitize_filename(unsafe_name))
+            view.queue.items[0].source(),
+            "https://example.org/replacement.zip"
         );
-        assert!(item.is_queued());
+        assert!(view.queue.items[0].is_queued());
         assert!(view.active.is_none());
-        assert!(view.transfer.is_none());
     });
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
@@ -960,7 +1015,8 @@ fn native_add_windows_keep_independent_drafts_and_close_independently(cx: &mut T
                     directory.path().join("first.zip").to_str().unwrap(),
                     window,
                     cx,
-                )
+                );
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
             });
         })
     });
@@ -972,17 +1028,24 @@ fn native_add_windows_keep_independent_drafts_and_close_independently(cx: &mut T
                     directory.path().join("second.zip").to_str().unwrap(),
                     window,
                     cx,
-                )
+                );
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
             });
         })
     });
     draw(&mut first);
     draw(&mut second);
     first_form.read_with(cx, |form, cx| {
-        assert_eq!(form.filename.read(cx).value().as_ref(), "first.zip")
+        assert_eq!(
+            form.destination.read(cx).value().as_ref(),
+            directory.path().join("first.zip").to_str().unwrap()
+        )
     });
     second_form.read_with(cx, |form, cx| {
-        assert_eq!(form.filename.read(cx).value().as_ref(), "second.zip")
+        assert_eq!(
+            form.destination.read(cx).value().as_ref(),
+            directory.path().join("second.zip").to_str().unwrap()
+        )
     });
     first.update(|window, _| window.remove_window());
     draw(cx);
@@ -996,16 +1059,22 @@ fn native_add_windows_keep_independent_drafts_and_close_independently(cx: &mut T
     second.update(|window, cx| {
         second_form
             .read(cx)
-            .filename
+            .destination
             .clone()
             .update(cx, |input, cx| input.focus(window, cx))
     });
     draw(&mut second);
     second.simulate_keystrokes("secondary-a");
-    second.simulate_input("surviving.zip");
+    second.simulate_input(directory.path().join("surviving.zip").to_str().unwrap());
     draw(&mut second);
     second_form.read_with(cx, |form, cx| {
-        assert_eq!(form.filename.read(cx).value().as_ref(), "surviving.zip")
+        assert_eq!(
+            form.destination.read(cx).value().as_ref(),
+            directory.path().join("surviving.zip").to_str().unwrap()
+        )
+    });
+    poll(&mut second, |cx| {
+        second_form.read_with(cx, |form, cx| form.can_submit(cx))
     });
     second_form.update(cx, |form, cx| form.submit(false, cx));
     draw(cx);
@@ -1100,11 +1169,15 @@ fn native_add_owns_manager_after_main_close_and_can_submit(cx: &mut TestAppConte
                     directory.path().join("survives.zip").to_str().unwrap(),
                     window,
                     cx,
-                )
+                );
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
             });
         })
     });
     draw(&mut child);
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
+    });
     // Holding an observation only across submission allows us to inspect the queue;
     // it is dropped before checking that no root/registry ownership cycle remains.
     let observer = weak.upgrade().unwrap();
@@ -1378,7 +1451,8 @@ fn removing_and_clearing_finished_records_closes_only_matching_native_status_roo
     assert_eq!(cx.update(|_, cx| cx.windows().len()), 4);
     view.update(cx, |view, cx| {
         view.queue.selected.insert(first);
-        view.remove_selected(cx);
+        let ids = view.queue.selected.iter().copied().collect::<Vec<_>>();
+        view.finish_record_removal(&ids, cx);
     });
     draw(cx);
     view.read_with(cx, |view, _| {
@@ -1393,7 +1467,16 @@ fn removing_and_clearing_finished_records_closes_only_matching_native_status_roo
     assert_eq!(cx.update(|_, cx| cx.windows().len()), 3);
     assert_eq!(std::fs::read(&first_path).unwrap(), b"first");
     assert_eq!(std::fs::read(&third_path).unwrap(), b"third");
-    view.update(cx, |view, cx| view.clear_finished(cx));
+    view.update(cx, |view, cx| {
+        let ids = view
+            .queue
+            .items
+            .iter()
+            .filter(|item| item.is_finished())
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        view.finish_record_removal(&ids, cx);
+    });
     draw(cx);
     view.read_with(cx, |view, _| {
         assert!(view.queue.item(third).is_none());
@@ -1408,7 +1491,7 @@ fn removing_and_clearing_finished_records_closes_only_matching_native_status_roo
     assert_eq!(std::fs::read(&third_path).unwrap(), b"third");
     second_details.read_with(cx, |details, _| {
         assert_eq!(details.snapshot.id, second);
-        assert!(details.show_details);
+        assert!(!details.show_details);
     });
     second_details.update(cx, |_, cx| cx.emit(crate::download_details::CloseDetails));
     draw(cx);
@@ -1435,11 +1518,15 @@ fn native_add_hands_manager_ownership_to_status_when_starting_after_main_close(
         form.update(cx, |form, cx| {
             form.prefill(server.source.clone(), window, cx);
             form.destination.update(cx, |input, cx| {
-                input.set_value(destination.to_str().unwrap(), window, cx)
+                input.set_value(destination.to_str().unwrap(), window, cx);
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
             });
         })
     });
     draw(&mut add);
+    poll(&mut add, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
+    });
     let weak = view.downgrade();
     cx.update(|window, _| window.remove_window());
     drop(root);
@@ -1478,7 +1565,7 @@ fn native_add_hands_manager_ownership_to_status_when_starting_after_main_close(
     details.read_with(&status, |details, _| {
         assert_eq!(details.snapshot.status, "Finished");
         assert!(!details.snapshot.active);
-        assert!(details.show_details);
+        assert!(!details.show_details);
     });
     drop(form);
     drop(observer);
@@ -1672,6 +1759,7 @@ fn native_menu_filter_clear_and_disabled_remove_preserve_downloaded_files(cx: &m
     let saved = directory.path().join("saved.txt");
     std::fs::write(&saved, b"keep these bytes").unwrap();
     let (_root, view, cx) = mount(cx, &runtime);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
     let _menus = cx.update(|window, cx| {
         crate::native_menu::install(cx, view.downgrade(), window.window_handle())
     });
@@ -1735,6 +1823,13 @@ fn native_menu_filter_clear_and_disabled_remove_preserve_downloaded_files(cx: &m
         );
     });
     cx.dispatch_action(crate::native_menu::ClearFinishedDownloads);
+    draw(cx);
+    view.read_with(cx, |view, _| assert!(view.queue.item(finished).is_some()));
+    let confirm = cx
+        .debug_bounds("remove-records")
+        .expect("clear requires confirmation");
+    cx.simulate_click(confirm.center(), gpui_kit::Modifiers::default());
+    draw(cx);
     cx.dispatch_action(crate::native_menu::ShowAllDownloads);
     draw(cx);
     view.read_with(cx, |view, cx| {
@@ -2343,7 +2438,6 @@ fn system_theme_callback_updates_shared_native_roots_without_losing_add_drafts(
                 (
                     form.source.read(cx).value().to_string(),
                     form.destination.read(cx).value().to_string(),
-                    form.filename.read(cx).value().to_string(),
                 )
             })
         })
@@ -2373,7 +2467,6 @@ fn system_theme_callback_updates_shared_native_roots_without_losing_add_drafts(
             form.read_with(&child, |form, cx| {
                 assert_eq!(form.source.read(cx).value().as_ref(), draft.0);
                 assert_eq!(form.destination.read(cx).value().as_ref(), draft.1);
-                assert_eq!(form.filename.read(cx).value().as_ref(), draft.2);
             });
         }
         let mut details = VisualTestContext::from_window(details_handle, &cx.cx);
@@ -2497,4 +2590,836 @@ fn theme_selector_stock_geometry_and_click_preserve_preference_until_selection(
     // Clicking the stock dropdown is exercised, not a native popup visibility
     // assertion. Its private Kit popup state is intentionally not inspected.
     cx.update(|_, cx| assert_eq!(palette::preference(cx), ThemePreference::System));
+}
+
+// Advanced controls use a real, reusable HTTP peer. Unlike the one-request
+// fixture above, probe, parallel parts and resumed parts each own a connection.
+#[derive(Clone)]
+struct AdvancedRequest {
+    range: Option<(usize, usize)>,
+    if_range: Option<String>,
+}
+
+struct AdvancedFixture {
+    source: String,
+    body: std::sync::Arc<Vec<u8>>,
+    requests: Receiver<AdvancedRequest>,
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
+}
+
+impl AdvancedFixture {
+    fn release_all(&self) {
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for AdvancedFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release_all();
+        if let Some(server) = self.server.take() {
+            server.join().expect("advanced fixture server panicked");
+        }
+    }
+}
+
+fn advanced_fixture(ranges: bool) -> AdvancedFixture {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let body = Arc::new((0..65536).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let source = format!("http://{}/file", listener.local_addr().unwrap());
+    let release = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, requests) = mpsc::channel();
+    let worker_body = body.clone();
+    let worker_release = release.clone();
+    let worker_stop = stop.clone();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut workers = Vec::new();
+        while !worker_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let body = worker_body.clone();
+                    let release = worker_release.clone();
+                    let stop = worker_stop.clone();
+                    let tx = tx.clone();
+                    workers.push(thread::spawn(move || {
+                        stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_millis(200))).unwrap();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut headers = Vec::new();
+                        let read_deadline = Instant::now() + Duration::from_secs(2);
+                        while !headers.ends_with(b"\r\n\r\n") {
+                            if stop.load(Ordering::SeqCst) || Instant::now() >= read_deadline {
+                                return;
+                            }
+                            match reader.read_until(b'\n', &mut headers) {
+                                Ok(0) => return,
+                                Ok(_) => {},
+                                Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {},
+                                Err(_) => return,
+                            }
+                            assert!(headers.len() <= 16 * 1024);
+                        }
+                        let headers = String::from_utf8(headers).unwrap();
+                        assert!(headers.starts_with("GET /file HTTP/1.1\r\n"));
+                        let mut range = None;
+                        let mut if_range = None;
+                        for line in headers.lines() {
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name.eq_ignore_ascii_case("range") {
+                                    let (start, end) = value.trim().strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+                                    range = Some((start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()));
+                                } else if name.eq_ignore_ascii_case("if-range") {
+                                    if_range = Some(value.trim().to_string());
+                                }
+                            }
+                        }
+                        let _ = tx.send(AdvancedRequest { range, if_range });
+                        let (start, end) = if ranges { range.unwrap_or((0, body.len() - 1)) } else { (0, body.len() - 1) };
+                        assert!(start <= end && end < body.len());
+                        let response = if ranges && range.is_some() {
+                            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nETag: \"advanced-v1\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", body.len(), end - start + 1)
+                        } else {
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                        };
+                        if stream.write_all(response.as_bytes()).is_err() || stream.write_all(&body[start..=start]).is_err() { return; }
+                        // Only the validated 0-0 probe is never gated.
+                        if ranges && range == Some((0, 0)) { return; }
+                        let gate_deadline = Instant::now() + Duration::from_secs(5);
+                        while !release.load(Ordering::SeqCst) {
+                            if stop.load(Ordering::SeqCst) || Instant::now() >= gate_deadline { return; }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        if !stop.load(Ordering::SeqCst) {
+                            let _ = stream.write_all(&body[start + 1..=end]);
+                        }
+                    }));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1))
+                }
+                Err(e) => panic!("advanced fixture accept: {e}"),
+            }
+        }
+        for worker in workers {
+            worker.join().expect("advanced fixture worker panicked");
+        }
+    });
+    AdvancedFixture {
+        source,
+        body,
+        requests,
+        release,
+        stop,
+        server: Some(server),
+    }
+}
+
+fn advanced_add(
+    view: &Entity<DownloadManager>,
+    cx: &mut VisualTestContext,
+    fixture: &AdvancedFixture,
+    path: std::path::PathBuf,
+    start: bool,
+) -> DownloadId {
+    view.update(cx, |view, cx| {
+        view.enqueue_with_options(
+            fixture.source.clone(),
+            path,
+            start,
+            ulos_core::transfer::TransferOptions {
+                connections: 2,
+                ..Default::default()
+            },
+            cx,
+        )
+        .unwrap()
+    })
+}
+
+fn advanced_details(
+    view: &Entity<DownloadManager>,
+    id: DownloadId,
+    cx: &mut VisualTestContext,
+) -> (
+    Entity<crate::download_details::DownloadDetails>,
+    VisualTestContext,
+) {
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_details(id, window, cx)));
+    draw(cx);
+    let (details, handle) = view.read_with(cx, |view, _| {
+        let child = &view.detail_windows[&id];
+        (child.upgrade().unwrap(), child.handle)
+    });
+    let mut child = VisualTestContext::from_window(handle, &cx.cx);
+    child.update(|window, cx| {
+        window.activate_window();
+        details.update(cx, |details, cx| {
+            details.show_details = true;
+            cx.notify();
+        });
+    });
+    draw(&mut child);
+    (details, child)
+}
+
+fn advanced_finished(view: &Entity<DownloadManager>, id: DownloadId, cx: &mut VisualTestContext) {
+    poll(cx, |cx| {
+        view.read_with(cx, |view, _| view.queue.item(id).unwrap().is_finished())
+    });
+}
+
+#[gpui::test]
+fn advanced_parallel_pause_retains_slot_and_resumes_validated_ranges(cx: &mut TestAppContext) {
+    use crate::download_details::{SetConnections, TogglePause};
+    use ulos_core::transfer::{ConnectionStatus, ResumeCapability};
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = advanced_fixture(true);
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = advanced_add(
+        &view,
+        cx,
+        &fixture,
+        directory.path().join("parallel.bin"),
+        true,
+    );
+    let (details, mut child) = advanced_details(&view, id, cx);
+    let next = view.update(cx, |view, cx| {
+        view.enqueue(
+            "https://example.org/next".into(),
+            directory.path().join("next.bin"),
+            false,
+            cx,
+        )
+        .unwrap()
+    });
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| {
+            d.snapshot.telemetry.connections.len() == 2
+                && d.snapshot.telemetry.progress.downloaded_bytes >= 2
+        })
+    });
+    details.update(&mut child, |_, cx| {
+        cx.emit(SetConnections { id, connections: 8 })
+    });
+    details.update(&mut child, |_, cx| cx.emit(TogglePause(id)));
+    poll(cx, |cx| details.read_with(cx, |d, _| d.snapshot.paused));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.active, Some(id));
+        assert!(view.queue.item(next).unwrap().is_queued());
+        assert_eq!(view.queue.item(id).unwrap().options.connections, 2);
+    });
+    details.read_with(cx, |d, _| {
+        assert_eq!(d.snapshot.telemetry.resume, ResumeCapability::Supported);
+        assert!(
+            d.snapshot
+                .telemetry
+                .connections
+                .iter()
+                .all(|c| c.status == ConnectionStatus::Paused)
+        );
+    });
+    details.update(&mut child, |_, cx| cx.emit(TogglePause(id)));
+    let mut observed = Vec::new();
+    poll(cx, |_| {
+        observed.extend(fixture.requests.try_iter());
+        observed
+            .iter()
+            .filter(|r| r.if_range.as_deref() == Some("\"advanced-v1\""))
+            .count()
+            >= 4
+    });
+    assert!(observed.iter().any(|r| r.range == Some((0, 0))));
+    assert!(
+        observed
+            .iter()
+            .any(|r| r.range.is_some_and(|(start, _)| start > 32768))
+    );
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    assert_eq!(
+        std::fs::read(directory.path().join("parallel.bin")).unwrap(),
+        *fixture.body
+    );
+    details.read_with(cx, |d, _| {
+        assert_eq!(d.snapshot.telemetry.connections.len(), 2);
+        assert!(
+            d.snapshot
+                .telemetry
+                .connections
+                .iter()
+                .all(|c| c.status == ConnectionStatus::Complete)
+        );
+    });
+}
+
+#[gpui::test]
+fn advanced_live_rate_changes_reach_task_and_zero_is_rejected(cx: &mut TestAppContext) {
+    use crate::download_details::SetRateLimit;
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = advanced_fixture(true);
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = advanced_add(&view, cx, &fixture, directory.path().join("rate.bin"), true);
+    let (details, mut child) = advanced_details(&view, id, cx);
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| !d.snapshot.telemetry.connections.is_empty())
+    });
+    details.update(&mut child, |_, cx| {
+        cx.emit(SetRateLimit {
+            id,
+            bytes_per_second: Some(512),
+        })
+    });
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| {
+            d.snapshot.telemetry.bytes_per_second == Some(512)
+        })
+    });
+    details.update(&mut child, |_, cx| {
+        cx.emit(SetRateLimit {
+            id,
+            bytes_per_second: Some(0),
+        })
+    });
+    draw(&mut child);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.queue.item(id).unwrap().options.bytes_per_second,
+            Some(512)
+        )
+    });
+    details.update(&mut child, |_, cx| {
+        cx.emit(SetRateLimit {
+            id,
+            bytes_per_second: None,
+        })
+    });
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| d.snapshot.telemetry.bytes_per_second.is_none())
+    });
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    assert_eq!(
+        std::fs::read(directory.path().join("rate.bin")).unwrap(),
+        *fixture.body
+    );
+    details.read_with(cx, |d, _| {
+        assert_eq!(
+            d.snapshot.telemetry.resume,
+            ulos_core::transfer::ResumeCapability::Supported
+        )
+    });
+}
+
+#[gpui::test]
+fn advanced_queued_connection_input_is_retained_and_bounded(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = advanced_fixture(true);
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = view.update(cx, |view, cx| {
+        view.enqueue(
+            fixture.source.clone(),
+            directory.path().join("queued.bin"),
+            false,
+            cx,
+        )
+        .unwrap()
+    });
+    let (details, mut child) = advanced_details(&view, id, cx);
+    let input = details.read_with(cx, |d, _| d.connections_input.clone().unwrap());
+    child.update(|window, cx| input.update(cx, |input, cx| input.set_value("2", window, cx)));
+    details.update(&mut child, |d, cx| d.apply_connections(cx));
+    draw(&mut child);
+    assert_eq!(
+        details.read_with(cx, |d, _| d.snapshot.options.connections),
+        2
+    );
+    child.update(|window, cx| input.update(cx, |input, cx| input.set_value("17", window, cx)));
+    details.update(&mut child, |d, cx| d.apply_connections(cx));
+    draw(&mut child);
+    assert_eq!(
+        details.read_with(cx, |d, _| d.snapshot.options.connections),
+        2
+    );
+    assert_eq!(
+        details.read_with(cx, |d, _| d.connections_input.clone().unwrap()),
+        input
+    );
+    view.update(cx, |view, cx| view.start_item(id, cx));
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| d.snapshot.telemetry.connections.len() == 2)
+    });
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    assert_eq!(
+        std::fs::read(directory.path().join("queued.bin")).unwrap(),
+        *fixture.body
+    );
+}
+
+#[gpui::test]
+fn advanced_collision_rename_retry_preserves_original_without_initial_http(
+    cx: &mut TestAppContext,
+) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("original.bin");
+    std::fs::write(&path, b"original content").unwrap();
+    let fixture = advanced_fixture(false);
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = advanced_add(&view, cx, &fixture, path.clone(), true);
+    let (details, mut child) = advanced_details(&view, id, cx);
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| d.snapshot.status == "Failed")
+    });
+    assert!(fixture.requests.try_recv().is_err());
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::RetryDownload {
+            id,
+            collision: ulos_core::transfer::CollisionPolicy::Rename,
+        })
+    });
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    let renamed = directory.path().join("original (1).bin");
+    assert_eq!(std::fs::read(&path).unwrap(), b"original content");
+    assert_eq!(std::fs::read(&renamed).unwrap(), *fixture.body);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.queue.item(id).unwrap().destination, renamed)
+    });
+}
+
+#[gpui::test]
+fn advanced_overwrite_retry_requires_dialog_confirmation(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("overwrite.bin");
+    std::fs::write(&path, b"keep until confirmed").unwrap();
+    let fixture = advanced_fixture(false);
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = advanced_add(&view, cx, &fixture, path.clone(), true);
+    let (details, mut child) = advanced_details(&view, id, cx);
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| d.snapshot.status == "Failed")
+    });
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::RetryDownload {
+            id,
+            collision: ulos_core::transfer::CollisionPolicy::Overwrite,
+        })
+    });
+    draw(&mut child);
+    assert!(fixture.requests.try_recv().is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"keep until confirmed");
+    let confirm = child
+        .debug_bounds("confirm-retry")
+        .expect("overwrite consent control");
+    child.simulate_click(confirm.center(), gpui_kit::Modifiers::default());
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    assert_eq!(std::fs::read(&path).unwrap(), *fixture.body);
+}
+
+#[gpui::test]
+fn advanced_add_overwrite_consent_resets_on_destination_edit(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = advanced_fixture(false);
+    std::fs::write(directory.path().join("consent.bin"), b"original").unwrap();
+    std::fs::write(directory.path().join("edited.bin"), b"other original").unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_add(window, cx)));
+    draw(cx);
+    let form = view.read_with(cx, |view, _| {
+        view.add_windows.values().next().unwrap().upgrade().unwrap()
+    });
+    let mut child = add_context(&view, cx);
+    child.update(|window, cx| {
+        form.update(cx, |form, cx| {
+            form.prefill(fixture.source.clone(), window, cx);
+            form.destination.update(cx, |input, cx| {
+                input.set_value(
+                    directory.path().join("consent.bin").to_str().unwrap(),
+                    window,
+                    cx,
+                );
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
+            });
+        })
+    });
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.has_file_target(cx))
+    });
+    form.update(&mut child, |form, cx| {
+        form.set_collision(ulos_core::transfer::CollisionPolicy::Overwrite, cx)
+    });
+    draw(&mut child);
+    form.read_with(cx, |form, cx| assert!(!form.can_submit(cx)));
+    form.update(&mut child, |form, cx| form.submit(false, cx));
+    view.read_with(cx, |view, _| assert!(view.queue.items.is_empty()));
+    form.update(&mut child, |form, cx| form.authorize_overwrite(true, cx));
+    form.read_with(cx, |form, cx| assert!(form.can_submit(cx)));
+    child.update(|window, cx| {
+        form.read(cx)
+            .destination
+            .clone()
+            .update(cx, |input, cx| input.focus(window, cx))
+    });
+    draw(&mut child);
+    child.simulate_keystrokes("secondary-a");
+    child.simulate_input(directory.path().join("edited.bin").to_str().unwrap());
+    draw(&mut child);
+    form.read_with(cx, |form, _| assert!(!form.overwrite_confirmed));
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.has_file_target(cx))
+    });
+    form.update(&mut child, |form, cx| {
+        form.set_collision(ulos_core::transfer::CollisionPolicy::Overwrite, cx);
+        assert!(!form.can_submit(cx));
+        form.authorize_overwrite(true, cx);
+        form.submit(false, cx);
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.queue.items.len(), 1);
+        assert_eq!(
+            view.queue.items[0].options.collision,
+            ulos_core::transfer::CollisionPolicy::Overwrite
+        );
+        assert_eq!(
+            view.queue.items[0].destination,
+            directory.path().join("edited.bin")
+        );
+    });
+    assert!(fixture.requests.try_recv().is_err());
+}
+
+#[gpui::test]
+fn advanced_progress_footer_is_shared_by_all_status_tabs(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = view.update(cx, |view, cx| {
+        view.enqueue(
+            "https://example.org/progress".into(),
+            directory.path().join("progress.bin"),
+            false,
+            cx,
+        )
+        .unwrap()
+    });
+    let (details, mut child) = advanced_details(&view, id, cx);
+    // Synthetic progress deliberately tests presentation, not engine behaviour.
+    view.update(cx, |view, cx| {
+        view.queue
+            .item_mut(id)
+            .unwrap()
+            .completion
+            .arm(crate::completion::CompletionAction::Shutdown);
+        view.queue.item_mut(id).unwrap().apply_state(
+            TransferState::Downloading(DownloadProgress {
+                downloaded_bytes: 50,
+                total_bytes: Some(100),
+            }),
+            Instant::now(),
+        );
+        view.refresh_details(cx);
+    });
+    for tab in 0..3 {
+        details.update(&mut child, |d, cx| d.select_tab(tab, cx));
+        draw(&mut child);
+        assert!(child.debug_bounds("status-progress").is_some(), "tab {tab}");
+        assert!(
+            child.debug_bounds("shared-cancel-shutdown").is_some(),
+            "Shutdown cancellation must remain visible on tab {tab}"
+        );
+        assert!(
+            child.debug_bounds("status-percentage").is_some(),
+            "tab {tab}"
+        );
+        details.read_with(cx, |d, _| {
+            assert_eq!(
+                d.snapshot.progress,
+                Some(DownloadProgress {
+                    downloaded_bytes: 50,
+                    total_bytes: Some(100)
+                })
+            )
+        });
+    }
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::CancelShutdown(id))
+    });
+    draw(&mut child);
+    view.read_with(cx, |view, _| {
+        assert!(!view.queue.item(id).unwrap().completion.is_armed())
+    });
+}
+
+#[gpui::test]
+fn advanced_shutdown_confirmation_countdown_and_new_work_cancellation(cx: &mut TestAppContext) {
+    if !crate::completion::shutdown_supported() {
+        return;
+    }
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = advanced_fixture(false);
+    let (_root, view, cx) = mount(cx, &runtime);
+    let id = advanced_add(
+        &view,
+        cx,
+        &fixture,
+        directory.path().join("shutdown.bin"),
+        true,
+    );
+    let (details, mut child) = advanced_details(&view, id, cx);
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::RequestShutdown(id))
+    });
+    draw(&mut child);
+    assert!(!details.read_with(cx, |d, _| d.snapshot.shutdown_armed));
+    let confirm = child
+        .debug_bounds("confirm-poweroff")
+        .expect("shutdown consent control");
+    child.simulate_click(confirm.center(), gpui_kit::Modifiers::default());
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| d.snapshot.shutdown_armed)
+    });
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    details.read_with(cx, |d, _| {
+        assert_eq!(d.snapshot.shutdown_remaining, Some(30))
+    });
+    view.update(cx, |view, cx| {
+        view.enqueue(
+            "https://example.org/new".into(),
+            directory.path().join("new.bin"),
+            false,
+            cx,
+        )
+        .unwrap();
+        assert!(!view.completion_tick(Instant::now() + Duration::from_secs(35), cx));
+        assert!(!view.completion_tick(Instant::now() + Duration::from_secs(36), cx));
+    });
+    details.read_with(cx, |d, _| {
+        assert!(!d.snapshot.shutdown_armed);
+        assert!(d.snapshot.shutdown_remaining.is_none());
+    });
+    // No provider call: new work cancels the actual countdown before its deadline.
+}
+
+#[gpui::test]
+fn advanced_native_status_close_disarms_shutdown_without_cancelling_transfer(
+    cx: &mut TestAppContext,
+) {
+    use ulos_core::transfer::ResumeCapability;
+    if !crate::completion::shutdown_supported() {
+        return;
+    }
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = advanced_fixture(true);
+    let destination = directory.path().join("close-before-publication.bin");
+    let (_root, view, cx) = mount(cx, &runtime);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    let id = advanced_add(&view, cx, &fixture, destination.clone(), true);
+    poll(cx, |cx| {
+        view.read_with(cx, |view, _| {
+            let telemetry = &view.queue.item(id).unwrap().telemetry;
+            telemetry.resume == ResumeCapability::Supported
+                && telemetry.connections.len() == 2
+                && telemetry.progress.downloaded_bytes >= 2
+        })
+    });
+    let (details, mut child) = advanced_details(&view, id, cx);
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::RequestShutdown(id))
+    });
+    draw(&mut child);
+    assert!(!details.read_with(cx, |d, _| d.snapshot.shutdown_armed));
+    view.read_with(cx, |view, _| {
+        assert!(!view.queue.item(id).unwrap().completion.is_armed());
+        assert!(!destination.exists());
+    });
+    let confirm = child.debug_bounds("confirm-poweroff").unwrap();
+    child.simulate_click(confirm.center(), gpui_kit::Modifiers::default());
+    draw(&mut child);
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| d.snapshot.shutdown_armed)
+    });
+    assert!(child.simulate_close(), "status must allow native close");
+    child.update(|window, _| window.remove_window());
+    child.run_until_parked();
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.detail_windows.is_empty());
+        assert!(!view.queue.item(id).unwrap().completion.is_armed());
+        assert_eq!(view.active, Some(id));
+        assert!(view.transfer.is_some());
+        assert!(view.shutdown_id.is_none());
+        assert!(view._shutdown_countdown.is_none());
+    });
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    assert_eq!(std::fs::read(&destination).unwrap(), *fixture.body);
+    view.update(cx, |view, cx| {
+        assert!(view.active.is_none());
+        assert!(view.shutdown_id.is_none());
+        assert!(view.shutdown_remaining.is_none());
+        assert!(view._shutdown_countdown.is_none());
+        assert!(!view.queue.item(id).unwrap().completion.is_armed());
+        assert!(!view.completion_tick(Instant::now() + Duration::from_secs(35), cx));
+    });
+}
+
+#[gpui::test]
+fn advanced_status_close_cancels_countdown_at_shutdown_deadline(cx: &mut TestAppContext) {
+    if !crate::completion::shutdown_supported() {
+        return;
+    }
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = advanced_fixture(true);
+    let destination = directory.path().join("close-during-countdown.bin");
+    let (_root, view, cx) = mount(cx, &runtime);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    let id = advanced_add(&view, cx, &fixture, destination.clone(), true);
+    let (details, mut child) = advanced_details(&view, id, cx);
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::RequestShutdown(id))
+    });
+    draw(&mut child);
+    assert!(!details.read_with(cx, |d, _| d.snapshot.shutdown_armed));
+    let confirm = child.debug_bounds("confirm-poweroff").unwrap();
+    child.simulate_click(confirm.center(), gpui_kit::Modifiers::default());
+    draw(&mut child);
+    poll(cx, |cx| {
+        details.read_with(cx, |d, _| d.snapshot.shutdown_armed)
+    });
+    fixture.release_all();
+    advanced_finished(&view, id, cx);
+    details.read_with(cx, |d, _| {
+        assert_eq!(d.snapshot.shutdown_remaining, Some(30))
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.shutdown_id, Some(id));
+        assert_eq!(view.shutdown_remaining, Some(30));
+        assert!(view.queue.item(id).unwrap().completion.is_armed());
+    });
+    // Exercise the authored close event, then check the deadline before drawing
+    // the main window. A surviving main window must not authorize shutdown.
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::CloseDetails)
+    });
+    child.run_until_parked();
+    view.update(cx, |view, cx| {
+        assert!(!view.completion_tick(Instant::now() + Duration::from_secs(35), cx));
+        assert!(!view.completion_tick(Instant::now() + Duration::from_secs(36), cx));
+        assert!(!view.queue.item(id).unwrap().completion.is_armed());
+        assert!(view.shutdown_id.is_none());
+        assert!(view.shutdown_remaining.is_none());
+        assert!(view._shutdown_countdown.is_none());
+        assert_eq!(cx.windows().len(), 1);
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| assert!(view.detail_windows.is_empty()));
+    assert_eq!(std::fs::read(&destination).unwrap(), *fixture.body);
+}
+
+#[gpui::test]
+fn advanced_unfinished_queue_and_failure_block_shutdown_and_terminal_rearming(
+    cx: &mut TestAppContext,
+) {
+    if !crate::completion::shutdown_supported() {
+        return;
+    }
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("published.bin");
+    let bytes = b"published receipt fixture";
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (id, unfinished) = view.update(cx, |view, cx| {
+        let id = view
+            .enqueue(
+                "https://example.invalid/published".into(),
+                destination.clone(),
+                false,
+                cx,
+            )
+            .unwrap();
+        let unfinished = view
+            .enqueue(
+                "https://example.invalid/unfinished".into(),
+                directory.path().join("unfinished.bin"),
+                false,
+                cx,
+            )
+            .unwrap();
+        (id, unfinished)
+    });
+    let (details, mut child) = advanced_details(&view, id, cx);
+    // This model-only test injects terminal receipts, not HTTP success. Explicit
+    // button consent is covered by both real-transfer close tests above.
+    std::fs::write(&destination, bytes).unwrap();
+    view.update(cx, |view, cx| {
+        view.arm_shutdown(id, cx);
+        assert!(view.queue.item(id).unwrap().completion.is_armed());
+        view.active = Some(id);
+        view.apply_state(
+            id,
+            TransferState::Completed(DownloadReceipt {
+                destination: destination.clone(),
+                downloaded_bytes: bytes.len() as u64,
+            }),
+            cx,
+        );
+        assert!(view.queue.item(unfinished).unwrap().is_queued());
+        assert!(!view.queue.item(id).unwrap().completion.is_armed());
+        assert!(view.shutdown_id.is_none());
+        assert!(view._shutdown_countdown.is_none());
+        assert_eq!(
+            view.completion_error.as_deref(),
+            Some("Shutdown cancelled because other downloads are unfinished.")
+        );
+        assert!(!view.completion_tick(Instant::now() + Duration::from_secs(35), cx));
+    });
+    details.update(&mut child, |_, cx| {
+        cx.emit(crate::download_details::RequestShutdown(id))
+    });
+    draw(&mut child);
+    assert!(child.debug_bounds("confirm-poweroff").is_none());
+    view.update(cx, |view, cx| {
+        view.arm_shutdown(id, cx);
+        assert!(!view.queue.item(id).unwrap().completion.is_armed());
+        view.arm_shutdown(unfinished, cx);
+        assert!(view.queue.item(unfinished).unwrap().completion.is_armed());
+        view.active = Some(unfinished);
+        view.apply_state(
+            unfinished,
+            TransferState::Failed("injected transfer failure".into()),
+            cx,
+        );
+        assert!(!view.queue.item(unfinished).unwrap().completion.is_armed());
+        assert!(view.active.is_none());
+        assert!(view.shutdown_id.is_none());
+        assert!(view.shutdown_remaining.is_none());
+        assert!(view._shutdown_countdown.is_none());
+        view.arm_shutdown(unfinished, cx);
+        assert!(!view.queue.item(unfinished).unwrap().completion.is_armed());
+        assert!(!view.completion_tick(Instant::now() + Duration::from_secs(35), cx));
+    });
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    assert!(!directory.path().join("unfinished.bin").exists());
 }

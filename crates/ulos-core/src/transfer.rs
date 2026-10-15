@@ -26,6 +26,10 @@ use url::Url;
 
 use crate::{DownloadError, DownloadProgress, DownloadReceipt};
 
+/// Maximum requested connections per transfer; actual workers may be fewer.
+/// Additional connections do not guarantee improved speed.
+pub const MAX_CONNECTIONS: usize = 16;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CollisionPolicy {
     #[default]
@@ -224,7 +228,7 @@ fn network(error: reqwest::Error) -> DownloadError {
     DownloadError::Network(error.without_url())
 }
 
-fn client() -> Result<Client, DownloadError> {
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .user_agent(concat!("Ulos/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
@@ -245,11 +249,13 @@ fn client() -> Result<Client, DownloadError> {
                 attempt.follow()
             }
         }))
-        .build()
-        .map_err(network)
 }
 
-fn identity(response: &Response) -> Result<(), DownloadError> {
+fn client() -> Result<Client, DownloadError> {
+    client_builder().build().map_err(network)
+}
+
+pub(crate) fn identity(response: &Response) -> Result<(), DownloadError> {
     for value in response.headers().get_all(header::CONTENT_ENCODING) {
         if !value
             .to_str()
@@ -567,8 +573,9 @@ async fn full_stream<F: Fn(TransferTelemetry)>(
     Ok(downloaded)
 }
 
-/// Run on a Tokio runtime. Connections must be 1..=8; the initial limit must be
-/// positive. `control` owns live settings (normally initialized from options).
+/// Run on a Tokio runtime. Connections must be between 1 and [MAX_CONNECTIONS]
+/// inclusive; the initial limit must be positive. `control` owns live settings
+/// (normally initialized from options).
 /// Neither source URLs nor server validators are exposed in telemetry/errors.
 pub async fn run(
     source: &str,
@@ -577,7 +584,7 @@ pub async fn run(
     control: TransferControl,
     on_update: impl Fn(TransferTelemetry) + Send + Sync + 'static,
 ) -> Result<DownloadReceipt, DownloadError> {
-    if !(1..=8).contains(&options.connections)
+    if !(1..=MAX_CONNECTIONS).contains(&options.connections)
         || options.bytes_per_second == Some(0)
         || control.rate_limit() == Some(0)
     {

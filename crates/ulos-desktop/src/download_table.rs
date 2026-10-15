@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use gpui_kit::{
     component::{
-        Disableable,
+        Disableable, Icon,
         button::Button,
         checkbox::Checkbox,
+        h_flex,
         label::Label,
         table::{Column, ColumnSort, TableDelegate, TableState},
     },
@@ -13,11 +14,11 @@ use gpui_kit::{
 };
 
 use crate::{
+    download_details::{status_color, status_icon},
     formatting,
     manager::DownloadManager,
     queue::{Category, DownloadId, SortColumn},
 };
-use gpui_kit::assets::IconName as AssetIcon;
 
 /// Presentation data, refreshed by the manager when queue state changes.
 #[derive(Clone, Debug)]
@@ -27,6 +28,7 @@ pub struct DownloadRow {
     pub category: Category,
     pub size: Option<u64>,
     pub status: String,
+    pub progress: Option<ulos_core::DownloadProgress>,
     pub rate: Option<f64>,
     pub selected: bool,
     pub destination: PathBuf,
@@ -61,7 +63,7 @@ impl DownloadTable {
                     .sortable()
                     .movable(false),
                 Column::new("status", "Status")
-                    .width(px(140.))
+                    .width(px(170.))
                     .movable(false),
                 Column::new("rate", "Transfer rate")
                     .width(px(130.))
@@ -71,18 +73,6 @@ impl DownloadTable {
             #[cfg(test)]
             rendered_cells: Default::default(),
         }
-    }
-}
-
-fn category_icon(category: Category) -> AssetIcon {
-    match category {
-        Category::Image => AssetIcon::Image,
-        Category::Music => AssetIcon::Music,
-        Category::Video => AssetIcon::Film,
-        Category::Apps => AssetIcon::Package,
-        Category::Document => AssetIcon::FileText,
-        Category::Compressed => AssetIcon::Archive,
-        Category::Other => AssetIcon::File,
     }
 }
 
@@ -147,7 +137,7 @@ impl TableDelegate for DownloadTable {
         row_ix: usize,
         col_ix: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         #[cfg(test)]
         self.rendered_cells.set(self.rendered_cells.get() + 1);
@@ -173,7 +163,8 @@ impl TableDelegate for DownloadTable {
                 let owner = self.owner.clone();
                 Button::new(("download-name", id))
                     .accessibility_label(format!("Open details for {}", row.name))
-                    .icon(category_icon(row.category))
+                    .debug_selector(move || format!("download-name-{id}"))
+                    .icon(crate::file_icons::category_icon(row.category, cx))
                     .label(row.name.clone())
                     .tooltip(row.destination.display().to_string())
                     .on_click(move |_, window, cx| {
@@ -188,13 +179,93 @@ impl TableDelegate for DownloadTable {
                     .unwrap_or_else(|| "—".into()),
             )
             .into_any_element(),
-            3 => Label::new(row.status.clone()).into_any_element(),
+            3 => h_flex()
+                .gap_2()
+                .child(
+                    Icon::new(status_icon(&row.status)).text_color(status_color(&row.status, cx)),
+                )
+                .child(
+                    Label::new(status_label(&row.status, row.progress))
+                        .text_color(status_color(&row.status, cx)),
+                )
+                .into_any_element(),
             _ => Label::new(
                 row.rate
                     .map(|rate| format!("{}/s", formatting::bytes(rate as u64)))
                     .unwrap_or_else(|| "—".into()),
             )
             .into_any_element(),
+        }
+    }
+}
+
+/// Unknown lengths and in-progress zero totals must not imply completion.
+fn status_label(status: &str, progress: Option<ulos_core::DownloadProgress>) -> String {
+    let percent = progress.and_then(|progress| {
+        if progress.total_bytes == Some(0) {
+            return (status == "Finished" && progress.downloaded_bytes == 0).then_some(100.0);
+        }
+        formatting::percentage(progress)
+    });
+    match percent {
+        Some(percent) => format!("{status} · {percent:.1}%"),
+        None => status.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_label;
+    use ulos_core::DownloadProgress;
+
+    #[test]
+    fn known_progress_supplements_readable_status() {
+        assert_eq!(
+            status_label(
+                "Downloading",
+                Some(DownloadProgress {
+                    downloaded_bytes: 5,
+                    total_bytes: Some(10)
+                })
+            ),
+            "Downloading · 50.0%"
+        );
+        assert_eq!(
+            status_label(
+                "Failed",
+                Some(DownloadProgress {
+                    downloaded_bytes: 5,
+                    total_bytes: Some(10)
+                })
+            ),
+            "Failed · 50.0%"
+        );
+        assert_eq!(
+            status_label(
+                "Finished",
+                Some(DownloadProgress {
+                    downloaded_bytes: 0,
+                    total_bytes: Some(0)
+                })
+            ),
+            "Finished · 100.0%"
+        );
+    }
+
+    #[test]
+    fn unknown_totals_do_not_invent_percentages() {
+        for progress in [
+            None,
+            Some(DownloadProgress {
+                downloaded_bytes: 5,
+                total_bytes: None,
+            }),
+            Some(DownloadProgress {
+                downloaded_bytes: 0,
+                total_bytes: Some(0),
+            }),
+        ] {
+            assert_eq!(status_label("Downloading", progress), "Downloading");
         }
     }
 }

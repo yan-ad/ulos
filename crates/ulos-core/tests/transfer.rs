@@ -16,7 +16,7 @@ use tokio::{
 use ulos_core::{
     DownloadError,
     transfer::{
-        self, CollisionPolicy, ResumeCapability, TransferControl, TransferOptions,
+        self, CollisionPolicy, MAX_CONNECTIONS, ResumeCapability, TransferControl, TransferOptions,
         TransferTelemetry,
     },
 };
@@ -211,6 +211,36 @@ async fn verified_ranges_reassemble_and_are_actually_concurrent() {
             .to_ascii_lowercase()
             .contains("if-range: \"stable\"")
     }));
+}
+
+#[tokio::test]
+async fn sixteen_verified_connections_are_bounded_concurrent_and_reassemble() {
+    assert_eq!(MAX_CONNECTIONS, 16);
+    let body: Vec<_> = (0..=255).cycle().take(4099).collect();
+    let server = server(Mode::Range, body.clone(), MAX_CONNECTIONS, false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("sixteen.bin");
+    let (sender, receiver) = watch::channel(TransferTelemetry::default());
+    let receipt = bounded(
+        &server.source,
+        destination.clone(),
+        TransferOptions {
+            connections: MAX_CONNECTIONS,
+            ..Default::default()
+        },
+        TransferControl::new(None),
+        move |value| {
+            sender.send_replace(value);
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.downloaded_bytes, body.len() as u64);
+    assert_eq!(tokio::fs::read(destination).await.unwrap(), body);
+    assert_eq!(receiver.borrow().resume, ResumeCapability::Supported);
+    assert_eq!(receiver.borrow().connections.len(), MAX_CONNECTIONS);
+    assert_eq!(server.maximum.load(Ordering::SeqCst), MAX_CONNECTIONS);
+    assert_eq!(server.requests.lock().unwrap().len(), MAX_CONNECTIONS + 1);
 }
 
 #[tokio::test]
@@ -503,7 +533,7 @@ async fn overwrite_refuses_symlinks() {
 #[tokio::test]
 async fn invalid_options_and_credentials_fail_before_network() {
     let directory = tempfile::tempdir().unwrap();
-    for connections in [0, 9, usize::MAX] {
+    for connections in [0, MAX_CONNECTIONS + 1, usize::MAX] {
         assert!(
             bounded(
                 "http://127.0.0.1:1/file",

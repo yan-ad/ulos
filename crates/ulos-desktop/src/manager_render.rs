@@ -18,18 +18,6 @@ use gpui_kit::{
     },
 };
 
-fn category_icon(category: Category) -> AssetIcon {
-    match category {
-        Category::Image => AssetIcon::Image,
-        Category::Music => AssetIcon::Music,
-        Category::Video => AssetIcon::Film,
-        Category::Apps => AssetIcon::Package,
-        Category::Document => AssetIcon::FileText,
-        Category::Compressed => AssetIcon::Archive,
-        Category::Other => AssetIcon::File,
-    }
-}
-
 fn toolbar_button(id: &'static str, label: &str, icon: AssetIcon) -> Button {
     Button::new(id)
         .accessibility_label(label)
@@ -68,8 +56,8 @@ fn manager_menu_item(
             MenuCommand::StopQueue => view.stop_queue(cx),
             MenuCommand::StopAll => view.stop_all(cx),
             MenuCommand::StopSelected => view.stop_selected(cx),
-            MenuCommand::Remove => view.remove_selected(cx),
-            MenuCommand::Clear => view.clear_finished(cx),
+            MenuCommand::Remove => view.remove_selected(window, cx),
+            MenuCommand::Clear => view.clear_finished(window, cx),
             MenuCommand::Options => view.open_options(window, cx),
             MenuCommand::Details => view.open_selected_details(window, cx),
             MenuCommand::Reveal => view.reveal_selected(cx),
@@ -106,10 +94,22 @@ impl DownloadManager {
         &self,
         filter: Filter,
         label: &'static str,
-        icon: AssetIcon,
         count: usize,
         cx: &mut Context<Self>,
     ) -> SidebarMenuItem {
+        let icon = match filter {
+            Filter::Category(category) => crate::file_icons::category_icon(category, cx),
+            _ => {
+                let glyph = match filter {
+                    Filter::All => AssetIcon::Download,
+                    Filter::Finished => AssetIcon::Check,
+                    Filter::Unfinished => AssetIcon::Clock,
+                    Filter::Queued => AssetIcon::List,
+                    Filter::Category(_) => unreachable!(),
+                };
+                Icon::new(glyph).text_color(crate::file_icons::navigation_color(cx))
+            }
+        };
         SidebarMenuItem::new(label)
             .icon(icon)
             .active(self.queue.filter == filter)
@@ -134,34 +134,15 @@ impl DownloadManager {
                     .iter()
                     .filter(|item| item.category == category)
                     .count();
-                self.sidebar_filter(
-                    Filter::Category(category),
-                    category.label(),
-                    category_icon(category),
-                    count,
-                    cx,
-                )
+                self.sidebar_filter(Filter::Category(category), category.label(), count, cx)
             })
             .collect::<Vec<_>>();
         let downloads = SidebarMenu::new()
-            .child(self.sidebar_filter(
-                Filter::All,
-                "All downloads",
-                AssetIcon::Download,
-                self.queue.items.len(),
-                cx,
-            ))
-            .child(self.sidebar_filter(
-                Filter::Finished,
-                "Finished",
-                AssetIcon::Check,
-                finished,
-                cx,
-            ))
+            .child(self.sidebar_filter(Filter::All, "All downloads", self.queue.items.len(), cx))
+            .child(self.sidebar_filter(Filter::Finished, "Finished", finished, cx))
             .child(self.sidebar_filter(
                 Filter::Unfinished,
                 "Unfinished",
-                AssetIcon::Clock,
                 self.queue.items.len() - finished,
                 cx,
             ))
@@ -169,7 +150,6 @@ impl DownloadManager {
                 self.sidebar_filter(
                     Filter::Queued,
                     "Queue",
-                    AssetIcon::List,
                     self.queue
                         .items
                         .iter()
@@ -249,13 +229,13 @@ impl DownloadManager {
                 toolbar_button("remove-selected", "Remove", AssetIcon::Trash)
                     .disabled(!removable)
                     .tooltip("Remove selected records from this session; files are not deleted")
-                    .on_click(cx.listener(|view, _, _, cx| view.remove_selected(cx))),
+                    .on_click(cx.listener(|view, _, window, cx| view.remove_selected(window, cx))),
             )
             .content(
                 toolbar_button("clear-finished", "Clear finished", AssetIcon::Check)
                     .disabled(!finished)
                     .tooltip("Clear finished session records; downloaded files are kept")
-                    .on_click(cx.listener(|view, _, _, cx| view.clear_finished(cx))),
+                    .on_click(cx.listener(|view, _, window, cx| view.clear_finished(window, cx))),
             )
             .content(
                 toolbar_button("scheduler", "Scheduler", AssetIcon::Calendar)
@@ -598,6 +578,7 @@ impl Render for DownloadManager {
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
+                            .when_some(self.history_error.as_ref().map(|error| format!("History unavailable: {error} This session is not being saved.")), |this, error| { this.child(Label::new(error)) })
                             .when_some(self.notice.clone(), |this, notice| {
                                 this.child(Label::new(notice).px_4().py_2().text_xs())
                             })

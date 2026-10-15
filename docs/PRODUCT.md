@@ -12,14 +12,14 @@ This document records the implemented manager foundation and future scope. See [
 
 ## Current HTTP scope
 
-- `ulos-core`: a UI-independent library that validates download requests and streams a single HTTP/HTTPS transfer to disk.
+- `ulos-core`: a UI-independent library that validates download requests and provides both legacy single-stream HTTP and controlled verified-range desktop transfers to disk.
 - `ulos-cli`: a URL/output command-line entry point using the shared core `HttpDownloadTask`.
 - `ulos-desktop`: light manager foundation with native titlebar, native macOS system menus (Ulos / Tasks / File / Edit / Downloads / View / Help), and non-macOS in-window Kit dropdown menus. One shared toolbar has stock icon-only Buttons except labeled Add URL, accessible labels/built-in tooltips, and a stock search Input on the same row, followed by a category tree, viewport-virtualized Kit DataTable with four data columns and stable-ID checkboxes, and status bar. The latest light IDM 6.28 layout reference supersedes the earlier dark AB reference; no source or branding is copied and native Kit rendering is not pixel-identical.
 - Real bounded session queue: at most 500 records, one active transfer, FIFO automatic advancement, independent presentation search/category filters/name-size sorting, stable selection, metadata-only removal/clear, and show-in-folder for finished records. No persisted queue or history.
 - Each Add action opens an independent native confirmation window (up to 16 live drafts), providing Address, File name, Save as, native folder/save pickers, Start download, and Download later. Start download starts the chosen item when idle; when busy it queues it and enables advancement. Download later does not enable advancement, but an already-running queue may process it.
 - Filename suggestions use only the decoded final URL path segment (fallback `download.bin`), ignoring query/fragment. No HEAD or Content-Disposition lookup. Suggestions and selected/edited names are sanitized into a bounded portable component while preserving manual overrides.
-- Filename click / Details opens a live native status window: one reused/activated window per download, with different IDs viewable concurrently. Closing status does not cancel a transfer. Closing the main window leaves child windows and their shared session owner alive; the last-window close quits. Removing/clearing records closes their related status windows, leaving downloaded files untouched. Options remains a Kit modal. Status, Speed limiter, and Options on completion tabs do not imply new engine features: the latter two explain that they are unimplemented. Hide details controls one actual HTTP-stream progress section; Pause is disabled, Cancel is active only for active work.
-- File safety: never overwrite an existing destination; use collision-safe staging names ending in `.part`, bounded-memory streaming, available length validation, and cleanup on failure.
+- Filename click / Details opens a live native status window: one reused/activated window per download, with different IDs viewable concurrently. Closing status does not cancel a transfer, but withdraws shutdown intent/countdown. Closing the main window leaves child windows and their shared session owner alive; the last-window close quits. Removing/clearing records closes their related status windows, leaving downloaded files untouched. Options remains a Kit modal. Status, Speed, and Completion are functional Kit segmented tabs with stock icons. A shared footer shows actual progress with the percentage inside the Kit bar on all tabs. Hide details controls actual per-connection telemetry. Pause/Resume works only within verified range sessions; unsupported streams disable it. Speed controls aggregate limiting and next-start connections. Completion requires parent-confirmed power intent and a visible cancellable countdown.
+- File safety: Reject is the default; Rename preserves the original using bounded numbered no-clobber publication. Overwrite is an explicit consent-gated exception for regular files after successful unique staging, never implicit replacement. Use bounded-memory streaming, applicable length validation, and best-effort owned staging cleanup on failure.
 
 See [Architecture](ARCHITECTURE.md) for the transfer contract and [Roadmap](ROADMAP.md) for sequencing.
 
@@ -29,11 +29,11 @@ All application widgets, content text, and panels must use GPUI Kit, without man
 
 ## Proposed product progression
 
-HTTP core/CLI reliability and the session manager foundation are the current focus. Persistent queues/history/checkpoints and browser integration follow; session queue visibility is implemented. Pause/resume, scheduling, rate limits, and bounded segmentation require separate implementation and verification. None are implied by single-transfer integration.
+HTTP core/CLI reliability and the session manager foundation are the current focus. Persistent queues/history/checkpoints and browser integration follow; session queue visibility is implemented. Session pause/resume, aggregate rate limits, and bounded segmentation are source-implemented in the controlled engine, with verification tracked separately. Durable restart recovery and scheduling remain future work. No feature implies a measured speed improvement.
 
 Browser integration is planned through Chromium/Firefox native messaging and a small JavaScript/TypeScript extension. Import should be an explicit user action, with permission and destination controls. Copied-link detection is implemented separately as an explicit Options opt-in, off by default and only for this session. Once-per-second checks use GPUI's asynchronous clipboard API only while the main Ulos window is active, no Add/status window is open, and Options is closed; eligibility is rechecked after each async read. Disabled detection performs no clipboard reads. Accept only one whitespace-trimmed HTTP/HTTPS URL within 16 KiB, rejecting embedded credentials and multi-link/non-URL input; a fingerprint suppresses repeated proposals while the form is closed. Non-URL text is not retained or logged. Accepted source/query data must remain in memory for signed downloads; Details strips query, fragment, and credentials. Detection only prefills a confirmation form and makes no autonomous download or naming network request. Wayland access depends on the compositor.
 
-Scheduler and Grabber are disabled placeholders. Resume, limiting, and completion actions are not implemented.
+Scheduler and Grabber remain disabled placeholders. Controlled session resume, limiting, and confirmed real shutdown are implemented; persistent checkpoints and other completion actions are not.
 
 ## Boundaries
 
@@ -46,3 +46,14 @@ Scheduler and Grabber are disabled placeholders. Resume, limiting, and completio
 ## Open requirements
 
 Confirm target Linux distributions/versions, supported browsers and release channels, and final name. Packaging formats, supported OS baselines, accessibility requirements, authenticated-download handling, and release policy also need decisions. Record evidence before describing any platform as supported.
+
+
+## Advanced workflow limits and safety
+
+The desktop defaults to four connections (Add offers 1/2/4/8; engine and Details accept 1–8). A verified identity-encoded range probe and strong ETag are required for segmentation and pause; otherwise one full stream is used. Every resumed/segment response verifies identity and exact range; changed resources or unexpected If-Range full responses fail rather than silently restart or append. Actual connection count can be lower than configured. Paused work retains the single active queue slot. Checkpoints and crash resume are not implemented.
+
+Live speed input is positive whole-number 1–1,048,576 KiB/s, or unlimited when disabled. The shared budget limits chunk/output consumption before writes across all connections, not TCP-prefetched network bytes or wire QoS. Connection changes affect only queued or inactive failed next starts, not active/paused transfers. Accepted settings are parent-owned and telemetry updates subsequently; no instant server propagation is claimed.
+
+An already-exists failure offers Override existing with confirmation or Add another file via a fresh Rename retry. Initial Add Overwrite requires a destination-specific authorization checkbox. Both routes revalidate parent state; consent is not inferred from a selected menu item alone. The CLI remains unchanged: single-stream with no overwrite.
+
+Completion shutdown is per download and off by default. Users must confirm a save-all-work warning. Only published Completed with every record finished and no active/paused task permits the visible 30-second countdown. Cancel, new work/retry, failure/cancellation, record removal, status close, or all-window close withdraws intent. The final check requires the status window still live, so closing it cannot leave a hidden countdown. Production requests real OS poweroff with operator permissions; no forced app closure/elevation/bypass. Provider exit success is not observed poweroff. Tests suppress dispatch and do not exercise real host shutdown. See [Architecture](ARCHITECTURE.md) and [Testing](TESTING.md).

@@ -44,9 +44,38 @@ pub fn percentage(progress: DownloadProgress) -> Option<f32> {
     })
 }
 
+pub fn decimal_bytes(value: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut amount = value as f64;
+    let mut unit = 0;
+    while amount >= 1000.0 && unit + 1 < UNITS.len() {
+        amount /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value} B")
+    } else {
+        format!("{amount:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_uses_decimal_units_through_terabytes() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (999, "999 B"),
+            (1000, "1.0 KB"),
+            (1_500_000, "1.5 MB"),
+            (2_000_000_000, "2.0 GB"),
+            (3_000_000_000_000, "3.0 TB"),
+        ] {
+            assert_eq!(decimal_bytes(bytes), expected);
+        }
+    }
 
     #[test]
     fn formats_bytes_without_inventing_decimal_units() {

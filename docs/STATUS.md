@@ -4,15 +4,17 @@ Updated: 2026-10-14. Local host: macOS 27.0.1, Apple Silicon, Rust/Cargo 1.98.1.
 
 ## Implemented foundation
 
-- HTTP/HTTPS single-stream CLI and desktop transfers, using the shared UI-independent Rust engine and owned Tokio task service.
+- HTTP/HTTPS CLI downloads retain the legacy single-stream path. Desktop transfers now use the UI-independent controlled engine: verified parallel byte ranges, session pause/resume, live aggregate speed limiting, explicit conflict policies, and owned Tokio workers.
 - Light, reference-structured manager using Kit menus, standard icon/label Buttons in Toolbar, Sidebar, virtualized DataTable, Empty, and StatusBar. All panels, text and controls use Kit components; Kit-reexported layout helpers are layout-only. Native chrome remains platform-owned, not a hand-drawn Windows skin. No copied IDM code, logo, or sample rows.
 - Real bounded session queue (500 records maximum), FIFO advancement, one active transfer, filename search, category/status/queued filters, sort, stable-ID selection, cancellation, clear-finished, and metadata-only removal. Stop queue allows current work to finish without advancing; Stop all also requests cancellation. Download now starts the new item if idle; while busy it queues the item and enables progression.
-- Each Add action opens an independent native Kit-rooted window, with up to 16 simultaneous drafts. Each window owns its inputs, subscriptions, and native folder/save picker tasks. Closing is blocked while its picker is outstanding. URL-derived filenames and manual path/name synchronization remain unchanged, with no naming network request and no overwrite.
+- Each Add action opens an independent native Kit-rooted window, with up to 16 simultaneous drafts. Each window owns its inputs, subscriptions, and native folder/save picker tasks. Closing is blocked while its picker is outstanding. URL-derived naming makes no network request. Connection choices and explicit Reject/Override/numbered-file policies are included; Override requires separate authorization for the selected destination.
 - Portable single-component filename sanitizer: controls/bidi characters, path separators and Windows punctuation, leading/trailing spaces/dots, reserved Windows device names, and a 180-byte UTF-8 filename limit with bounded extension preservation. File contents/type are not inferred from extensions; categories are presentation hints.
 - Off-by-default, session-only clipboard detection enabled through the Kit Options modal. Polls once per second only when the main window is active, no native Add/status window is open, and Options is closed. Async completion rechecks consent, main-window focus and child-window eligibility. Confirmation-only; no automatic download, network request, content logging or disk history. Accepted candidates are bounded at 16 KiB; OS read allocation occurs before validation.
 - Download status opens in a separate native window from the list/Details action or after Start download. One window per download ID is reused and activated; different downloads can have concurrent status windows. Kit GroupBox/DescriptionList/Tabs/Progress/Table/Button present actual telemetry. Closing status does not cancel; removing its record closes the corresponding status window without deleting files.
 - Child roots strongly retain the shared manager; reverse registries retain weak content. Downloads and child-window submission/cancellation remain functional after the main window closes. Registry cleanup is deferred to avoid reentrant entity borrowing, and the app quits when its last native window closes.
-- Speed limiter and completion tabs explain unavailable features; Pause, Scheduler, and Grabber are disabled and labeled not implemented. No fabricated connection rows or resume capability.
+- Status, Speed and Completion are functional segmented Kit tabs. Pause/Resume uses verified written offsets and strong validators, not advertised Accept-Ranges alone. Live rate limiting applies across all streams, and actual connection rows replace the old single-stream placeholder. Scheduler and Grabber remain disabled.
+- Progress is shared outside tab content with a centered percentage Label inside the Kit bar, including a completed empty-file case. Status icons supplement readable labels. The status window uses clean full-content macOS chrome with tabs in the titlebar row; Add windows keep native controls without visible title text.
+- Completion shutdown is off by default and requires explicit confirmation. A successful published receipt starts a visible 30-second cancellable countdown only when every queue record is finished. New work, failure/cancellation, record removal, status-window closure, or no remaining windows disarm it. Production uses real OS shutdown providers; tests never execute them.
 - Progress/state observation is bounded and latest-state/coalesced. Unchanged polling no longer invalidates the manager; rate expiry triggers presentation refresh only when the displayed rate changes. Unchanged status snapshots do not notify their view. DataTable builds viewport cells rather than all 500 records. No network/filesystem work occurs in rendering.
 - macOS Tasks/File/Edit/Downloads/View/Help menus now use the system menu bar through Kit's native Menu API. Linux/Windows retain Kit dropdown menus. Search shares the compact command toolbar; only Add URL has a visible action label. Other toolbar actions use stock icon-only Kit Buttons with managed Kit tooltips and accessible names.
 - Buttons, Inputs and Checkboxes retain stock Kit appearance. Removed per-control variants/sizes and custom palette overrides. Toolbar content slots preserve default control styling rather than applying the toolbar's automatic compact/ghost preparation. Table row allocation accommodates stock filename Buttons without changing those Buttons.
@@ -23,6 +25,7 @@ Updated: 2026-10-14. Local host: macOS 27.0.1, Apple Silicon, Rust/Cargo 1.98.1.
 ```text
 ulos-core/http.rs               safe HTTP transfers
 ulos-core/tasks.rs              owned worker, latest state, cancellation
+ulos-core/transfer.rs           controlled ranges, rate budget, session resume and publication policies
 ulos-core/naming.rs             pure filename detection/sanitization
 ulos-desktop/queue.rs           bounded session model and measured telemetry
 ulos-desktop/manager.rs         scheduling, dialog ownership, clipboard policy
@@ -34,6 +37,7 @@ ulos-desktop/native_windows.rs  native roots and child-context subscriptions
 ulos-desktop/native_menu.rs     guarded native commands and cached menu state
 ulos-desktop/clipboard.rs       bounded URL proposal/deduplication
 ulos-desktop/palette.rs         System-default preference and stock Light/Dark themes
+ulos-desktop/completion.rs      confirmed completion gate and real platform poweroff adapters
 ```
 
 ## Verification
@@ -75,11 +79,12 @@ These results supersede the earlier desktop failures, formatting differences and
 
 ## Known limits
 
-- Session queue/history and clipboard preference are not persisted. No pause/resume, durable checkpoints, segmentation, retries/rate limiting, completion automation, browser capture, torrent engine, installer, or updater.
+- Session queue/history, theme/clipboard preferences and transfer checkpoints are not persisted. Session pause/resume, bounded segmentation, live limiting, explicit retries and guarded shutdown are implemented; durable resume/recovery, scheduling/site capture, browser integration, torrents, installers and updates remain future work.
 - Best-effort temporary-file cleanup, no crash-recovery scanner. Cancellation can race with final publication; clients disclose that a completed file may exist. Slow/network-volume behavior and directory crash durability remain unverified. Desktop runtime shutdown timeout is two seconds, not proof that all blocking filesystem work has finished.
-- URL-path naming only; no HEAD or Content-Disposition detection. Manual paths do not expand `~`/environment variables. Non-UTF-8 path selection is rejected rather than altered. Existing final files are never replaced.
+- URL-path naming only; no HEAD or Content-Disposition filename detection. Manual paths do not expand `~`/environment variables. Non-UTF-8 path selection is rejected rather than altered. Reject and Rename never clobber files; authorized Override publishes a staged replacement only after transfer success.
 - Clipboard behavior depends on OS permissions/compositor support, especially Wayland. No global background-service guarantee. Signed URLs must remain in transfer memory to work; neither clipboard content nor source queries are written to logs/history.
-- Native child windows are implemented. Native macOS Add/status screenshots were reviewed using an isolated harness; complete native accessibility, keyboard, minimum-size and Windows/Linux review remains pending. One HTTP stream is displayed; resume, speed-limiter and completion automation remain unimplemented.
+- Native child windows are implemented. Earlier native screenshots were reviewed, but the new controlled status layout's native accessibility, keyboard, minimum-size and Windows/Linux visual review remain pending. Actual connections may be fewer than requested; servers lacking a verified range/strong-validator contract use a complete single stream with pause unavailable.
+- Real OS shutdown command execution was deliberately not tested on this host. macOS may request Automation permission; Linux needs systemd/poweroff permission; Windows/open applications may defer shutdown. Provider success is not proof that the machine powered off. No elevation, forced app closure, or permission bypass is used.
 - Ulos is licensed under MIT; see `LICENSE`. Dependencies retain their own licenses and notices. Project name, Linux baseline, browser targets, and distribution formats remain undecided. No new commit was made during this continuation.
 
 ### Native macOS menus and stock toolbar verification (2026-10-14, latest)
@@ -119,7 +124,35 @@ These results supersede the earlier desktop failures, formatting differences and
 
 ## Next work
 
+### Controlled transfers and compact status controls (2026-10-14, latest)
+
+- Desktop uses 1–8 bounded HTTP connections (default four), with actual connection telemetry. Parallel ranges require an observed valid `206`, identity encoding, and a strong ETag. Every subsequent range verifies URL, validator, exact Content-Range and length; a changed/full `200` response is rejected rather than appended. Unsupported servers use one complete stream.
+- Resume Capability reports Unknown/Supported/Unsupported from the actual probe. Supported downloads can pause and resume at written offsets with `If-Range`; paused work retains its active queue slot. Resume is session-only, not crash/restart recovery.
+- Speed controls apply a positive KiB/s limit live, shared across all connections; disabling restores unlimited consumption. Connection-count changes apply only to queued/retryable work. The limiter controls body consumption/writes, not total network packet bandwidth or metadata overhead.
+- Add offers Reject, authorized Override, or Add another file. Override stages a replacement and publishes only on success; numbered output uses exclusive no-clobber publication. Existing-file failures offer a numbered retry or confirmed replacement. Actual publication paths update the queue and status filename.
+- Native status uses a short Download title and full-content macOS chrome. Stock Kit segmented tabs, state icons, real connection rows, and a shared percentage-in-bar progress footer replace the older explanatory-only UI. Progress and shutdown cancellation remain visible on every tab.
+- Completion shutdown requires a confirmation Button, successful file publication, all records finished, a live status window, and a 30-second cancellable countdown. New work, retry, failure/cancel, removal, status close, or all-window closure disarm it. Status closure leaves the download running. Production calls osascript/System Events on macOS, systemctl poweroff on Linux, or shutdown.exe on Windows, without elevation or forced application closure. Permission failures are reported honestly.
+- Final `cargo test --locked --workspace`: **156 passed** (60 core/CLI, 96 desktop/model/window/power-gate tests). Workspace Clippy with `-D warnings`, formatting, desktop build and diff whitespace checks passed. Tests cover actual range concurrency, exact reassembly, malformed/changed response rejection, pause offsets, shared/live rate limits, collisions, consent, countdown cancellation and status closure. Test builds cannot execute OS shutdown.
+- No real shutdown command, OS appearance-setting change, or permission change was performed. Native rendering of this new status layout, actual OS poweroff/permission behavior, accessibility and Windows/Linux execution remain unverified. No speedup or complete IDM parity is claimed. Upstream `block 0.1.6` future-compatibility warning remains; no commit/push performed.
+
+## Next milestones
+
 1. Native accessibility/keyboard and Linux compositor/GPU tests.
 2. Persistent queue, checkpoint durability and recovery.
 3. Safe validator-aware resume, then bounded segmentation.
 4. Browser native-messaging handoff; later torrent engine research/license review.
+
+### Add window refinements (2026-10-15)
+
+- User Address edits/pastes now debounce HEAD-only advisory size inspection for 450ms; changed/invalid URLs invalidate old replies and abort pending requests. Sizes use decimal B/KB/MB/GB/TB with the existing filename-category icon and readable category label. Zero and unknown sizes remain distinct. Clipboard/programmatic prefill remains network-free, with an explicit Check size action; editing that Address enables the normal automatic check. No GET fallback or automatic transfer.
+- Sanitized destination checks run on a blocking worker after a 150ms debounce. Only existing regular files expose the stock Kit conflict RadioGroup. Missing targets hide conflict choices and retain Reject; directories/symlinks/errors show a warning. Path edits revoke consent and reset the policy. Overwrite retains a separate destination-specific checkbox and native parent validation; publication safety still belongs to core, not this advisory exists-check.
+- Connections use stock Kit radios for 1/2/4/8/16. Add has no native title text, while retaining native decorations/controls. No Button/Input/Checkbox/Radio appearance overrides. Existing Add drafts, picker guards, manual names, and child-window ownership remain intact.
+- Final verification: `cargo fmt --all -- --check`, `cargo test` (**70 passed**), `cargo test --workspace -- --test-threads=1` (**194 passed**, including **124 desktop**), default and workspace `cargo clippy --all-targets -- -D warnings`, and `git diff --check` passed. Initial runs exposed fixture issues: pause can close an accepted connection before request headers; Clear now requires confirmation; animated confirmation clicks needed reduced-motion fixtures. These test corrections do not change transfer/power behavior.
+- Post-implementation source-level anti-slop review: stock Kit controls only, category text supplements its icon, real size/unknown/error states, no decorative panels or invented metrics. Native screenshots, title rendering, keyboard navigation/screen-reader behavior, and Linux/Windows runtime checks were not performed and remain unverified. Upstream `block 0.1.6` future-compatibility warning remains. No real shutdown, permission/settings changes, commit, or push.
+
+### Icon colors and shorter overwrite form (2026-10-15)
+
+- Downloads-group sidebar icons are orange. The seven file-type icons use a shared Light/Dark palette in sidebar, filename cells and Add preview: Image teal, Music pink, Video violet, Apps blue, Document green, Compressed amber, Other slate. Stock Kit glyphs, text labels, item counts, filters, collapse behavior, and control styling remain intact. `file_icons.rs` replaces duplicate glyph mappings.
+- Removed the staged-publication description and redundant authorization paragraph beneath the Add overwrite checkbox. The destination-specific checkbox remains required by AGENTS.md; missing consent still disables Start/Download later and blocks Enter and native parent acceptance. No automatic authorization or publication-policy changes were made.
+- Verification: `cargo test` (**70 passed**), `cargo test --workspace -- --test-threads=1` (**197 passed**, including **127 desktop**), default and workspace strict clippy, formatting check, and `git diff --check` passed. Palette tests verify distinct colors and at least 3:1 non-text contrast on relevant stock Light/Dark surfaces; the overwrite regression verifies suppressing redundant guidance does not relax the consent gate.
+- Post-implementation source review: colors are secondary category/navigation cues, not status-only signals; labels and distinct glyphs remain. No new animation, decorative panel, custom-painted widget, or Button/Input/Checkbox styling. Native visual/accessibility checks and Linux/Windows execution were not performed. The upstream `block 0.1.6` future-compatibility warning remains. No commit or push.

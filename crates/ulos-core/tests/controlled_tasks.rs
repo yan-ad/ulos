@@ -90,7 +90,10 @@ async fn respond(
     let mut headers = String::new();
     loop {
         let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+        // Pause can close an accepted connection before its request is sent.
+        if reader.read_line(&mut line).await.unwrap() == 0 {
+            return;
+        }
         headers.push_str(&line);
         assert!(headers.len() < 16_384);
         if line == "\r\n" {

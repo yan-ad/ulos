@@ -1,4 +1,4 @@
-//! Bounded, session-only queue presentation model. No networking or file operations.
+//! Bounded queue presentation and metadata-only history model. No networking or file operations.
 
 use std::{
     collections::BTreeSet,
@@ -6,7 +6,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use ulos_core::transfer::{CollisionPolicy, ConnectionStatus, TransferOptions, TransferTelemetry};
 use ulos_core::{DownloadProgress, tasks::TransferState};
+
+use crate::{
+    completion::CompletionGate,
+    storage::{HistoryRecord, HistoryStatus},
+};
 
 pub type DownloadId = u64;
 pub const MAX_ITEMS: usize = 500;
@@ -95,6 +101,9 @@ pub struct QueueItem {
     pub added_at: SystemTime,
     pub state: Option<TransferState>,
     pub cancelling: bool,
+    pub options: TransferOptions,
+    pub telemetry: TransferTelemetry,
+    pub completion: CompletionGate,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
     source: String,
@@ -115,6 +124,10 @@ impl QueueItem {
         &self.source
     }
 
+    pub fn has_source(&self) -> bool {
+        !self.source.is_empty()
+    }
+
     pub fn status(&self) -> &str {
         if self.cancelling && self.is_active() {
             return "Cancelling";
@@ -123,6 +136,7 @@ impl QueueItem {
             None => "Added",
             Some(TransferState::Preparing) => "Connecting",
             Some(TransferState::Downloading(_)) => "Downloading",
+            Some(TransferState::Paused(_)) => "Paused",
             Some(TransferState::Completed(_)) => "Finished",
             Some(TransferState::Failed(_)) => "Failed",
             Some(TransferState::Cancelled) => "Cancelled",
@@ -144,7 +158,11 @@ impl QueueItem {
     pub fn progress(&self) -> Option<DownloadProgress> {
         if matches!(
             self.state,
-            Some(TransferState::Downloading(_) | TransferState::Completed(_))
+            Some(
+                TransferState::Downloading(_)
+                    | TransferState::Paused(_)
+                    | TransferState::Completed(_)
+            )
         ) || self.downloaded_bytes > 0
         {
             Some(DownloadProgress {
@@ -201,10 +219,31 @@ impl QueueItem {
                 }
                 self.downloaded_bytes = progress.downloaded_bytes;
                 self.total_bytes = progress.total_bytes;
+                self.telemetry.progress = *progress;
+                self.telemetry.paused = false;
+            }
+            TransferState::Paused(progress) => {
+                self.downloaded_bytes = progress.downloaded_bytes;
+                self.total_bytes = progress.total_bytes;
+                self.telemetry.progress = *progress;
+                self.telemetry.paused = true;
+                self.last_sample = None;
+                self.measured_rate = None;
             }
             TransferState::Completed(receipt) => {
+                self.destination = receipt.destination.clone();
+                self.category = Category::from_path(&self.destination);
                 self.downloaded_bytes = receipt.downloaded_bytes;
                 self.total_bytes = Some(receipt.downloaded_bytes);
+                self.telemetry.destination = self.destination.clone();
+                self.telemetry.progress = DownloadProgress {
+                    downloaded_bytes: self.downloaded_bytes,
+                    total_bytes: self.total_bytes,
+                };
+                self.telemetry.paused = false;
+                for connection in &mut self.telemetry.connections {
+                    connection.status = ConnectionStatus::Complete;
+                }
             }
             TransferState::Preparing => {
                 self.last_sample = None;
@@ -218,6 +257,43 @@ impl QueueItem {
             self.measured_rate = None;
         }
         self.state = Some(state);
+    }
+
+    /// Copy observed worker metadata, not user-selected settings or state.
+    /// Late snapshots cannot replace a terminal receipt or its final metadata.
+    pub fn apply_telemetry(&mut self, telemetry: TransferTelemetry) {
+        if !self.state.as_ref().is_some_and(TransferState::is_terminal) {
+            self.telemetry = telemetry;
+        }
+    }
+
+    pub fn can_retry(&self) -> bool {
+        self.has_source()
+            && matches!(
+                self.state,
+                Some(TransferState::Failed(_) | TransferState::Cancelled)
+            )
+    }
+
+    /// Reset metadata for a new attempt; never touch files or start a worker.
+    pub fn reset_for_retry(&mut self, collision: CollisionPolicy) -> bool {
+        if !self.can_retry() {
+            return false;
+        }
+        self.completion.cancel();
+        self.completion = CompletionGate::default();
+        self.state = None;
+        self.cancelling = false;
+        self.downloaded_bytes = 0;
+        self.total_bytes = None;
+        self.last_sample = None;
+        self.measured_rate = None;
+        self.telemetry = TransferTelemetry {
+            destination: self.destination.clone(),
+            ..TransferTelemetry::default()
+        };
+        self.options.collision = collision;
+        true
     }
 
     /// This records intent only; the owner must signal the actual worker.
@@ -242,6 +318,110 @@ pub struct SessionQueue {
 }
 
 impl SessionQueue {
+    /// Export only observed metadata, never source URLs, error text or user intent.
+    pub fn history_records(&self) -> Vec<HistoryRecord> {
+        self.items
+            .iter()
+            .map(|item| HistoryRecord {
+                id: item.id,
+                destination: item.destination.clone(),
+                added_at: item.added_at,
+                status: match item.state.as_ref() {
+                    None => HistoryStatus::Added,
+                    Some(TransferState::Preparing) => HistoryStatus::Connecting,
+                    Some(TransferState::Downloading(_)) => HistoryStatus::Downloading,
+                    Some(TransferState::Paused(_)) => HistoryStatus::Paused,
+                    Some(TransferState::Completed(_)) => HistoryStatus::Completed,
+                    Some(TransferState::Failed(_)) => HistoryStatus::Failed,
+                    Some(TransferState::Cancelled) => HistoryStatus::Cancelled,
+                },
+                downloaded: item.downloaded_bytes,
+                total: item.total_bytes,
+            })
+            .collect()
+    }
+
+    /// Restore historical observations only, before creating any user queue rows.
+    /// Missing URLs deliberately make every restored row terminal and non-retryable.
+    pub fn restore_history(&mut self, records: Vec<HistoryRecord>) -> Result<(), &'static str> {
+        if !self.items.is_empty() {
+            return Err("History can only be restored into an empty queue");
+        }
+        if records.len() > MAX_ITEMS {
+            return Err("History is limited to 500 downloads");
+        }
+        let mut ids = BTreeSet::new();
+        for record in &records {
+            if record.id == 0 {
+                return Err("History contains an invalid download ID");
+            }
+            if !ids.insert(record.id) {
+                return Err("History contains duplicate download IDs");
+            }
+        }
+        // next_id is the last allocated ID, not the next candidate. MAX is a
+        // valid historical ID; add's checked increment then refuses new rows.
+        let high_water = ids.last().copied().unwrap_or(0).max(self.next_id);
+        let items = records
+            .into_iter()
+            .map(|record| {
+                let mut completion = CompletionGate::default();
+                let state = match record.status {
+                    HistoryStatus::Completed => {
+                        // Remember unarmed success so shutdown cannot be armed retroactively.
+                        completion.on_success(Instant::now());
+                        TransferState::Completed(ulos_core::DownloadReceipt {
+                            destination: record.destination.clone(),
+                            downloaded_bytes: record.downloaded,
+                        })
+                    }
+                    HistoryStatus::Failed => TransferState::Failed(
+                        "Failed in a previous session. Source URL was not retained.".into(),
+                    ),
+                    HistoryStatus::Cancelled => TransferState::Cancelled,
+                    HistoryStatus::Added
+                    | HistoryStatus::Connecting
+                    | HistoryStatus::Downloading
+                    | HistoryStatus::Paused
+                    | HistoryStatus::Interrupted => TransferState::Failed(
+                        "Interrupted previous session. Add the URL again to restart.".into(),
+                    ),
+                };
+                QueueItem {
+                    id: record.id,
+                    category: Category::from_path(&record.destination),
+                    telemetry: TransferTelemetry {
+                        destination: record.destination.clone(),
+                        progress: DownloadProgress {
+                            downloaded_bytes: record.downloaded,
+                            total_bytes: record.total,
+                        },
+                        ..TransferTelemetry::default()
+                    },
+                    destination: record.destination,
+                    added_at: record.added_at,
+                    state: Some(state),
+                    cancelling: false,
+                    options: TransferOptions {
+                        connections: 4,
+                        collision: CollisionPolicy::Reject,
+                        ..TransferOptions::default()
+                    },
+                    completion,
+                    downloaded_bytes: record.downloaded,
+                    total_bytes: record.total,
+                    source: String::new(),
+                    last_sample: None,
+                    measured_rate: None,
+                }
+            })
+            .collect();
+        self.items = items;
+        self.next_id = high_water;
+        self.selected.clear();
+        Ok(())
+    }
+
     pub fn add(&mut self, url: String, destination: PathBuf) -> Result<DownloadId, &'static str> {
         if url.trim().is_empty() || destination.as_os_str().is_empty() {
             return Err("A source and destination are required");
@@ -265,6 +445,16 @@ impl SessionQueue {
         self.items.push(QueueItem {
             id,
             category: Category::from_path(&destination),
+            // Four HTTP connections, not CPU workers; core's default stays one.
+            options: TransferOptions {
+                connections: 4,
+                ..TransferOptions::default()
+            },
+            telemetry: TransferTelemetry {
+                destination: destination.clone(),
+                ..TransferTelemetry::default()
+            },
+            completion: CompletionGate::default(),
             destination,
             added_at: SystemTime::now(),
             state: None,
@@ -356,10 +546,19 @@ impl SessionQueue {
     }
 
     /// Remove metadata only, never files; active rows retain their ownership.
+    #[cfg(test)]
     pub fn remove_selected(&mut self) -> usize {
+        let ids: Vec<_> = self.selected.iter().copied().collect();
+        self.remove_records(&ids)
+    }
+
+    /// Recheck ownership at removal time, including paused or cancelling workers.
+    /// Only queue metadata is removed; destination files are never touched.
+    pub fn remove_records(&mut self, ids: &[DownloadId]) -> usize {
+        let ids: BTreeSet<_> = ids.iter().copied().collect();
         let before = self.items.len();
         self.items
-            .retain(|item| !self.selected.contains(&item.id) || item.is_active());
+            .retain(|item| !ids.contains(&item.id) || item.is_active());
         self.selected
             .retain(|id| self.items.iter().any(|item| item.id == *id));
         before - self.items.len()
@@ -412,6 +611,182 @@ mod tests {
         queue.visible().iter().map(|item| item.id).collect()
     }
 
+    fn history_record(id: u64, status: HistoryStatus) -> HistoryRecord {
+        HistoryRecord {
+            id,
+            destination: "history/file.bin".into(),
+            added_at: SystemTime::UNIX_EPOCH + Duration::new(123, 456),
+            status,
+            downloaded: 17,
+            total: Some(100),
+        }
+    }
+
+    #[test]
+    fn completed_history_preserves_actual_receipt_without_source_or_intent() {
+        let mut original = SessionQueue::default();
+        let id = add(&mut original, "requested.bin");
+        original.item_mut(id).unwrap().apply_state(
+            TransferState::Completed(DownloadReceipt {
+                destination: "actual-renamed.bin".into(),
+                downloaded_bytes: 91,
+            }),
+            Instant::now(),
+        );
+        let records = original.history_records();
+        assert!(!format!("{records:?}").contains("private=value"));
+        let mut restored = SessionQueue::default();
+        restored.restore_history(records.clone()).unwrap();
+        assert_eq!(restored.history_records(), records);
+        let item = restored.item_mut(id).unwrap();
+        assert!(matches!(
+            &item.state,
+            Some(TransferState::Completed(receipt))
+                if receipt.destination == Path::new("actual-renamed.bin")
+                    && receipt.downloaded_bytes == 91
+        ));
+        assert_eq!(item.source(), "");
+        assert!(!item.has_source());
+        assert!(!item.can_retry());
+        assert!(!item.completion.is_armed());
+        assert!(
+            !item
+                .completion
+                .arm(crate::completion::CompletionAction::Shutdown)
+        );
+        assert!(!item.completion.take_due(Instant::now()));
+    }
+
+    #[test]
+    fn unfinished_history_is_terminal_not_resumable_or_retryable() {
+        for status in [
+            HistoryStatus::Added,
+            HistoryStatus::Connecting,
+            HistoryStatus::Downloading,
+            HistoryStatus::Paused,
+            HistoryStatus::Interrupted,
+            HistoryStatus::Failed,
+            HistoryStatus::Cancelled,
+        ] {
+            let record = history_record(7, status);
+            let mut queue = SessionQueue::default();
+            queue.restore_history(vec![record.clone()]).unwrap();
+            assert_eq!(queue.next_queued(), None);
+            assert_eq!(queue.active_count(), 0);
+            let item = queue.item_mut(7).unwrap();
+            assert!(item.state.as_ref().unwrap().is_terminal());
+            assert_eq!(item.added_at, record.added_at);
+            assert_eq!(item.downloaded_bytes, record.downloaded);
+            assert_eq!(item.total_bytes, record.total);
+            assert_eq!(item.telemetry.progress.downloaded_bytes, record.downloaded);
+            assert_eq!(
+                item.telemetry.resume,
+                ulos_core::transfer::ResumeCapability::Unknown
+            );
+            assert!(item.telemetry.connections.is_empty());
+            assert_eq!(item.options.connections, 4);
+            assert_eq!(item.options.collision, CollisionPolicy::Reject);
+            assert_eq!(item.options.bytes_per_second, None);
+            assert!(!item.has_source());
+            assert!(!item.reset_for_retry(CollisionPolicy::Overwrite));
+            assert!(!item.completion.is_armed());
+            match item.state.as_ref().unwrap() {
+                TransferState::Cancelled => assert_eq!(status, HistoryStatus::Cancelled),
+                TransferState::Failed(reason) => {
+                    assert_eq!(
+                        reason,
+                        if status == HistoryStatus::Failed {
+                            "Failed in a previous session. Source URL was not retained."
+                        } else {
+                            "Interrupted previous session. Add the URL again to restart."
+                        }
+                    );
+                }
+                _ => panic!("history must not restart a transfer"),
+            }
+            queue.filter = Filter::Unfinished;
+            assert_eq!(visible(&queue), vec![7]);
+            queue.filter = Filter::Queued;
+            assert!(visible(&queue).is_empty());
+        }
+    }
+
+    #[test]
+    fn history_validation_is_atomic_and_ids_never_wrap_or_reuse() {
+        let mut queue = SessionQueue::default();
+        for records in [
+            vec![
+                history_record(8, HistoryStatus::Completed),
+                history_record(8, HistoryStatus::Failed),
+            ],
+            vec![
+                history_record(8, HistoryStatus::Completed),
+                history_record(0, HistoryStatus::Failed),
+            ],
+            (1..=(MAX_ITEMS as u64 + 1))
+                .map(|id| history_record(id, HistoryStatus::Failed))
+                .collect(),
+        ] {
+            assert!(queue.restore_history(records).is_err());
+            assert!(queue.items.is_empty());
+            assert_eq!(queue.next_id, 0);
+        }
+        queue
+            .restore_history(vec![history_record(42, HistoryStatus::Completed)])
+            .unwrap();
+        assert_eq!(add(&mut queue, "new.bin"), 43);
+        let before = queue.history_records();
+        assert!(queue.restore_history(vec![]).is_err());
+        assert_eq!(queue.history_records(), before);
+        let mut exhausted = SessionQueue::default();
+        exhausted
+            .restore_history(vec![history_record(u64::MAX, HistoryStatus::Completed)])
+            .unwrap();
+        assert_eq!(
+            exhausted.add("https://example.invalid".into(), "new.bin".into()),
+            Err("Download identifiers exhausted")
+        );
+        exhausted.remove_records(&[u64::MAX]);
+        exhausted.restore_history(vec![]).unwrap();
+        assert_eq!(
+            exhausted.add("https://example.invalid".into(), "new.bin".into()),
+            Err("Download identifiers exhausted")
+        );
+    }
+
+    #[test]
+    fn explicit_history_removal_rechecks_active_ownership_and_prunes_selection() {
+        let mut queue = SessionQueue::default();
+        let active = add(&mut queue, "active.bin");
+        let paused = add(&mut queue, "paused.bin");
+        let finished = add(&mut queue, "finished.bin");
+        queue
+            .item_mut(active)
+            .unwrap()
+            .apply_state(TransferState::Preparing, Instant::now());
+        queue.item_mut(paused).unwrap().apply_state(
+            TransferState::Paused(DownloadProgress {
+                downloaded_bytes: 3,
+                total_bytes: Some(9),
+            }),
+            Instant::now(),
+        );
+        queue
+            .item_mut(finished)
+            .unwrap()
+            .apply_state(completed(9), Instant::now());
+        for id in [active, paused, finished] {
+            queue.select(id, true);
+        }
+        assert_eq!(
+            queue.remove_records(&[active, paused, finished, finished, 999]),
+            1
+        );
+        assert!(queue.item(active).is_some());
+        assert!(queue.item(paused).is_some());
+        assert_eq!(queue.selected, BTreeSet::from([active, paused]));
+    }
+
     #[test]
     fn categories_cover_common_extensions_case_and_archives() {
         for (path, category) in [
@@ -442,10 +817,13 @@ mod tests {
         let failed = add(&mut queue, "failed.txt");
         let cancelled = add(&mut queue, "cancelled.txt");
         let now = Instant::now();
-        queue
-            .item_mut(success)
-            .unwrap()
-            .apply_state(completed(10), now);
+        queue.item_mut(success).unwrap().apply_state(
+            TransferState::Completed(DownloadReceipt {
+                destination: "success.png".into(),
+                downloaded_bytes: 10,
+            }),
+            now,
+        );
         queue
             .item_mut(failed)
             .unwrap()
@@ -662,6 +1040,187 @@ mod tests {
                     })
                 );
             }
+        }
+    }
+    #[test]
+    fn paused_rows_keep_ownership_progress_and_reset_rate_samples() {
+        let mut queue = SessionQueue::default();
+        let id = add(&mut queue, "paused.bin");
+        let now = Instant::now();
+        let item = queue.item_mut(id).unwrap();
+        item.apply_state(downloading(10, Some(100)), now);
+        item.apply_state(downloading(20, Some(100)), now + Duration::from_secs(1));
+        assert_eq!(item.speed_bytes_per_second(), Some(10.0));
+        let progress = DownloadProgress {
+            downloaded_bytes: 20,
+            total_bytes: Some(100),
+        };
+        item.apply_state(
+            TransferState::Paused(progress),
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(item.status(), "Paused");
+        assert_eq!(item.progress(), Some(progress));
+        assert!(item.is_active());
+        assert!(!item.is_finished());
+        assert!(!item.is_queued());
+        assert!(!item.can_retry());
+        assert_eq!(item.speed_bytes_per_second(), None);
+        assert_eq!(item.eta(), None);
+        assert_eq!(queue.active_count(), 1);
+        queue.filter = Filter::Unfinished;
+        assert_eq!(visible(&queue), vec![id]);
+        queue.filter = Filter::Queued;
+        assert!(queue.visible().is_empty());
+        let item = queue.item_mut(id).unwrap();
+        item.apply_state(downloading(25, Some(100)), now + Duration::from_secs(20));
+        assert_eq!(item.downloaded_bytes, 25);
+        assert_eq!(item.speed_bytes_per_second(), None);
+        item.apply_state(
+            TransferState::Paused(progress),
+            now + Duration::from_secs(21),
+        );
+        assert!(item.request_cancel());
+        assert_eq!(item.status(), "Cancelling");
+    }
+
+    #[test]
+    fn retry_resets_only_failed_or_cancelled_metadata_and_completion_intent() {
+        use crate::completion::CompletionAction;
+
+        for terminal in [
+            TransferState::Failed("fixture".into()),
+            TransferState::Cancelled,
+        ] {
+            let mut queue = SessionQueue::default();
+            let id = add(&mut queue, "retry.bin");
+            let item = queue.item_mut(id).unwrap();
+            assert_eq!(item.options.connections, 4);
+            assert_eq!(item.options.bytes_per_second, None);
+            assert_eq!(item.options.collision, CollisionPolicy::Reject);
+            assert!(!item.completion.is_armed());
+            item.options.connections = 3;
+            item.options.bytes_per_second = Some(1024);
+            assert!(item.completion.arm(CompletionAction::Shutdown));
+            item.apply_state(downloading(42, Some(100)), Instant::now());
+            item.apply_state(terminal, Instant::now());
+            assert!(item.can_retry());
+            assert!(item.reset_for_retry(CollisionPolicy::Rename));
+            assert_eq!(item.status(), "Added");
+            assert!(item.is_queued());
+            assert!(!item.is_finished());
+            assert_eq!(item.progress(), None);
+            assert_eq!(item.downloaded_bytes, 0);
+            assert_eq!(item.total_bytes, None);
+            assert!(!item.cancelling);
+            assert_eq!(item.last_sample, None);
+            assert_eq!(item.measured_rate, None);
+            assert_eq!(item.options.connections, 3);
+            assert_eq!(item.options.bytes_per_second, Some(1024));
+            assert_eq!(item.options.collision, CollisionPolicy::Rename);
+            assert_eq!(item.telemetry.destination, item.destination);
+            assert_eq!(item.telemetry.progress.downloaded_bytes, 0);
+            assert!(item.telemetry.connections.is_empty());
+            assert!(!item.completion.is_armed());
+            assert!(item.source().contains("private=value"));
+            assert!(!item.reset_for_retry(CollisionPolicy::Overwrite));
+        }
+    }
+
+    #[test]
+    fn completed_receipt_records_actual_renamed_destination_and_connection_status() {
+        use ulos_core::transfer::ConnectionProgress;
+
+        let mut queue = SessionQueue::default();
+        let id = add(&mut queue, "requested.bin");
+        let item = queue.item_mut(id).unwrap();
+        item.telemetry.connections.push(ConnectionProgress {
+            id: 1,
+            start: 0,
+            end: Some(41),
+            downloaded: 42,
+            status: ConnectionStatus::Downloading,
+        });
+        item.apply_state(
+            TransferState::Completed(DownloadReceipt {
+                destination: "actual (1).pdf".into(),
+                downloaded_bytes: 42,
+            }),
+            Instant::now(),
+        );
+        assert_eq!(item.name(), "actual (1).pdf");
+        assert_eq!(item.category, Category::Document);
+        assert_eq!(item.destination, PathBuf::from("actual (1).pdf"));
+        assert_eq!(item.telemetry.destination, item.destination);
+        assert_eq!(item.telemetry.progress, item.progress().unwrap());
+        assert_eq!(
+            item.telemetry.connections[0].status,
+            ConnectionStatus::Complete
+        );
+        assert_eq!(item.telemetry.connections[0].downloaded, 42);
+    }
+
+    #[test]
+    fn telemetry_is_observed_metadata_and_late_snapshots_cannot_override_receipts() {
+        use ulos_core::transfer::{ConnectionProgress, ResumeCapability};
+
+        let mut queue = SessionQueue::default();
+        let id = add(&mut queue, "requested.bin");
+        let item = queue.item_mut(id).unwrap();
+        item.options.bytes_per_second = Some(4096);
+        let telemetry = TransferTelemetry {
+            progress: DownloadProgress {
+                downloaded_bytes: 7,
+                total_bytes: Some(42),
+            },
+            resume: ResumeCapability::Supported,
+            connections: vec![ConnectionProgress {
+                id: 1,
+                start: 0,
+                end: Some(41),
+                downloaded: 7,
+                status: ConnectionStatus::Downloading,
+            }],
+            destination: "chosen.bin".into(),
+            bytes_per_second: None,
+            ..TransferTelemetry::default()
+        };
+        item.apply_telemetry(telemetry.clone());
+        assert_eq!(item.telemetry, telemetry);
+        assert_eq!(item.options.connections, 4);
+        assert_eq!(item.options.bytes_per_second, Some(4096));
+        assert!(item.is_queued());
+        assert_eq!(item.downloaded_bytes, 0);
+        item.apply_state(completed(42), Instant::now());
+        let final_metadata = item.telemetry.clone();
+        item.apply_telemetry(telemetry);
+        assert_eq!(item.telemetry, final_metadata);
+        assert_eq!(item.destination, PathBuf::from("fixture"));
+        assert_eq!(item.downloaded_bytes, 42);
+    }
+
+    #[test]
+    fn retry_does_not_restart_completed_paused_active_or_queued_items() {
+        for state in [
+            None,
+            Some(TransferState::Preparing),
+            Some(downloading(7, Some(42))),
+            Some(TransferState::Paused(DownloadProgress {
+                downloaded_bytes: 7,
+                total_bytes: Some(42),
+            })),
+            Some(completed(42)),
+        ] {
+            let mut queue = SessionQueue::default();
+            let id = add(&mut queue, "fixture");
+            let item = queue.item_mut(id).unwrap();
+            if let Some(state) = state.clone() {
+                item.apply_state(state, Instant::now());
+            }
+            assert!(!item.can_retry());
+            assert!(!item.reset_for_retry(CollisionPolicy::Overwrite));
+            assert_eq!(item.state, state);
+            assert_eq!(item.options.collision, CollisionPolicy::Reject);
         }
     }
 }

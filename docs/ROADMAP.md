@@ -19,15 +19,28 @@ No Linux/Windows runtime or visual/accessibility results are inferred from macOS
 **Implemented foundation; verification is tracked separately in [Status](STATUS.md).** Initialization was committed as `7bf99c6`; do not infer later commit or test outcomes from this roadmap.
 
 - Shared UI-independent `HttpDownloadTask`, bounded coalescing state, caller-supplied Tokio handle, and cancellation on drop.
-- Light IDM 6.28-inspired manager structure using GPUI Kit, native titlebar, in-window menu strip, icon-over-label toolbar, category tree, viewport-virtualized Kit DataTable with four data columns, and StatusBar. This supersedes the earlier dark AB reference, without copied branding/source or an exact-pixel-match promise.
+- Light IDM 6.28-inspired manager structure using GPUI Kit, native titlebar, macOS system menus/non-macOS Kit dropdowns, stock icon toolbar and grouped collapsible sidebar, viewport-virtualized Kit DataTable with four data columns, and StatusBar. This supersedes the earlier dark AB reference, without copied branding/source or an exact-pixel-match promise.
 - Real 500-record session queue with one active HTTP transfer, FIFO advancement, presentation-only search/filter/sort, stable selection, metadata-only removal/clear, and finished-file reveal.
 - Independent native Add windows (new draft per invocation, maximum 16) with URL-path name suggestion, portable sanitization, native folder/save pickers, manual-name preservation, Start download / Download later.
-- Native status windows (one reused/activated window per download, different IDs concurrent), real telemetry and one HTTP-stream row, Hide details, active cancellation, disabled Pause, and honest explanatory limiter/completion tabs.
+- Native status windows (one reused/activated window per download, different IDs concurrent), real per-connection telemetry, Hide details, active cancellation, verified session Pause/Resume, functional Speed/Completion tabs, and persistent shared progress footer.
 - Options copied-link detection: explicit off-by-default session opt-in, main-window-active one-second async checks suppressed by any Add/status window or Options dialog and rechecked after reads, bounded one-URL proposals and fingerprint deduplication, no autonomous downloads or non-URL retention/logging.
 - Kit-only widgets, text and panels, with layout-only Kit `div`/`v_flex`/`h_flex`; Options remains a Kit modal. Child roots own their inputs/subscriptions and a strong shared manager handle, while manager registries keep weak child content. Main close leaves children usable; last-window close quits. Picker guards prevent Add dismissal/submission while outstanding. Record removal closes related status windows without file deletion.
 - Change-gated 100ms watch observation and stale-rate refresh, unchanged-status snapshot suppression, and structural 500-record viewport/child-input render regressions. No measured latency or FPS claim.
 
-No persistent queue/history, resume, limiter, scheduler, site grabber, browser bridge, or completion actions are implemented. Scheduler/Grabber remain disabled. Keyboard/focus, accessibility, complete shutdown, and native Linux/Windows validation remain pending; a test adapter is not native-platform evidence.
+No persistent queue/history/checkpoints, scheduler, site grabber, browser bridge, or completion actions beyond confirmed shutdown are implemented. Scheduler/Grabber remain disabled. Keyboard/focus, accessibility, complete runtime teardown, and native Linux/Windows validation remain pending; a test adapter is not native-platform evidence.
+
+## Current continuation — controlled advanced transfers
+
+**Source implemented; integration verification is partial and tracked separately.** Do not infer a full-workspace lint/test pass or native screenshot from this list.
+
+- Desktop `start_with_options` controlled engine, default four bounded 1–8 connections, observed range/strong-ETag capability and response-by-response identity checks; truthful single-stream fallback and actual worker counts. CLI legacy single-stream/no-overwrite unchanged.
+- Session Pause/Resume closes responses and resumes written offsets through validated ranges; paused active work retains its queue slot. No checkpoint or crash-resume claim.
+- Live aggregate consumption limit (positive checked KiB/s input or unlimited), shared before-write grants across workers; not wire QoS or an unmeasured speedup. Connection changes apply only on queued/inactive-failed next starts.
+- Reject default, finite numbered Rename with no-clobber publication, consent-gated staged Overwrite with original preservation on transfer failure and regular-file guards. Retry remains explicit.
+- Real OS completion shutdown provider, confirmed per-download default-off intent, published-success/all-finished gate, visible cancellable 30-second countdown, and final live-status-window check. New work, retry, failure/cancellation, removal or status/all-window close cancel intent. No forced app closure/elevation; no host poweroff test.
+- Native macOS full-content status chrome with fixed Download title, Kit icon-bearing segmented Status/Speed/Completion tabs, actual connection table, and percentage inside the shared 24px Kit progress footer on all tabs. Stock controls remain unmodified.
+
+Outstanding: adversarial range/limiter/publication integration, latest full-workspace checks, native screenshot/focus/accessibility review and Linux/Windows execution/graphics validation. Test command-plan/gate logic without executing OS poweroff or changing settings. [Testing](TESTING.md) lists acceptance cases; [Status](STATUS.md) owns actual results.
 
 ## Milestone 2 — Reliable HTTP transfers and persistence
 
@@ -35,8 +48,8 @@ No persistent queue/history, resume, limiter, scheduler, site grabber, browser b
 
 - Harden failures, cancellation/publication semantics, cleanup-error reporting, retries, and slow-filesystem behavior with local fixtures.
 - SQLite queue storage, checkpoint durability, startup recovery, and migrations.
-- Safe resume with validators and verified ranges; restart on full responses or changed representations.
-- Rate controls and bounded segmentation only after server-support and integrity tests.
+- Durable recovery with validators, verified offsets and ranges, and explicit safe restart decisions. Current session resume fails on changed representations or unexpected If-Range full responses; it must not silently restart or append.
+- Extend source-implemented aggregate rate controls and bounded session segmentation with broader integration/platform verification and durable recovery tests.
 - Run configured Linux/Windows CI and perform native Linux graphical validation; agree on distro/version targets.
 
 Exit evidence: reproducible interruption/restart and data-integrity tests, explicit crash-recovery behavior, and a recorded platform matrix. A database row must never be treated as proof that file bytes survived a crash.

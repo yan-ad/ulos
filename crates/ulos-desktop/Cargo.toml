@@ -11,6 +11,8 @@ gpui-kit.workspace = true
 tokio.workspace = true
 ulos-core.workspace = true
 url.workspace = true
+directories = "6.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }

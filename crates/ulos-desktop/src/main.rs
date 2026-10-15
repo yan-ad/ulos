@@ -1,14 +1,18 @@
 mod add_download;
 mod clipboard;
+mod completion;
 mod download_details;
 mod download_table;
+mod file_icons;
 mod formatting;
 mod manager;
 #[cfg(any(target_os = "macos", test))]
 mod native_menu;
 mod native_windows;
 mod palette;
+mod platform_paths;
 mod queue;
+mod storage;
 mod window_chrome;
 
 use gpui_kit::*;
@@ -26,6 +30,23 @@ fn main() {
         }
     };
     let handle = runtime.handle().clone();
+    // Resolve platform paths and load SQLite before any queue snapshot can be saved.
+    let paths = runtime.block_on(async {
+        tokio::task::spawn_blocking(platform_paths::PlatformPaths::detect)
+            .await
+            .unwrap_or_else(|_| Err("Platform location worker stopped unexpectedly.".into()))
+    });
+    let (paths, history, writer, history_error) = match paths {
+        Ok(paths) => match runtime.block_on(storage::load_history(paths.history.clone())) {
+            Ok(records) => {
+                let writer = storage::HistoryWriter::new(&handle, paths.history.clone());
+                (Some(paths), records, Some(writer), None)
+            }
+            Err(error) => (Some(paths), Vec::new(), None, Some(error)),
+        },
+        Err(error) => (None, Vec::new(), None, Some(error)),
+    };
+    let flush_writer = writer.clone();
     application().with_assets(assets::AllAssets).run(move |cx| {
         init(cx);
         palette::init(cx);
@@ -55,6 +76,9 @@ fn main() {
                 return;
             }
         };
+        manager.update(cx, |manager, cx| {
+            manager.initialize_history(paths, history, writer, history_error, cx);
+        });
         #[cfg(target_os = "macos")]
         {
             let subscriptions = native_menu::install(cx, manager.downgrade(), main_window);
@@ -66,5 +90,10 @@ fn main() {
         let _ = (main_window, manager);
         cx.activate(true);
     });
+    if let Some(writer) = flush_writer
+        && let Err(error) = runtime.block_on(writer.flush())
+    {
+        eprintln!("History could not be saved: {error}");
+    }
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
 }
