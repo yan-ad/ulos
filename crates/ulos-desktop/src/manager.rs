@@ -72,6 +72,9 @@ pub struct DownloadManager {
     clipboard: ClipboardDetector,
     _clipboard_task: Option<Task<()>>,
     options_open: bool,
+    about_open: bool,
+    update_checking: bool,
+    _update_check: Option<Task<()>>,
     sidebar_collapsed: bool,
     main_window: AnyWindowHandle,
     paths: Option<PlatformPaths>,
@@ -86,7 +89,7 @@ pub struct DownloadManager {
     scheduler_window: Option<ChildWindow<SchedulerWindow>>,
     scheduler_error: Option<String>,
     _schedule_timer: Option<Task<()>>,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) native_menu_subscriptions: Vec<Subscription>,
     #[cfg(test)]
     render_count: std::rc::Rc<std::cell::Cell<usize>>,
@@ -177,6 +180,7 @@ impl DownloadManager {
                         && !view.torrent_picker_open
                         && view.detail_windows.is_empty()
                         && !view.options_open
+                        && !view.about_open
                         && !view.removal_open
                         && !view.removal_busy
                         && view.scheduler_window.is_none()
@@ -244,6 +248,9 @@ impl DownloadManager {
             clipboard: ClipboardDetector::default(),
             _clipboard_task: Some(clipboard_task),
             options_open: false,
+            about_open: false,
+            update_checking: false,
+            _update_check: None,
             sidebar_collapsed: false,
             main_window: window.window_handle(),
             paths: None,
@@ -258,7 +265,7 @@ impl DownloadManager {
             scheduler_window: None,
             scheduler_error: None,
             _schedule_timer: Some(schedule_timer),
-            #[cfg(any(target_os = "macos", test))]
+            #[cfg(target_os = "macos")]
             native_menu_subscriptions: Vec::new(),
             #[cfg(test)]
             render_count: Default::default(),
@@ -687,6 +694,7 @@ impl DownloadManager {
             || self.torrent_picker_open
             || !self.detail_windows.is_empty()
             || self.options_open
+            || self.about_open
             || self.removal_open
             || self.removal_busy
             || self.scheduler_window.is_some()
@@ -759,6 +767,7 @@ impl DownloadManager {
             is_torrent: item.is_torrent,
             output_directory: item.output_directory,
             torrent: item.torrent_telemetry.clone(),
+            torrent_fresh: item.is_torrent && item.speed_bytes_per_second().is_some(),
             error: match &item.state {
                 Some(TransferState::Failed(error)) => {
                     Some(if error.starts_with("Network request failed:") {
@@ -1225,7 +1234,7 @@ impl DownloadManager {
     }
 
     fn open_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.options_open || self.scheduler_window.is_some() {
+        if self.options_open || self.about_open || self.scheduler_window.is_some() {
             return;
         }
         self.options_open = true;
@@ -1276,6 +1285,7 @@ impl DownloadManager {
                 .iter()
                 .any(|item| self.queue.selected.contains(&item.id) && item.is_finished()),
             can_options: !self.options_open
+                && !self.about_open
                 && self.add_windows.is_empty()
                 && self.torrent_windows.is_empty()
                 && !self.torrent_picker_open
@@ -1332,10 +1342,14 @@ impl DownloadManager {
                     .child(Label::new("Queue order is FIFO. Stop Queue lets the active file finish; Stop All requests cancellation. Removing records never deletes downloaded files."))
                     .child(Label::new("Click a filename or choose Details to open its native status window. Queue history and clipboard preferences are session-only.")))
             }),
+            Command::About => self.about(window, cx),
+            Command::Updates => self.check_updates(window, cx, true),
         }
     }
 }
 
+#[path = "manager_app.rs"]
+mod application;
 #[path = "manager_history.rs"]
 mod history;
 #[path = "manager_render.rs"]
@@ -1345,6 +1359,9 @@ mod scheduling;
 #[path = "manager_torrent.rs"]
 mod torrents;
 
+#[cfg(test)]
+#[path = "manager_app_tests.rs"]
+mod app_tests;
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod tests;

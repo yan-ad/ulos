@@ -74,6 +74,7 @@ fn downloads_exact_bytes_and_reports_success() {
                 Err(error) => panic!("Server accept failed: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

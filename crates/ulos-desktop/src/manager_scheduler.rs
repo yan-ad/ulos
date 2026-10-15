@@ -60,7 +60,7 @@ impl DownloadManager {
             });
             return;
         }
-        if self.options_open || self.removal_open || self.removal_busy {
+        if self.options_open || self.about_open || self.removal_open || self.removal_busy {
             return;
         }
         self.scheduler_window = None;
@@ -106,7 +106,7 @@ impl DownloadManager {
         draft: &SchedulerSnapshot,
         cx: &mut Context<Self>,
     ) {
-        if self.removal_busy || self.removal_open || self.options_open {
+        if self.removal_busy || self.removal_open || self.options_open || self.about_open {
             self.scheduler_error = Some("Finish the other dialog or file removal first.".into());
             self.refresh_scheduler(cx);
             return;

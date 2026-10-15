@@ -143,13 +143,14 @@ impl QueueItem {
             return "Cancelling";
         }
         if self.is_torrent && self.is_active() {
-            return match self.torrent_telemetry.as_ref().map(|value| &value.phase) {
-                Some(TorrentPhase::Checking) => "Checking",
-                Some(TorrentPhase::Publishing) => "Verifying / publishing",
-                _ if matches!(self.state, Some(TransferState::Paused(_))) => "Paused",
-                _ if matches!(self.state, Some(TransferState::Downloading(_))) => "Downloading",
-                _ => "Preparing torrent",
-            };
+            if matches!(self.state, Some(TransferState::Paused(_))) {
+                return "Paused";
+            }
+            return self
+                .torrent_telemetry
+                .as_ref()
+                .map(TorrentTelemetry::activity_label)
+                .unwrap_or("Preparing torrent");
         }
         match self.state.as_ref() {
             None => "Added",
@@ -194,6 +195,19 @@ impl QueueItem {
     }
 
     pub fn speed_bytes_per_second(&self) -> Option<f64> {
+        if self.is_torrent {
+            return self
+                .torrent_telemetry
+                .as_ref()
+                .filter(|telemetry| {
+                    telemetry.phase == TorrentPhase::Downloading
+                        && matches!(self.state, Some(TransferState::Downloading(_)))
+                        && self
+                            .last_sample
+                            .is_some_and(|(time, _)| time.elapsed() < Duration::from_secs(2))
+                })
+                .map(|telemetry| telemetry.download_bytes_per_second as f64);
+        }
         if matches!(self.state, Some(TransferState::Downloading(_)))
             && self
                 .last_sample
@@ -328,7 +342,10 @@ impl QueueItem {
         self.cancelling = false;
         self.downloaded_bytes = 0;
         self.total_bytes = self.torrent_source.as_ref().map(TorrentSource::total_bytes);
-        self.torrent_telemetry = self.total_bytes.map(initial_torrent_telemetry);
+        self.torrent_telemetry = self
+            .torrent_source
+            .as_ref()
+            .map(|source| initial_torrent_telemetry(source.total_bytes(), source.tracker_count()));
         self.last_sample = None;
         self.measured_rate = None;
         self.telemetry = TransferTelemetry {
@@ -353,13 +370,11 @@ impl QueueItem {
     }
 }
 
-fn initial_torrent_telemetry(total_bytes: u64) -> TorrentTelemetry {
+fn initial_torrent_telemetry(total_bytes: u64, tracker_count: usize) -> TorrentTelemetry {
     TorrentTelemetry {
-        downloaded_bytes: 0,
         total_bytes,
-        peers: 0,
-        uploaded_bytes: 0,
-        phase: TorrentPhase::Preparing,
+        tracker_count,
+        ..TorrentTelemetry::default()
     }
 }
 
@@ -551,7 +566,9 @@ impl SessionQueue {
             },
             is_torrent,
             output_directory,
-            torrent_telemetry: total_bytes.map(initial_torrent_telemetry),
+            torrent_telemetry: torrent_source.as_ref().map(|source| {
+                initial_torrent_telemetry(source.total_bytes(), source.tracker_count())
+            }),
             torrent_source,
             // Four HTTP connections, not CPU workers; core's default stays one.
             options: TransferOptions {
@@ -837,7 +854,7 @@ mod tests {
         assert_eq!(item.category, Category::Document);
         item.apply_state(TransferState::Preparing, Instant::now());
         assert_eq!(item.status(), "Preparing torrent");
-        let mut telemetry = initial_torrent_telemetry(3);
+        let mut telemetry = initial_torrent_telemetry(3, 0);
         telemetry.phase = TorrentPhase::Checking;
         telemetry.downloaded_bytes = 3;
         telemetry.peers = 7;
@@ -849,7 +866,7 @@ mod tests {
         item.apply_torrent_telemetry(telemetry);
         assert_eq!(item.status(), "Verifying / publishing");
         item.apply_state(TransferState::Cancelled, Instant::now());
-        item.apply_torrent_telemetry(initial_torrent_telemetry(100));
+        item.apply_torrent_telemetry(initial_torrent_telemetry(100, 0));
         assert_eq!(item.total_bytes, Some(3));
         assert!(item.can_retry());
         assert!(!item.reset_for_retry(CollisionPolicy::Overwrite));
@@ -871,11 +888,64 @@ mod tests {
             .add("https://example.invalid".into(), "http.txt".into())
             .unwrap();
         let http = queue.item_mut(http).unwrap();
-        http.apply_torrent_telemetry(initial_torrent_telemetry(123));
+        http.apply_torrent_telemetry(initial_torrent_telemetry(123, 0));
         assert!(http.torrent_telemetry.is_none());
         assert_eq!(http.total_bytes, None);
         queue.next_id = u64::MAX;
         assert!(queue.add_torrent(torrent(false), "other".into()).is_err());
+    }
+
+    #[test]
+    fn torrent_activity_and_rates_use_live_observations_not_piece_deltas() {
+        let mut queue = SessionQueue::default();
+        let id = queue
+            .add_torrent(torrent(false), "metrics.bin".into())
+            .unwrap();
+        let item = queue.item_mut(id).unwrap();
+        let now = Instant::now();
+        let progress = DownloadProgress {
+            downloaded_bytes: 0,
+            total_bytes: Some(3),
+        };
+        item.apply_state(TransferState::Downloading(progress), now);
+        let mut telemetry = TorrentTelemetry {
+            total_bytes: 3,
+            phase: TorrentPhase::Downloading,
+            ..Default::default()
+        };
+        item.apply_torrent_telemetry(telemetry.clone());
+        assert_eq!(item.status(), "No peer discovery");
+        assert_eq!(item.speed_bytes_per_second(), Some(0.0));
+        telemetry.tracker_count = 1;
+        item.apply_torrent_telemetry(telemetry.clone());
+        assert_eq!(item.status(), "Searching for peers");
+        telemetry.connecting_peers = 2;
+        item.apply_torrent_telemetry(telemetry.clone());
+        assert_eq!(item.status(), "Connecting to peers");
+        telemetry.connecting_peers = 0;
+        telemetry.peers = 1;
+        telemetry.download_bytes_per_second = 8192;
+        item.apply_torrent_telemetry(telemetry.clone());
+        assert_eq!(item.status(), "Downloading");
+        assert_eq!(
+            item.downloaded_bytes, 0,
+            "payload rate is not verified piece progress"
+        );
+        assert_eq!(item.speed_bytes_per_second(), Some(8192.0));
+        assert!(item.eta().is_some());
+        telemetry.stalled_for_secs = 20;
+        telemetry.download_bytes_per_second = 0;
+        item.apply_torrent_telemetry(telemetry.clone());
+        assert_eq!(item.status(), "Stalled");
+        assert_eq!(item.eta(), None);
+        item.apply_state(TransferState::Paused(progress), now);
+        assert_eq!(item.status(), "Paused");
+        assert_eq!(item.speed_bytes_per_second(), None);
+        item.apply_state(TransferState::Cancelled, now);
+        telemetry.download_bytes_per_second = 9999;
+        item.apply_torrent_telemetry(telemetry);
+        assert_eq!(item.status(), "Cancelled");
+        assert_eq!(item.speed_bytes_per_second(), None);
     }
 
     #[test]

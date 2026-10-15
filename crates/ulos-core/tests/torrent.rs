@@ -275,7 +275,10 @@ async fn cancel_and_drop_wait_for_cleanup_before_terminal() {
 
 // A handcrafted local BitTorrent v1 peer, not a second engine (upload feature is
 // disabled in this crate). Tracker compact response points only to loopback.
-async fn seed(mut stream: TcpStream, payload: Vec<u8>) {
+async fn seed(stream: TcpStream, payload: Vec<u8>) {
+    seed_with_delay(stream, payload, Duration::ZERO).await;
+}
+async fn seed_with_delay(mut stream: TcpStream, payload: Vec<u8>, delay: Duration) {
     let mut handshake = [0u8; 68];
     if stream.read_exact(&mut handshake).await.is_err() {
         return;
@@ -312,6 +315,7 @@ async fn seed(mut stream: TcpStream, payload: Vec<u8>) {
             if start + len > payload.len() {
                 break;
             }
+            tokio::time::sleep(delay).await;
             let mut response = vec![7];
             response.extend_from_slice(&msg[1..9]);
             response.extend_from_slice(&payload[start..start + len]);
@@ -449,6 +453,15 @@ async fn actual_pause_resume_retains_slot() {
         *task.subscribe().borrow(),
         TransferState::Paused(_)
     ));
+    {
+        let sample = telemetry.borrow().clone();
+        assert_eq!(sample.download_bytes_per_second, 0);
+        assert_eq!(sample.upload_bytes_per_second, 0);
+        assert_eq!(sample.peers, 0);
+        assert_eq!(sample.connecting_peers, 0);
+        assert_eq!(sample.queued_peers, 0);
+        assert_eq!(sample.stalled_for_secs, 0);
+    }
     assert!(task.resume());
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -531,4 +544,209 @@ fn v1_hybrid_and_symlink_extensions_are_explicit() {
         ("info", info("ok", b"x", None)),
     ]);
     assert!(parse(bytes(&metadata)).is_err());
+}
+
+#[test]
+fn telemetry_labels_and_redacted_diagnostics() {
+    let mut t = TorrentTelemetry::default();
+    assert_eq!(t.activity_label(), "Preparing torrent");
+    assert_eq!(t.diagnostic(), None);
+    for (phase, label) in [
+        (TorrentPhase::Checking, "Checking"),
+        (TorrentPhase::Paused, "Paused"),
+        (TorrentPhase::Publishing, "Verifying / publishing"),
+    ] {
+        t.phase = phase;
+        assert_eq!(t.activity_label(), label);
+        assert_eq!(t.diagnostic(), None);
+    }
+    t.phase = TorrentPhase::Downloading;
+    assert_eq!(t.activity_label(), "No peer discovery");
+    assert!(t.diagnostic().unwrap().contains("No trackers"));
+    t.tracker_count = 1;
+    assert_eq!(t.activity_label(), "Searching for peers");
+    assert!(t.diagnostic().unwrap().contains("no peer candidates"));
+    t.seen_peers = 2;
+    assert!(t.diagnostic().unwrap().contains("peers were seen"));
+    t.connecting_peers = 1;
+    assert_eq!(t.activity_label(), "Connecting to peers");
+    t.connecting_peers = 0;
+    t.queued_peers = 1;
+    assert_eq!(t.activity_label(), "Connecting to peers");
+    t.queued_peers = 0;
+    t.peers = 1;
+    assert_eq!(t.activity_label(), "Waiting for peers");
+    t.download_bytes_per_second = 42;
+    assert_eq!(t.activity_label(), "Downloading");
+    t.stalled_for_secs = 15;
+    assert_eq!(t.activity_label(), "Stalled");
+    assert!(t.diagnostic().unwrap().contains("may be choked"));
+    t.phase = TorrentPhase::Paused;
+    assert_eq!(t.activity_label(), "Paused");
+    assert_eq!(t.diagnostic(), None);
+}
+
+async fn downloading_sample(task: &TorrentDownloadTask) -> TorrentTelemetry {
+    let mut telemetry = task.telemetry();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sample = telemetry.borrow_and_update().clone();
+            if sample.phase == TorrentPhase::Downloading {
+                return sample;
+            }
+            telemetry.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trackerless_and_empty_or_failed_local_tracker_have_truthful_diagnostics() {
+    for status in [None, Some(200), Some(500)] {
+        let tracker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A synthetic secret must never escape via telemetry diagnostics.
+        let url = format!(
+            "http://{}/announce?passkey=fixture-secret",
+            tracker.local_addr().unwrap()
+        );
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = tracker.accept().await {
+                let mut request = vec![0; 16384];
+                let _ = stream.read(&mut request).await;
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let body = bytes(&d(vec![("interval", B::I(1)), ("peers", s([]))]));
+                let headers = format!(
+                    "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.unwrap_or(200),
+                    body.len()
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let source = parse(metainfo(
+            info("fixture.bin", b"local only", None),
+            status.map(|_| url.as_str()),
+        ))
+        .unwrap();
+        let mut task = TorrentDownloadTask::start(
+            &tokio::runtime::Handle::current(),
+            source,
+            dir.path().join("out"),
+            TorrentOptions::default(),
+        );
+        let initial = downloading_sample(&task).await;
+        assert_eq!(initial.tracker_count, usize::from(status.is_some()));
+        if status.is_some() {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while requests.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let sample = task.telemetry().borrow().clone();
+        assert_eq!(sample.peers, 0);
+        assert_eq!(sample.seen_peers, 0);
+        assert_eq!(sample.download_bytes_per_second, 0);
+        assert_eq!(sample.upload_bytes_per_second, 0);
+        assert_eq!(
+            sample.activity_label(),
+            if status.is_none() {
+                "No peer discovery"
+            } else {
+                "Searching for peers"
+            }
+        );
+        let diagnostic = sample.diagnostic().unwrap();
+        assert!(diagnostic.to_lowercase().contains("tracker-only"));
+        assert!(!diagnostic.contains("fixture-secret"));
+        if status.is_some() {
+            assert!(diagnostic.contains("failure is not confirmed"));
+        }
+        task.cancel();
+        assert_eq!(terminal(&task).await, TransferState::Cancelled);
+        let stopped = task.telemetry().borrow().clone();
+        assert_eq!(stopped.peers, 0);
+        assert_eq!(stopped.download_bytes_per_second, 0);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_local_payload_reports_real_peers_and_binary_byte_rates() {
+    // Long enough for librqbit's one-second estimator snapshots; no public peers.
+    let payload: Vec<u8> = (0..128 * 16384).map(|i| (i % 251) as u8).collect();
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = peer.local_addr().unwrap().port();
+    let seed_payload = payload.clone();
+    let seeder = tokio::spawn(async move {
+        let (stream, _) = peer.accept().await.unwrap();
+        seed_with_delay(stream, seed_payload, Duration::from_millis(70)).await;
+    });
+    let tracker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = tracker.accept().await {
+            let mut request = vec![0; 16384];
+            let _ = stream.read(&mut request).await;
+            let [hi, lo] = port.to_be_bytes();
+            let body = bytes(&d(vec![
+                ("interval", B::I(1)),
+                ("peers", s([127, 0, 0, 1, hi, lo])),
+            ]));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        }
+    });
+    let source = parse(metainfo(info("slow.bin", &payload, None), Some(&url))).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let task = TorrentDownloadTask::start(
+        &tokio::runtime::Handle::current(),
+        source,
+        dir.path().join("out"),
+        TorrentOptions::default(),
+    );
+    let mut telemetry = task.telemetry();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let sample = telemetry.borrow_and_update().clone();
+            assert_eq!(sample.upload_bytes_per_second, 0);
+            if sample.download_bytes_per_second > 0 {
+                assert_eq!(sample.phase, TorrentPhase::Downloading);
+                assert!(sample.peers > 0);
+                assert!(sample.seen_peers > 0);
+                assert_eq!(sample.tracker_count, 1);
+                assert!(sample.downloaded_bytes > 0);
+                assert!(sample.downloaded_bytes < sample.total_bytes);
+                assert!(sample.stalled_for_secs < 15);
+                break;
+            }
+            telemetry.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(terminal(&task).await, TransferState::Completed(_)));
+    assert_eq!(std::fs::read(dir.path().join("out")).unwrap(), payload);
+    let stopped = telemetry.borrow().clone();
+    assert_eq!(stopped.phase, TorrentPhase::Publishing);
+    assert_eq!(stopped.tracker_count, 1);
+    assert_eq!(stopped.peers, 0);
+    assert_eq!(stopped.connecting_peers, 0);
+    assert_eq!(stopped.queued_peers, 0);
+    assert_eq!(stopped.download_bytes_per_second, 0);
+    assert_eq!(stopped.upload_bytes_per_second, 0);
+    seeder.abort();
+    server.abort();
 }

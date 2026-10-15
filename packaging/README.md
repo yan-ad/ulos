@@ -8,25 +8,18 @@ the notices are not a full transitive compliance audit.
 
 ## macOS
 
-Build `cargo build --locked -p ulos-desktop --release`, then run
-`./scripts/bundle-macos.sh` to create **dist/Ulos.app**. For a debug build run
-`cargo build --locked -p ulos-desktop` and `./scripts/bundle-macos.sh debug`.
-An optional second argument chooses a different absent `.app` output, e.g.
-`./scripts/bundle-macos.sh debug '/tmp/Ulos development.app'`. Existing outputs,
-including symlinks, are refused. `CARGO_TARGET_DIR` is respected; cross-compilation
-and custom target triples require separate packaging work. Versions in Info.plist
-must be updated for releases. A failed copy can leave a partial output for manual
-inspection; it will never be silently replaced on retry.
+Build the desktop, then run `./scripts/bundle-macos.sh [release|debug] [absent-output.app]`.
+The default output is `dist/Ulos.app`. The bundle executable is named **Ulos**,
+with the supplied icon, numeric Apple version, full `UlosVersion`, LICENSE and
+third-party notices. `CARGO_TARGET_DIR` and `CARGO_BUILD_TARGET` are respected.
+Existing outputs (including symlinks) are refused.
 
-This script only copies an already built executable and metadata. It does not run
-`open`, `lsregister`, `codesign`, installers, or default-handler commands. The
-result is a **local unsigned/not-notarized bundle** (the copied executable may have
-a toolchain ad-hoc signature); Gatekeeper and runtime compatibility are not
-certified. Manually opening or moving a bundle may cause macOS's normal Launch
-Services discovery; the script itself never requests registration. To try a file,
-choose Ulos in Finder's Open With, without selecting Change All. Finder open-file
-events go to the application's OS-open callback, not necessarily argv; direct
-`Ulos.app/Contents/MacOS/ulos-desktop /absolute/file.torrent` uses startup argv.
+The script applies an ad-hoc integrity signature; it is **not Developer ID signed
+or notarized**. The authored `.icon` document is retained, and the generated
+`.icns` is the declared fallback supported without Icon Composer. No installer,
+Launch Services registration or default-handler command runs. To try a local
+file, choose Ulos explicitly in Open With; do not select Change All unless intended.
+Direct `Ulos.app/Contents/MacOS/Ulos /absolute/file.torrent` uses startup argv.
 
 The imported `org.bittorrent.torrent` UTI conforms to `public.data`, tags the
 `torrent` extension and `application/x-bittorrent` MIME, and is declared as Viewer
@@ -36,7 +29,7 @@ project chooses and verifies its deployment baseline.
 
 ## Linux
 
-`linux/org.ulos.desktop.desktop` declares `Exec=ulos-desktop %F` for local files,
+`linux/org.ulos.desktop.desktop` declares `Exec=Ulos %F` for local files,
 so each selected file arrives as one startup argument, including spaces. The
 binary must be on the desktop session's PATH. This metadata uses the existing
 `application/x-bittorrent` MIME; it does not invent a competing MIME database or
@@ -85,3 +78,13 @@ transfer. Parent UI must present each accepted file for review.
 - [freedesktop Exec %F semantics](https://specifications.freedesktop.org/desktop-entry-spec/latest/exec-variables.html)
 - [Microsoft OpenWithProgids](https://learn.microsoft.com/en-us/windows/win32/shell/how-to-include-an-application-on-the-open-with-dialog-box)
 - [Microsoft registered application capabilities](https://learn.microsoft.com/en-us/windows/win32/shell/default-programs)
+
+## Release workflow
+
+`.github/workflows/release.yml` accepts an existing `v` tag and verifies that its
+Cargo version matches. It builds native Apple silicon/Intel macOS DMGs, a Windows
+x64 ZIP and an Ubuntu 24.04 x64 portable tar archive, with engine tests on each
+platform and full desktop tests/lint on macOS. All builds must succeed before
+publication. SHA256SUMS is generated from the four artifacts; publishing uses
+`--verify-tag --draft=false --prerelease=false --latest`, including `-pre` names.
+The workflow never creates a source commit or tag. See INSTALL.md for GUI steps.

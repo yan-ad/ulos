@@ -4,10 +4,13 @@
     <key>CFBundleName</key><string>Ulos</string>
     <key>CFBundleDisplayName</key><string>Ulos</string>
     <key>CFBundleIdentifier</key><string>org.ulos.desktop</string>
-    <key>CFBundleExecutable</key><string>ulos-desktop</string>
+    <key>CFBundleExecutable</key><string>Ulos</string>
+    <key>CFBundleIconFile</key><string>Ulos.icns</string>
+    <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Ulos Download Manager contributors.</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleShortVersionString</key><string>0.0.1</string>
+    <key>UlosVersion</key><string>0.0.1-pre.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>CFBundleDocumentTypes</key><array><dict>

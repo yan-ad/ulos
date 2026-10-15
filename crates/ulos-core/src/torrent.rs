@@ -23,11 +23,11 @@ use crate::{DownloadProgress, DownloadReceipt, naming::sanitize_filename, tasks:
 use sha1::{Digest, Sha1};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     runtime::Handle,
@@ -501,21 +501,126 @@ pub async fn load(path: PathBuf) -> Result<TorrentSource, TorrentError> {
 pub struct TorrentOptions {
     pub collision: CollisionPolicy,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TorrentPhase {
+    #[default]
     Preparing,
     Checking,
     Downloading,
     Paused,
     Publishing,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TorrentTelemetry {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub peers: u32,
     pub uploaded_bytes: u64,
     pub phase: TorrentPhase,
+    pub download_bytes_per_second: u64,
+    pub upload_bytes_per_second: u64,
+    pub connecting_peers: u32,
+    pub queued_peers: u32,
+    /// Engine-observed historical peer count, not tracker availability.
+    pub seen_peers: u32,
+    /// Accepted tracker URLs in the source; not successful announces.
+    pub tracker_count: usize,
+    pub stalled_for_secs: u64,
+}
+impl TorrentTelemetry {
+    pub fn activity_label(&self) -> &'static str {
+        match self.phase {
+            TorrentPhase::Preparing => "Preparing torrent",
+            TorrentPhase::Checking => "Checking",
+            TorrentPhase::Paused => "Paused",
+            TorrentPhase::Publishing => "Verifying / publishing",
+            TorrentPhase::Downloading => {
+                if self.tracker_count == 0
+                    && self.peers == 0
+                    && self.connecting_peers == 0
+                    && self.queued_peers == 0
+                {
+                    "No peer discovery"
+                } else if self.peers == 0 && (self.connecting_peers > 0 || self.queued_peers > 0) {
+                    "Connecting to peers"
+                } else if self.peers == 0 {
+                    "Searching for peers"
+                } else if self.stalled_for_secs >= 15 {
+                    "Stalled"
+                } else if self.download_bytes_per_second == 0 && self.downloaded_bytes == 0 {
+                    "Waiting for peers"
+                } else {
+                    "Downloading"
+                }
+            }
+        }
+    }
+
+    /// Redacted explanations, never tracker URLs or raw engine errors. Peer
+    /// counters do not establish tracker failures or why a peer disconnected.
+    pub fn diagnostic(&self) -> Option<&'static str> {
+        if self.phase != TorrentPhase::Downloading {
+            return None;
+        }
+        if self.peers == 0 {
+            return Some(if self.connecting_peers > 0 || self.queued_peers > 0 {
+                "Tracker-only discovery: connecting to discovered peers. DHT and local discovery are disabled. Payload upload is disabled."
+            } else if self.tracker_count == 0 {
+                "No trackers are present. Tracker-only discovery cannot find peers; DHT and local discovery are disabled. Payload upload is disabled."
+            } else if self.seen_peers > 0 {
+                "Tracker-only discovery: peers were seen, but none are currently connected or pending. DHT and local discovery are disabled. Payload upload is disabled."
+            } else {
+                "Tracker-only discovery: no peer candidates have been observed yet. Trackers may return no peers or be unreachable; tracker failure is not confirmed. DHT and local discovery are disabled. Payload upload is disabled."
+            });
+        }
+        if self.stalled_for_secs >= 15 {
+            return Some(
+                "Connected peers are not sending data. They may be choked or have no needed pieces. Payload upload is disabled and some swarms require it.",
+            );
+        }
+        None
+    }
+
+    fn stop_activity(&mut self) {
+        self.download_bytes_per_second = 0;
+        self.upload_bytes_per_second = 0;
+        self.peers = 0;
+        self.connecting_peers = 0;
+        self.queued_peers = 0;
+        self.stalled_for_secs = 0;
+    }
+}
+
+// librqbit 9.0.1 SpeedEstimator::mbps divides B/s by 1024 twice:
+// despite its name this is MiB/s, not megabits/s. Match Speed::as_bytes,
+// additionally rejecting invalid floating-point samples.
+fn bytes_per_second(mib_per_second: f64) -> u64 {
+    if !mib_per_second.is_finite() || mib_per_second <= 0.0 {
+        return 0;
+    }
+    (mib_per_second * 1_048_576.0) as u64
+}
+
+#[derive(Default)]
+struct StallMonitor {
+    last: Option<(TorrentPhase, u64, u64, Instant)>,
+}
+impl StallMonitor {
+    fn sample(&mut self, phase: &TorrentPhase, progress: u64, fetched: u64, now: Instant) -> u64 {
+        let since = match &self.last {
+            Some((previous, old_progress, old_fetched, since))
+                if *phase == TorrentPhase::Downloading
+                    && previous == phase
+                    && *old_progress == progress
+                    && *old_fetched == fetched =>
+            {
+                *since
+            }
+            _ => now,
+        };
+        self.last = Some((phase.clone(), progress, fetched, since));
+        now.saturating_duration_since(since).as_secs()
+    }
 }
 
 pub struct TorrentDownloadTask {
@@ -534,16 +639,15 @@ impl TorrentDownloadTask {
     ) -> Self {
         let (state_tx, state) = watch::channel(TransferState::Preparing);
         let (telemetry_tx, telemetry) = watch::channel(TorrentTelemetry {
-            downloaded_bytes: 0,
             total_bytes: source.total,
-            peers: 0,
-            uploaded_bytes: 0,
-            phase: TorrentPhase::Preparing,
+            tracker_count: source.trackers,
+            ..TorrentTelemetry::default()
         });
         let (cancellation, cancelled) = oneshot::channel();
         let (control, commands) = watch::channel(false);
         runtime.spawn(async move {
             let updates = state_tx.clone();
+            let final_telemetry = telemetry_tx.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // Engine diagnostics may carry tracker queries. Suppress tracing
                 // locally on every owned engine thread, never install a global subscriber.
@@ -566,6 +670,10 @@ impl TorrentDownloadTask {
                 Ok(Err(e)) => TransferState::Failed(e.to_string()),
                 Err(_) => TransferState::Failed(TorrentError::Worker.to_string()),
             };
+            final_telemetry.send_modify(|t| {
+                t.phase = TorrentPhase::Publishing;
+                t.stop_activity();
+            });
             state_tx.send_replace(terminal);
         });
         Self {
@@ -684,7 +792,7 @@ fn worker(
         }
         telemetry.send_modify(|t| {
             t.phase = TorrentPhase::Publishing;
-            t.peers = 0;
+            t.stop_activity();
         });
         if !verify(&source, &output, || cancellation_requested(&mut cancelled))? {
             return Ok(None);
@@ -752,6 +860,7 @@ async fn run_engine(
         };
         let handle=added.into_handle().ok_or(TorrentError::Engine)?;
         let mut tick=tokio::time::interval(Duration::from_millis(100));
+        let mut stall = StallMonitor::default();
         loop {
             tokio::select! {
                 biased;
@@ -772,8 +881,27 @@ async fn run_engine(
             // Initializing progress measures bytes scanned, not verified data.
             let downloaded=if phase==TorrentPhase::Checking {0} else {stats.progress_bytes.min(source.total)};
             let progress=DownloadProgress {downloaded_bytes:downloaded,total_bytes:Some(source.total)};
-            telemetry.send_replace(TorrentTelemetry {downloaded_bytes:downloaded,total_bytes:source.total,peers:stats.live.as_ref().map(|s|s.snapshot.peer_stats.live).unwrap_or(0),uploaded_bytes:stats.uploaded_bytes,phase:phase.clone()});
+            let mut sample = TorrentTelemetry {
+                downloaded_bytes: downloaded,
+                total_bytes: source.total,
+                uploaded_bytes: stats.uploaded_bytes,
+                phase: phase.clone(),
+                tracker_count: source.trackers,
+                seen_peers: telemetry.borrow().seen_peers,
+                ..TorrentTelemetry::default()
+            };
+            let fetched = stats.live.as_ref().map(|s| s.snapshot.fetched_bytes).unwrap_or(0);
+            sample.stalled_for_secs = stall.sample(&phase, downloaded, fetched, Instant::now());
+            if phase == TorrentPhase::Downloading && let Some(live) = &stats.live {
+                sample.peers = live.snapshot.peer_stats.live;
+                sample.connecting_peers = live.snapshot.peer_stats.connecting;
+                sample.queued_peers = live.snapshot.peer_stats.queued;
+                sample.seen_peers = sample.seen_peers.max(live.snapshot.peer_stats.seen);
+                sample.download_bytes_per_second = bytes_per_second(live.download_speed.mbps);
+                sample.upload_bytes_per_second = bytes_per_second(live.upload_speed.mbps);
+            }
             state.send_replace(if phase==TorrentPhase::Paused {TransferState::Paused(progress)} else {TransferState::Downloading(progress)});
+            telemetry.send_replace(sample);
             if stats.finished {return Ok(true);}
         }
     }.await;
@@ -836,7 +964,13 @@ fn verify(
         if !meta.is_file() || meta.len() != entry.length {
             return Err(TorrentError::Verification);
         }
-        let mut file = File::open(path).map_err(|_| TorrentError::Verification)?;
+        // Windows FlushFileBuffers requires a handle opened for writing. The
+        // staged file is already owned by this transfer; never create/truncate it.
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| TorrentError::Verification)?;
         let mut remaining = entry.length;
         while remaining > 0 {
             if cancelled() {
@@ -945,6 +1079,36 @@ fn rename_directory(_from: &Path, _to: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rate_conversion_rejects_invalid_and_uses_binary_bytes() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            assert_eq!(super::bytes_per_second(invalid), 0);
+        }
+        assert_eq!(super::bytes_per_second(1.0), 1_048_576);
+        assert_eq!(super::bytes_per_second(0.5), 524_288);
+        assert_eq!(super::bytes_per_second(f64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn monotonic_stall_counts_only_unchanged_downloading_samples() {
+        use super::{StallMonitor, TorrentPhase};
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut monitor = StallMonitor::default();
+        let down = TorrentPhase::Downloading;
+        let at = |seconds| start + Duration::from_secs(seconds);
+        assert_eq!(monitor.sample(&down, 0, 0, at(0)), 0);
+        assert_eq!(monitor.sample(&down, 0, 0, at(15)), 15);
+        // Incomplete piece payload counts as movement, before verified progress.
+        assert_eq!(monitor.sample(&down, 0, 100, at(16)), 0);
+        assert_eq!(monitor.sample(&down, 0, 100, at(20)), 4);
+        assert_eq!(monitor.sample(&down, 100, 100, at(21)), 0);
+        assert_eq!(monitor.sample(&TorrentPhase::Paused, 100, 0, at(22)), 0);
+        assert_eq!(monitor.sample(&TorrentPhase::Paused, 100, 0, at(100)), 0);
+        assert_eq!(monitor.sample(&down, 100, 0, at(101)), 0);
+        assert_eq!(monitor.sample(&TorrentPhase::Checking, 0, 0, at(200)), 0);
+        assert_eq!(monitor.sample(&down, 100, 0, at(300)), 0);
+    }
     use super::*;
     #[test]
     fn publication_is_no_replace_even_when_target_arrives_late() {

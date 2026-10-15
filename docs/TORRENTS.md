@@ -9,6 +9,27 @@
 - HTTP/torrent records share the existing category sidebar and queue table, appending **Type** after Description, with no torrent sidebar group or dedicated torrent destination folder. Single-file torrents use their payload filename's existing category; multifile torrents use Other.
 - One global active slot, named queues, explicit ordering, session scheduler and completion gates cover both protocols. Paused work holds the slot. Actual engine Pause/Resume is asynchronous: command acceptance is not observed Paused state. Torrent live rate/connection controls are unavailable; do not display simulated HTTP capabilities. Progress/phase/peer/upload counters come from the engine; initializing scan bytes are not reported as verified download progress.
 
+## Live diagnostics
+
+The source-level diagnosis addresses a reported **0 B / Downloading** view with hidden peer/rate information; it does not establish that the user’s torrent was repaired or downloaded. The stock Kit **Status** summary always exposes **Peers** (connected, connecting, queued), **Download speed**, **Upload speed** (payload upload disabled), and **Trackers** (configured count), independently of the details disclosure. These are real observations, not decorative panels or new controls.
+
+Download/upload rates come from the engine’s speed estimators: librqbit 9.0.1’s `mbps` value is **MiB/s**, converted to **B/s** by multiplying by 1,048,576; invalid/nonpositive samples become zero. Verified piece bytes remain separate, so an incomplete piece can have a nonzero payload rate while verified progress stays at 0 B. Initial checking/scanning is not downloaded progress. Active downloading peer/rate presentation is gated by `snapshot.torrent_fresh` (a sample younger than two seconds); stale live values are withheld as unavailable, not inferred zeros. Paused, publishing and terminal activity is zero, not a retained last speed. Missing telemetry remains unavailable.
+
+Downloading-phase labels follow observed activity, in this order:
+
+| Label | Observation |
+| --- | --- |
+| No peer discovery | No configured trackers and no connected, connecting or queued peers; tracker-only discovery has no source. |
+| Connecting to peers | No connected peers, but connecting or queued candidates exist. |
+| Searching for peers | No connected or pending candidates; configured trackers do not establish successful discovery. Previously seen peers may no longer be available. |
+| Stalled | Connected peers, with neither fetched payload bytes nor verified piece bytes changing for at least 15 seconds. |
+| Waiting for peers | Connected peers, but no initial verified bytes or current payload rate, before the stall threshold. |
+| Downloading | Otherwise, normal downloading activity. |
+
+Preparing, Checking, Paused and Verifying / publishing retain their own phases. The monotonic stall monitor resets on fetched/verified movement and phase transitions; time paused is not downloading stall time.
+
+**Trackers configured is neither successful announce count nor seed count.** Peer counts and historical peers seen cannot prove tracker failure, choking, or seed/live availability; explanations describe possibilities, not diagnoses of remote systems. No tracker URLs, signed queries or peer addresses are exposed/logged for this diagnosis. Tracker-only discovery, DHT/local discovery off and payload upload disabled remain unchanged; no privacy/discovery policy is relaxed to make progress. No user torrent or public network was used for this diagnostic change, and no new native screenshot or live-user download result is claimed. Local-fixture and native review requirements are in the [testing plan](TESTING.md#torrent-verification-plan-not-results); actual command outcomes are recorded separately.
+
 ## Offline metainfo profile
 
 Accept v1 metainfo and compatible v1 hybrids containing a valid v1 manifest/piece list; **magnets and pure v2 are not implemented**. Strict parsing rejects some otherwise legal metainfo, including padding/symlink extensions and unsupported encodings; accepting hybrids does not imply all hybrid torrents are supported.

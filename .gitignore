@@ -4,3 +4,6 @@
 .env.*
 !.env.example
 *.part
+
+/dist/
+__pycache__/

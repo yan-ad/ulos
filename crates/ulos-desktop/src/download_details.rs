@@ -57,6 +57,7 @@ pub struct DetailsSnapshot {
     pub is_torrent: bool,
     pub output_directory: bool,
     pub torrent: Option<ulos_core::torrent::TorrentTelemetry>,
+    pub torrent_fresh: bool,
 }
 
 pub struct CancelDownload(pub DownloadId);
@@ -112,7 +113,13 @@ pub(crate) fn status_icon(status: &str) -> KitIcon {
         "Cancelled" | "Cancelling" | "Cancelling…" => KitIcon::CircleX,
         "Finished" | "Complete" => KitIcon::CircleCheck,
         "Paused" => KitIcon::Pause,
-        "Connecting" => KitIcon::LoaderCircle,
+        "Connecting"
+        | "Preparing torrent"
+        | "Checking"
+        | "Searching for peers"
+        | "Connecting to peers"
+        | "Waiting for peers" => KitIcon::LoaderCircle,
+        "No peer discovery" | "Stalled" => KitIcon::CircleAlert,
         "Downloading" => KitIcon::Download,
         _ => KitIcon::Clock,
     }
@@ -376,8 +383,12 @@ impl DownloadDetails {
             ("Source", KitIcon::Link, s.source.clone()),
         ];
         if s.is_torrent {
-            fields.retain(|(label, _, _)| *label != "Resume");
+            fields.retain(|(label, _, _)| !matches!(*label, "Resume" | "Rate"));
             fields.insert(0, ("Protocol", KitIcon::Link, "Torrent".into()));
+            let metrics = self.torrent_summary_fields();
+            for (label, value) in metrics.into_iter().rev() {
+                fields.insert(2, (label, KitIcon::Gauge, value));
+            }
         }
         GroupBox::new()
             .outline()
@@ -395,7 +406,18 @@ impl DownloadDetails {
                                 .child(Label::new(label))
                                 .into_any_element(),
                         )
-                        .value(Label::new(value).truncate().into_any_element())
+                        .value(
+                            h_flex()
+                                .min_w_0()
+                                .debug_selector(move || {
+                                    format!(
+                                        "status-metric-{}",
+                                        label.to_lowercase().replace(' ', "-")
+                                    )
+                                })
+                                .child(Label::new(value).truncate())
+                                .into_any_element(),
+                        )
                     }))
                     .when_some(s.error.clone(), |list, error| {
                         list.item(
@@ -407,22 +429,117 @@ impl DownloadDetails {
                         )
                     }),
             )
+            .when_some(
+                s.torrent
+                    .as_ref()
+                    .filter(|_| s.is_torrent && s.active && s.torrent_fresh)
+                    .and_then(|telemetry| telemetry.diagnostic()),
+                |panel, message| panel.child(Label::new(message)),
+            )
             .into_any_element()
+    }
+    fn torrent_summary_fields(&self) -> Vec<(&'static str, String)> {
+        let Some(telemetry) = &self.snapshot.torrent else {
+            return vec![
+                ("Peers", "Not available".into()),
+                ("Download speed", "Not available".into()),
+                ("Upload speed", "Disabled".into()),
+            ];
+        };
+        let transferring = self.snapshot.active
+            && telemetry.phase == ulos_core::torrent::TorrentPhase::Downloading;
+        let live = transferring && self.snapshot.torrent_fresh;
+        let unavailable = "Not available (waiting for an update)";
+        vec![
+            (
+                "Peers",
+                if live {
+                    format!(
+                        "{} connected, {} connecting, {} queued",
+                        telemetry.peers, telemetry.connecting_peers, telemetry.queued_peers
+                    )
+                } else if transferring {
+                    unavailable.into()
+                } else {
+                    "0 connected".into()
+                },
+            ),
+            (
+                "Download speed",
+                if transferring && !live {
+                    unavailable.into()
+                } else {
+                    format!(
+                        "{}/s",
+                        formatting::bytes(if live {
+                            telemetry.download_bytes_per_second
+                        } else {
+                            0
+                        })
+                    )
+                },
+            ),
+            (
+                "Upload speed",
+                if transferring && !live {
+                    format!("{unavailable} (payload upload disabled)")
+                } else {
+                    format!(
+                        "{}/s (payload upload disabled)",
+                        formatting::bytes(if live {
+                            telemetry.upload_bytes_per_second
+                        } else {
+                            0
+                        })
+                    )
+                },
+            ),
+            (
+                "Trackers",
+                format!(
+                    "{} configured (tracker-only discovery)",
+                    telemetry.tracker_count
+                ),
+            ),
+        ]
     }
     fn torrent_fields(&self) -> Vec<(&'static str, String)> {
         let Some(telemetry) = &self.snapshot.torrent else {
             return vec![("Telemetry", "Not available".into())];
         };
-        let phase = match telemetry.phase {
-            ulos_core::torrent::TorrentPhase::Preparing => "Preparing",
-            ulos_core::torrent::TorrentPhase::Checking => "Checking",
-            ulos_core::torrent::TorrentPhase::Downloading => "Downloading",
-            ulos_core::torrent::TorrentPhase::Paused => "Paused",
-            ulos_core::torrent::TorrentPhase::Publishing => "Publishing",
-        };
+        let active = self.snapshot.active;
         vec![
-            ("Phase", phase.into()),
-            ("Peers", telemetry.peers.to_string()),
+            (
+                "Phase",
+                if !active {
+                    self.snapshot.status.clone()
+                } else if telemetry.phase == ulos_core::torrent::TorrentPhase::Downloading
+                    && !self.snapshot.torrent_fresh
+                {
+                    "Waiting for telemetry".into()
+                } else {
+                    telemetry.activity_label().into()
+                },
+            ),
+            (
+                "Peers",
+                if !active {
+                    "0".into()
+                } else if self.snapshot.torrent_fresh {
+                    telemetry.peers.to_string()
+                } else {
+                    "Not available".into()
+                },
+            ),
+            ("Peers seen", telemetry.seen_peers.to_string()),
+            (
+                "No data for",
+                if active && self.snapshot.torrent_fresh {
+                    formatting::duration(Duration::from_secs(telemetry.stalled_for_secs))
+                } else {
+                    "Not applicable".into()
+                },
+            ),
             (
                 "Verified bytes",
                 format!(
@@ -828,6 +945,7 @@ mod tests {
     fn torrent_details() -> DownloadDetails {
         let mut view = details(None);
         view.snapshot.is_torrent = true;
+        view.snapshot.torrent_fresh = true;
         view.snapshot.source = "Local torrent metadata".into();
         view.snapshot.torrent = Some(ulos_core::torrent::TorrentTelemetry {
             downloaded_bytes: 42,
@@ -835,6 +953,10 @@ mod tests {
             peers: 3,
             uploaded_bytes: 0,
             phase: ulos_core::torrent::TorrentPhase::Downloading,
+            download_bytes_per_second: 2048,
+            tracker_count: 2,
+            seen_peers: 5,
+            ..ulos_core::torrent::TorrentTelemetry::default()
         });
         view
     }
@@ -847,6 +969,8 @@ mod tests {
             vec![
                 ("Phase", "Downloading".into()),
                 ("Peers", "3".into()),
+                ("Peers seen", "5".into()),
+                ("No data for", "0s".into()),
                 ("Verified bytes", "42 B of 100 B".into()),
                 ("Uploaded", "0 B".into()),
             ]
@@ -860,6 +984,120 @@ mod tests {
         );
         let _ = view.connection_content();
         assert!(!view.can_pause());
+    }
+
+    #[test]
+    fn stale_and_terminal_torrents_never_reuse_live_rates_or_publishing_labels() {
+        let mut view = torrent_details();
+        view.snapshot.torrent_fresh = false;
+        let fields = view.torrent_summary_fields();
+        for label in ["Peers", "Download speed", "Upload speed"] {
+            assert!(
+                fields
+                    .iter()
+                    .find(|(name, _)| *name == label)
+                    .unwrap()
+                    .1
+                    .contains("Not available")
+            );
+        }
+        assert_eq!(
+            view.torrent_fields()[0],
+            ("Phase", "Waiting for telemetry".into())
+        );
+        for status in ["Finished", "Failed", "Cancelled"] {
+            view.snapshot.active = false;
+            view.snapshot.status = status.into();
+            view.snapshot.torrent.as_mut().unwrap().phase =
+                ulos_core::torrent::TorrentPhase::Publishing;
+            assert_eq!(view.torrent_fields()[0], ("Phase", status.into()));
+            assert_eq!(view.torrent_fields()[1], ("Peers", "0".into()));
+            assert_eq!(
+                view.torrent_fields()[3],
+                ("No data for", "Not applicable".into())
+            );
+            assert_eq!(
+                view.torrent_summary_fields()[1],
+                ("Download speed", "0 B/s".into())
+            );
+            assert!(view.torrent_summary_fields()[2].1.starts_with("0 B/s"));
+        }
+    }
+
+    #[gpui::test]
+    fn torrent_live_metrics_are_visible_without_expanding_details(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, component::Root};
+        cx.update(gpui_kit::init);
+        let mut content = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|_| torrent_details());
+            content = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let content = content.unwrap();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in [
+            "status-metric-peers",
+            "status-metric-download-speed",
+            "status-metric-upload-speed",
+            "status-metric-trackers",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "missing always-visible {selector}"
+            );
+        }
+        content.read_with(cx, |view, _| {
+            assert!(!view.show_details);
+            assert_eq!(
+                view.torrent_summary_fields()[1],
+                ("Download speed", "2.0 KiB/s".into())
+            );
+            assert!(view.torrent_summary_fields()[2].1.contains("0 B/s"));
+            assert!(view.torrent_summary_fields()[2].1.contains("disabled"));
+        });
+        content.update(cx, |view, cx| {
+            let telemetry = view.snapshot.torrent.as_mut().unwrap();
+            telemetry.peers = 0;
+            telemetry.seen_peers = 0;
+            telemetry.downloaded_bytes = 0;
+            telemetry.download_bytes_per_second = 0;
+            assert_eq!(telemetry.activity_label(), "Searching for peers");
+            assert!(
+                telemetry
+                    .diagnostic()
+                    .unwrap()
+                    .contains("no peer candidates")
+            );
+            telemetry.tracker_count = 0;
+            assert_eq!(telemetry.activity_label(), "No peer discovery");
+            assert!(telemetry.diagnostic().unwrap().contains("No trackers"));
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("status-metric-peers").is_some());
+        content.update(cx, |view, cx| {
+            view.snapshot.paused = true;
+            view.snapshot.torrent.as_mut().unwrap().phase =
+                ulos_core::torrent::TorrentPhase::Paused;
+            assert_eq!(
+                view.torrent_summary_fields()[1],
+                ("Download speed", "0 B/s".into())
+            );
+            view.snapshot.active = false;
+            view.snapshot
+                .torrent
+                .as_mut()
+                .unwrap()
+                .download_bytes_per_second = 4096;
+            assert_eq!(
+                view.torrent_summary_fields()[1],
+                ("Download speed", "0 B/s".into())
+            );
+            cx.notify();
+        });
     }
 
     #[test]

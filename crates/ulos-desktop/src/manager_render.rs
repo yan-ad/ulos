@@ -38,6 +38,8 @@ enum MenuCommand {
     Clear,
     Options,
     Scheduler,
+    About,
+    Updates,
     Details,
     Reveal,
     ToggleSidebar,
@@ -61,6 +63,8 @@ fn manager_menu_item(
             MenuCommand::Clear => view.clear_finished(window, cx),
             MenuCommand::Options => view.open_options(window, cx),
             MenuCommand::Scheduler => view.open_scheduler(window, cx),
+            MenuCommand::About => view.about(window, cx),
+            MenuCommand::Updates => view.check_updates(window, cx, true),
             MenuCommand::Details => view.open_selected_details(window, cx),
             MenuCommand::Reveal => view.reveal_selected(cx),
             MenuCommand::ToggleSidebar => view.toggle_sidebar(cx),
@@ -481,17 +485,21 @@ impl DownloadManager {
                         )
                     }),
             )
-            .child(
-                Button::new("menu-help")
-                    .label("Help")
-                    .dropdown_menu(|menu, _, _| {
-                        menu.label("Add URL: choose a destination to download")
-                            .label("Click a filename to inspect transfer details")
-                            .separator()
-                            .label("Session-only queue; no persistent history")
-                            .label("Remove / clear records never deletes files")
-                    }),
-            )
+            .child(Button::new("menu-help").label("Help").dropdown_menu({
+                let owner = cx.weak_entity();
+                move |menu, _, _| {
+                    menu.item(manager_menu_item(
+                        "About Ulos",
+                        owner.clone(),
+                        MenuCommand::About,
+                    ))
+                    .item(manager_menu_item(
+                        "Check for Updates…",
+                        owner.clone(),
+                        MenuCommand::Updates,
+                    ))
+                }
+            }))
     }
 
     fn render_queue_table(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -58,7 +58,7 @@ impl DownloadManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.removal_open || self.removal_busy || self.options_open {
+        if self.removal_open || self.removal_busy || self.options_open || self.about_open {
             return;
         }
         let ids: Vec<_> = ids

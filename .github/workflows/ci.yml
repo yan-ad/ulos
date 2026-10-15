@@ -7,15 +7,21 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
   engine:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -24,13 +30,14 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
 
   desktop:
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -38,5 +45,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config clang cmake libfontconfig-dev libwayland-dev libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libvulkan1
       - run: cargo check --locked -p ulos-desktop
-      - run: cargo test --locked --workspace
+      - run: cargo test --locked --workspace -- --test-threads=1
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings

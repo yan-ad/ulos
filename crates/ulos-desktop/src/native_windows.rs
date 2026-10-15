@@ -384,7 +384,9 @@ impl Render for StatusWindow {
 #[cfg(test)]
 mod tests {
     use super::{add_options, status_options};
-    use gpui_kit::{TestAppContext, point, px, size};
+    #[cfg(target_os = "macos")]
+    use gpui_kit::point;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui::test]
     fn status_chrome_does_not_change_add_window_options(cx: &mut TestAppContext) {

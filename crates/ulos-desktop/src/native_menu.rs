@@ -37,6 +37,8 @@ gpui_kit::actions!(
         UseLightTheme,
         UseDarkTheme,
         ShowHelp,
+        AboutUlos,
+        CheckForUpdates,
         QuitApplication
     ]
 );
@@ -64,6 +66,8 @@ pub enum Command {
     LightTheme,
     DarkTheme,
     Help,
+    About,
+    Updates,
 }
 
 /// A value snapshot shared by menu construction and dispatch-time validation.
@@ -109,6 +113,7 @@ impl Command {
             | Self::LightTheme
             | Self::DarkTheme
             | Self::Help => true,
+            Self::About | Self::Updates => true,
         }
     }
 }
@@ -125,6 +130,8 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Quit Ulos", QuitApplication),
+            MenuItem::separator(),
+            item("About Ulos", AboutUlos, Command::About, state),
         ]),
         Menu::new("Tasks").items([
             item("Add URL…", NewDownload, Command::Add, state),
@@ -206,7 +213,15 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
             item("Dark Theme", UseDarkTheme, Command::DarkTheme, state)
                 .checked(state.theme_preference == crate::palette::ThemePreference::Dark),
         ]),
-        Menu::new("Help").items([item("Ulos Help", ShowHelp, Command::Help, state)]),
+        Menu::new("Help").items([
+            item("Ulos Help", ShowHelp, Command::Help, state),
+            item(
+                "Check for Updates…",
+                CheckForUpdates,
+                Command::Updates,
+                state,
+            ),
+        ]),
     ]
 }
 
@@ -237,7 +252,10 @@ fn register<A: Action>(
         if !command.enabled(&manager.read(cx).menu_state(cx)) {
             return;
         }
-        let target = if command == Command::Options {
+        let target = if matches!(
+            command,
+            Command::Options | Command::About | Command::Updates
+        ) {
             main
         } else {
             cx.active_window().unwrap_or(main)
@@ -282,6 +300,8 @@ pub fn install(
     register::<UseLightTheme>(cx, &owner, main, Command::LightTheme);
     register::<UseDarkTheme>(cx, &owner, main, Command::DarkTheme);
     register::<ShowHelp>(cx, &owner, main, Command::Help);
+    register::<AboutUlos>(cx, &owner, main, Command::About);
+    register::<CheckForUpdates>(cx, &owner, main, Command::Updates);
     cx.on_action::<QuitApplication>(|_, cx| cx.quit());
     cx.bind_keys([
         KeyBinding::new("secondary-q", QuitApplication, None),

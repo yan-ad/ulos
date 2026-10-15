@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod add_download;
 mod add_torrent;
 mod clipboard;
@@ -18,6 +20,7 @@ mod queue;
 mod scheduler;
 mod scheduler_window;
 mod storage;
+mod updates;
 mod window_chrome;
 
 use gpui_kit::*;
@@ -72,6 +75,7 @@ fn main() {
     });
     app.run(move |cx| {
         init(cx);
+        cx.set_app_identity("org.ulos.desktop", "Ulos");
         palette::init(cx);
         cx.bind_keys([
             KeyBinding::new("secondary-n", manager::AddUrl, Some("DownloadManager")),
@@ -102,6 +106,13 @@ fn main() {
         manager.update(cx, |manager, cx| {
             manager.initialize_history(paths, history, writer, history_error, cx);
             manager.watch_torrent_intake(inbox, intake_error, cx);
+        });
+        let update_owner = manager.downgrade();
+        cx.defer(move |cx| {
+            let _ = main_window.update(cx, |_, window, cx| {
+                let _ =
+                    update_owner.update(cx, |manager, cx| manager.check_updates(window, cx, false));
+            });
         });
         #[cfg(target_os = "macos")]
         {

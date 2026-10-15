@@ -42,7 +42,7 @@ impl DownloadManager {
             cx.notify();
             return;
         }
-        if self.removal_busy || self.options_open || self.removal_open {
+        if self.removal_busy || self.options_open || self.about_open || self.removal_open {
             self.notice = Some("Finish the open dialog before adding a torrent.".into());
             cx.notify();
             return;
@@ -94,7 +94,12 @@ impl DownloadManager {
     }
 
     pub(crate) fn choose_torrent_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.torrent_picker_open || self.removal_busy || self.options_open || self.removal_open {
+        if self.torrent_picker_open
+            || self.removal_busy
+            || self.options_open
+            || self.about_open
+            || self.removal_open
+        {
             return;
         }
         let prompt = cx.prompt_for_paths(PathPromptOptions {
