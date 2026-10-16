@@ -4,7 +4,7 @@ use crate::{
     manager::DownloadManager,
     queue::{DownloadId, SortColumn},
 };
-use gpui_kit::{AppContext, Entity, MouseButton, TestAppContext, VisualTestContext, point, px};
+use gpui_kit::{Entity, MouseButton, TestAppContext, VisualTestContext, point, px};
 use std::time::Instant;
 use ulos_core::tasks::TransferState;
 
@@ -38,7 +38,7 @@ fn queued_pair(
 fn right_click(view: &Entity<DownloadManager>, id: DownloadId, cx: &mut VisualTestContext) {
     draw(cx);
     let bounds = cx
-        .debug_bounds(format!("download-name-{id}"))
+        .debug_bounds(&format!("download-name-{id}"))
         .expect("visible download");
     cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Default::default());
     cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Default::default());
