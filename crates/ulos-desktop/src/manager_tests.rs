@@ -489,7 +489,7 @@ fn manual_save_path_overrides_a_previously_selected_path(cx: &mut TestAppContext
     assert!(!destination.exists());
 }
 
-fn mount<'a>(
+pub(super) fn mount<'a>(
     cx: &'a mut TestAppContext,
     runtime: &tokio::runtime::Runtime,
 ) -> (
@@ -517,7 +517,7 @@ fn add_context(view: &Entity<DownloadManager>, cx: &VisualTestContext) -> Visual
     VisualTestContext::from_window(handle, &cx.cx)
 }
 
-fn draw(cx: &mut VisualTestContext) {
+pub(super) fn draw(cx: &mut VisualTestContext) {
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
 }

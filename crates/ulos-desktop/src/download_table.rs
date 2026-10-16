@@ -10,6 +10,7 @@ use gpui_kit::{
         h_flex,
         label::Label,
         link::Link,
+        menu::PopupMenu,
         table::{Column, ColumnSort, TableDelegate, TableState},
     },
     *,
@@ -117,6 +118,24 @@ impl DownloadRow {
 }
 
 impl TableDelegate for DownloadTable {
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let Some(id) = self.rows.get(row_ix).map(|row| row.id) else {
+            return menu;
+        };
+        let Some(owner) = self.owner.upgrade() else {
+            return menu;
+        };
+        owner
+            .read(cx)
+            .row_context_menu(id, menu, window, self.owner.clone())
+    }
+
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len()
     }

@@ -26,7 +26,7 @@ fn toolbar_button(id: &'static str, label: &str, icon: AssetIcon) -> Button {
         .tooltip(label)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Clone, Copy)]
 enum MenuCommand {
     Add,
@@ -47,7 +47,7 @@ enum MenuCommand {
     Filter(Filter),
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn manager_menu_item(
     label: &'static str,
     manager: WeakEntity<DownloadManager>,
@@ -76,7 +76,11 @@ fn manager_menu_item(
 }
 
 impl DownloadManager {
-    fn theme_selector(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn theme_selector(
+        &self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         use crate::palette::{self, ThemePreference};
         let selected = palette::preference(cx);
         let icon = match selected {
@@ -178,7 +182,7 @@ impl DownloadManager {
             .child(sidebar)
     }
 
-    fn render_queue_toolbar(&self, cx: &mut Context<Self>) -> Toolbar {
+    pub(super) fn render_queue_toolbar(&self, cx: &mut Context<Self>) -> Toolbar {
         let selected_active = self
             .queue
             .items
@@ -287,18 +291,20 @@ impl DownloadManager {
             )
             .content(self.theme_selector("theme-selector", cx))
             .content(div().flex_1().min_w(px(8.)))
-            .content(
-                div()
-                    .id("download-search")
-                    .debug_selector(|| "download-search".into())
-                    .w(px(240.))
-                    .min_w(px(160.))
-                    .flex_shrink_1()
-                    .child(Input::new(&self.search).prefix(Icon::new(AssetIcon::Search))),
-            )
+            .content(self.render_toolbar_search())
     }
 
-    #[cfg(not(target_os = "macos"))]
+    pub(super) fn render_toolbar_search(&self) -> impl IntoElement {
+        div()
+            .id("download-search")
+            .debug_selector(|| "download-search".into())
+            .w(px(240.))
+            .min_w(px(160.))
+            .flex_shrink_1()
+            .child(Input::new(&self.search).prefix(Icon::new(AssetIcon::Search)))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn render_menu_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // AppMenuBar reads global native menus and needs a persistent Entity. These
         // Kit dropdowns keep the manager-local commands scoped to this window.
@@ -580,18 +586,23 @@ impl Render for DownloadManager {
             .any(|item| item.speed_bytes_per_second().is_some())
             .then(|| self.queue.total_speed());
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let menubar = Some(self.render_menu_strip(cx).into_any_element());
         #[cfg(target_os = "macos")]
         let menubar: Option<AnyElement> = None;
+        #[cfg(target_os = "windows")]
+        let menubar = Some(self.render_windows_header(cx).into_any_element());
         #[cfg(target_os = "macos")]
         let toolbar = gpui_kit::component::TitleBar::new()
             .h(px(48.))
             .bg(cx.theme().background)
             .child(self.render_queue_toolbar(cx).flex_1().min_w_0())
             .into_any_element();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let toolbar = self.render_queue_toolbar(cx).into_any_element();
+
+        #[cfg(target_os = "windows")]
+        let toolbar = self.render_windows_command_toolbar(cx).into_any_element();
 
         div()
             .id("manager-shell")

@@ -76,6 +76,8 @@ pub struct DownloadManager {
     update_checking: bool,
     _update_check: Option<Task<()>>,
     sidebar_collapsed: bool,
+    #[cfg(any(target_os = "windows", test))]
+    windows_command_tab: windows_header::CommandTab,
     main_window: AnyWindowHandle,
     paths: Option<PlatformPaths>,
     history: Option<HistoryWriter>,
@@ -252,6 +254,8 @@ impl DownloadManager {
             update_checking: false,
             _update_check: None,
             sidebar_collapsed: false,
+            #[cfg(any(target_os = "windows", test))]
+            windows_command_tab: windows_header::CommandTab::Tasks,
             main_window: window.window_handle(),
             paths: None,
             history: None,
@@ -1369,6 +1373,8 @@ mod application;
 mod history;
 #[path = "manager_render.rs"]
 mod rendering;
+#[path = "manager_row_menu.rs"]
+mod row_menu;
 #[path = "manager_scheduler.rs"]
 mod scheduling;
 #[path = "manager_torrent.rs"]
@@ -1383,3 +1389,7 @@ mod tests;
 #[cfg(test)]
 #[path = "manager_torrent_tests.rs"]
 mod torrent_tests;
+
+#[cfg(any(target_os = "windows", test))]
+#[path = "manager_windows_header.rs"]
+mod windows_header;
