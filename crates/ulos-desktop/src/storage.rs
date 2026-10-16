@@ -86,13 +86,12 @@ fn encode_path(path: &Path) -> Vec<u8> {
 #[cfg(windows)]
 fn decode_path(bytes: Vec<u8>) -> Result<PathBuf, String> {
     use std::os::windows::ffi::OsStringExt;
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err("History contains an invalid native path.".into());
     }
-    let wide: Vec<_> = bytes
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect();
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    let wide: Vec<_> = pairs.iter().map(|b| u16::from_le_bytes(*b)).collect();
     Ok(std::ffi::OsString::from_wide(&wide).into())
 }
 

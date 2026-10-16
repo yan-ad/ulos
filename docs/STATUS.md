@@ -217,3 +217,8 @@ These results supersede the earlier desktop failures, formatting differences and
 ### Windows desktop fixture portability follow-up (2026-10-15)
 
 - Replacement CI run `38747062959` passed Windows engine/torrent tests, including exclusive directory publication, but Windows desktop test failures remained in three portability assumptions: Add Download compared `/` strings rather than native `PathBuf`s, and intake fixtures used driveless Unix `file:///tmp/...` URLs on Windows. Production parsing correctly requires Windows drive-bearing file URLs; fixtures now construct `file://` values from native paths and explicitly test `--` for leading-dash filenames. These are fixture corrections, not relaxed path validation. Local focused intake/Add tests and workspace clippy pass. Candidate rerun required before tagging.
+
+### Final Windows/Rust 1.99 fixture fixes (2026-10-15)
+
+- Run `38833569311` reached the Windows desktop suite after the engine/publication fixes. Three remaining failures were fixture assumptions, not production behavior: Add Download compared Unix `/` strings instead of native PathBufs, and intake tests used Unix driveless `file:///tmp` URLs on Windows. Tests now create native temporary directories, construct file URLs with `Url::from_file_path`, test Windows drive URLs explicitly, and reserve leading-dash filenames for the `--` argument terminator.
+- Rust 1.99 strict clippy also rejected a nested Windows-only test item and two storage byte-parser idioms. The test is module-scoped; Windows path decoding uses `is_multiple_of` and `as_chunks::<2>()`. Local focused tests and workspace clippy pass; replacement CI is required before release tagging.
