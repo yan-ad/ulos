@@ -36,9 +36,10 @@ fn queued_pair(
 }
 
 fn right_click(view: &Entity<DownloadManager>, id: DownloadId, cx: &mut VisualTestContext) {
+    assert_eq!(id, 2, "fixture target");
     draw(cx);
     let bounds = cx
-        .debug_bounds(&format!("download-name-{id}"))
+        .debug_bounds("download-name-2")
         .expect("visible download");
     cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Default::default());
     cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Default::default());
@@ -198,6 +199,15 @@ fn row_menu_rechecks_active_pause_retry_and_source_less_history(cx: &mut TestApp
                 view.run_row_command(second, command, window, cx);
             }
             assert!(view.queue.item(first).is_some() && view.queue.selected.contains(&first));
+            let history = view.queue.history_records();
+            view.queue = crate::queue::SessionQueue::default();
+            view.queue.restore_history(history).unwrap();
+            assert!(!view.queue.item(first).unwrap().has_source());
+            assert!(!view.row_command_enabled(first, RowCommand::Start));
+            assert!(!view.row_command_enabled(first, RowCommand::Retry));
+            view.run_row_command(first, RowCommand::Start, window, cx);
+            view.run_row_command(first, RowCommand::Retry, window, cx);
+            assert!(view.active.is_none());
         })
     });
 }
