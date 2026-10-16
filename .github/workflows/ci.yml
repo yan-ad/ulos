@@ -45,5 +45,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config clang cmake libfontconfig-dev libwayland-dev libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libvulkan1
       - run: cargo check --locked -p ulos-desktop
-      - run: cargo test --locked --workspace -- --test-threads=1
+      - name: Compile desktop adapter tests
+        timeout-minutes: 15
+        run: cargo test --locked --workspace --no-run
+      - name: Test desktop adapters (bounded; not native rendering evidence)
+        timeout-minutes: 5
+        run: cargo test --locked --workspace -- --test-threads=1
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings

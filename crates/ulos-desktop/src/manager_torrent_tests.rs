@@ -20,12 +20,33 @@ use crate::{
     queue::{Category, Filter},
 };
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("test runtime")
+struct TestRuntime(Option<tokio::runtime::Runtime>);
+
+impl std::ops::Deref for TestRuntime {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl Drop for TestRuntime {
+    fn drop(&mut self) {
+        // GPUI's context may still retain the manager on assertion unwind. A
+        // blocking torrent worker must not turn a failed fixture into a CI hang.
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_timeout(Duration::from_secs(3));
+        }
+    }
+}
+
+fn runtime() -> TestRuntime {
+    TestRuntime(Some(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime"),
+    ))
 }
 
 #[gpui::test]
@@ -395,11 +416,11 @@ fn mixed_fifo_retains_torrent_slot_through_pause_and_cancellation(cx: &mut TestA
     });
     poll(cx, |cx| {
         view.read_with(cx, |view, _| {
-            view.queue
-                .item(torrent)
-                .unwrap()
-                .torrent_telemetry
-                .is_some()
+            let item = view.queue.item(torrent).unwrap();
+            matches!(item.state, Some(TransferState::Downloading(_)))
+                && item.torrent_telemetry.as_ref().is_some_and(|telemetry| {
+                    telemetry.phase == ulos_core::torrent::TorrentPhase::Downloading
+                })
         })
     });
     view.update(cx, |view, cx| view.toggle_pause(torrent, cx));
