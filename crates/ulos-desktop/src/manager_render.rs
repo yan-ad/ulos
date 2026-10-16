@@ -221,7 +221,7 @@ impl DownloadManager {
                         move |menu, _, _| {
                             let http = owner.clone();
                             let torrent = owner.clone();
-                            menu.item(PopupMenuItem::new("HTTP / HTTPS URL…").on_click(
+                            menu.item(PopupMenuItem::new("URL or magnet link…").on_click(
                                 move |_, window, cx| {
                                     let _ = http.update(cx, |view, cx| view.open_add(window, cx));
                                 },

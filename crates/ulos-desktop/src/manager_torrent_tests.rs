@@ -29,6 +29,238 @@ impl std::ops::Deref for TestRuntime {
     }
 }
 
+#[gpui::test]
+fn add_address_start_button_hands_ownership_to_status_after_main_close(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (root, view, cx) = mount(cx, &runtime);
+    let (_form, review, mut child) = magnet_add(&view, cx);
+    child.update(|window, cx| {
+        review.update(cx, |review, cx| {
+            review.review_resolved_fixture(
+                ulos_core::torrent::parse(metainfo(b"file.bin")).unwrap(),
+                window,
+                cx,
+            )
+        })
+    });
+    destination(&review, &directory.path().join("file.bin"), &mut child);
+    cx.update(|window, _| window.remove_window());
+    drop(root);
+    draw(&mut child);
+    let start = child.debug_bounds("start-torrent").unwrap();
+    child.simulate_click(start.center(), gpui_kit::Modifiers::default());
+    child.run_until_parked();
+    let (id, handle) = view.read_with(&child, |view, _| {
+        assert_eq!(view.queue.items.len(), 1);
+        let id = view.queue.items[0].id;
+        assert!(view.add_windows.is_empty());
+        assert!(view.detail_windows.contains_key(&id));
+        (id, view.detail_windows[&id].handle)
+    });
+    let mut status = VisualTestContext::from_window(handle, &child.cx);
+    view.update(&mut status, |view, cx| view.cancel_id(id, cx));
+    poll(&mut status, |cx| {
+        view.read_with(cx, |view, _| view.active.is_none())
+    });
+    assert!(!directory.path().join("file.bin").exists());
+}
+
+const MAGNET: &str = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+
+fn magnet_add(
+    view: &Entity<DownloadManager>,
+    cx: &mut VisualTestContext,
+) -> (
+    Entity<crate::add_download::AddDownload>,
+    Entity<AddTorrent>,
+    VisualTestContext,
+) {
+    cx.update(|window, cx| view.update(cx, |view, cx| view.open_add(window, cx)));
+    let (form, mut child) = view.read_with(cx, |view, _| {
+        let child = view.add_windows.values().next().unwrap();
+        (
+            child.upgrade().unwrap(),
+            VisualTestContext::from_window(child.handle, &cx.cx),
+        )
+    });
+    child.update(|window, cx| form.update(cx, |form, cx| form.prefill(MAGNET.into(), window, cx)));
+    draw(&mut child);
+    let review = form.read_with(&child, |form, _| form.magnet_review.clone());
+    (form, review, child)
+}
+
+#[gpui::test]
+fn add_address_magnets_are_explicit_and_cancel_closes_the_native_root(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (form, review, mut child) = magnet_add(&view, cx);
+    assert!(child.debug_bounds("resolve-magnet").is_some());
+    assert!(
+        child.debug_bounds("choose-torrent").is_none(),
+        "one address, no hidden file substitution"
+    );
+    child.update(|window, cx| {
+        form.update(cx, |form, cx| {
+            form.source.update(cx, |input, cx| input.focus(window, cx));
+            form.submit(true, cx);
+            form.submit(false, cx);
+        })
+    });
+    child.simulate_keystrokes("enter");
+    draw(&mut child);
+    review.read_with(&child, |review, cx| {
+        assert!(review.source.is_none() && !review.can_submit(cx));
+        assert_eq!(review.options.collision, CollisionPolicy::Reject);
+        assert_eq!(
+            review.options.settings,
+            ulos_core::torrent::TorrentSettings::default()
+        );
+    });
+    view.read_with(&child, |view, _| {
+        assert!(view.queue.items.is_empty() && view.active.is_none())
+    });
+    child.update(|_, cx| review.update(cx, |review, cx| review.dismiss(cx)));
+    draw(cx);
+    view.read_with(cx, |view, _| assert!(view.add_windows.is_empty()));
+}
+
+#[gpui::test]
+fn add_address_review_routes_later_and_rejects_stale_native_intents(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let source = ulos_core::torrent::parse(metainfo(b"file.bin")).unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (form, review, mut child) = magnet_add(&view, cx);
+    child.update(|window, cx| {
+        review.update(cx, |review, cx| {
+            review.review_resolved_fixture(source.clone(), window, cx)
+        })
+    });
+    destination(&review, &directory.path().join("file.bin"), &mut child);
+    let request = review.read_with(&child, |review, _| TorrentRequest {
+        source,
+        destination: directory.path().join("file.bin"),
+        start_now: false,
+        options: review.options.clone(),
+    });
+    form.read_with(&child, |form, cx| {
+        assert!(form.accepts_torrent_request(&request, cx))
+    });
+    let mut forged = TorrentRequest {
+        source: request.source.clone(),
+        destination: request.destination.clone(),
+        start_now: false,
+        options: request.options.clone(),
+    };
+    forged.options.settings.allow_upload = true;
+    form.read_with(&child, |form, cx| {
+        assert!(!form.accepts_torrent_request(&forged, cx))
+    });
+    child.update(|window, cx| {
+        form.read(cx).source.clone().update(cx, |input, cx| {
+            input.set_value("magnet:?xt=urn:btih:bad", window, cx)
+        });
+        // Intentionally do not deliver Change: parent must read the live input.
+        form.read(cx).magnet_review.clone().update(cx, |_, cx| {
+            cx.emit(TorrentRequest {
+                source: request.source.clone(),
+                destination: request.destination.clone(),
+                start_now: false,
+                options: request.options.clone(),
+            })
+        });
+    });
+    draw(&mut child);
+    view.read_with(&child, |view, _| {
+        assert!(view.queue.items.is_empty() && view.add_windows.len() == 1)
+    });
+    child.update(|window, cx| {
+        form.read(cx)
+            .source
+            .clone()
+            .update(cx, |input, cx| input.set_value(MAGNET, window, cx))
+    });
+    child.update(|_, cx| review.update(cx, |review, cx| review.submit(false, cx)));
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.queue.items.len(), 1);
+        assert!(view.queue.items[0].is_torrent && view.queue.items[0].is_queued());
+        assert!(view.active.is_none() && view.detail_windows.is_empty());
+        assert!(view.add_windows.is_empty());
+    });
+    assert!(!directory.path().join("file.bin").exists());
+}
+
+#[gpui::test]
+fn embedded_picker_guards_close_and_http_draft_survives_mode_switch(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (form, review, mut child) = magnet_add(&view, cx);
+    child.update(|window, cx| {
+        review.update(cx, |review, cx| {
+            review.review_resolved_fixture(
+                ulos_core::torrent::parse(metainfo(b"file.bin")).unwrap(),
+                window,
+                cx,
+            )
+        })
+    });
+    destination(&review, &directory.path().join("file.bin"), &mut child);
+    child
+        .update(|window, cx| review.update(cx, |review, cx| review.choose_destination(window, cx)));
+    assert!(!child.simulate_close());
+    child.update(|window, cx| {
+        form.update(cx, |form, cx| {
+            form.prefill("https://example.org/ignored".into(), window, cx);
+            assert!(form.is_magnet(cx));
+            form.submit(false, cx);
+            cx.emit(crate::add_download::DismissAdd);
+        })
+    });
+    draw(&mut child);
+    view.read_with(&child, |view, _| {
+        assert!(view.queue.items.is_empty() && view.add_windows.len() == 1)
+    });
+    child.simulate_path_prompt_response(|_| None);
+    draw(&mut child);
+    let manual = directory.path().join("manual.zip");
+    child.update(|window, cx| {
+        form.update(cx, |form, cx| {
+            form.prefill("https://example.org/file.zip".into(), window, cx);
+            form.destination.update(cx, |input, cx| {
+                input.set_value(manual.to_str().unwrap(), window, cx);
+                cx.emit(InputEvent::Change);
+            });
+        })
+    });
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
+    });
+    child.update(|window, cx| form.update(cx, |form, cx| form.prefill(MAGNET.into(), window, cx)));
+    review.read_with(&child, |review, _| assert!(review.source.is_none()));
+    child.update(|window, cx| {
+        form.update(cx, |form, cx| {
+            form.prefill("https://example.org/other.zip".into(), window, cx)
+        })
+    });
+    poll(&mut child, |cx| {
+        form.read_with(cx, |form, cx| form.can_submit(cx))
+    });
+    form.read_with(&child, |form, cx| {
+        assert_eq!(
+            PathBuf::from(form.destination.read(cx).value().as_ref()),
+            manual
+        )
+    });
+    assert!(child.simulate_close());
+    child.update(|window, _| window.remove_window());
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.add_windows.is_empty() && view.queue.items.is_empty())
+    });
+}
 impl Drop for TestRuntime {
     fn drop(&mut self) {
         // GPUI's context may still retain the manager on assertion unwind. A

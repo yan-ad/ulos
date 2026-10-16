@@ -37,8 +37,15 @@ impl NativeTorrentWindow {
         let content = cx.new(|cx| AddTorrent::new(path, directory, runtime, window, cx));
         let weak = content.downgrade();
         window.on_window_should_close(cx, move |_, cx| {
-            weak.upgrade()
-                .is_none_or(|view| !view.read(cx).choosing_path)
+            weak.upgrade().is_none_or(|view| {
+                view.update(cx, |view, _| {
+                    if view.choosing_path {
+                        return false;
+                    }
+                    view.cancel_pending();
+                    true
+                })
+            })
         });
         let submit = cx.subscribe_in(
             &content,
@@ -52,6 +59,7 @@ impl NativeTorrentWindow {
                     .update(cx, |owner, cx| owner.enqueue_torrent(request, cx));
                 match result {
                     Ok(id) => {
+                        view.content.update(cx, |form, _| form.cancel_pending());
                         window.remove_window();
                         if request.start_now {
                             view._owner
@@ -67,6 +75,7 @@ impl NativeTorrentWindow {
             window,
             |view, _, _: &DismissTorrent, window, cx| {
                 if !view.content.read(cx).choosing_path {
+                    view.content.update(cx, |form, _| form.cancel_pending());
                     window.remove_window();
                 }
             },
@@ -203,11 +212,11 @@ impl NativeAddWindow {
         let weak_content = content.downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             weak_content.upgrade().is_none_or(|form| {
-                form.update(cx, |form, _| {
-                    if form.choosing_path {
+                form.update(cx, |form, cx| {
+                    if form.picker_active(cx) {
                         return false;
                     }
-                    form.invalidate_preview();
+                    form.cancel_pending(cx);
                     true
                 })
             })
@@ -246,7 +255,7 @@ impl NativeAddWindow {
                 });
                 match result {
                     Ok(id) => {
-                        view.content.update(cx, |form, _| form.invalidate_preview());
+                        view.content.update(cx, |form, cx| form.cancel_pending(cx));
                         window.remove_window();
                         if request.start_now {
                             view._owner
@@ -258,15 +267,55 @@ impl NativeAddWindow {
             },
         );
         let dismiss = cx.subscribe_in(&content, window, |view, _, _: &DismissAdd, window, cx| {
-            if !view.content.read(cx).choosing_path {
-                view.content.update(cx, |form, _| form.invalidate_preview());
+            if !view.content.read(cx).picker_active(cx) {
+                view.content.update(cx, |form, cx| form.cancel_pending(cx));
                 window.remove_window();
             }
         });
+        let review = content.read(cx).magnet_review.clone();
+        let torrent_submit = cx.subscribe_in(
+            &review,
+            window,
+            |view, _, request: &TorrentRequest, window, cx| {
+                if !view.content.read(cx).accepts_torrent_request(request, cx) {
+                    return;
+                }
+                let result = view
+                    ._owner
+                    .update(cx, |owner, cx| owner.enqueue_torrent(request, cx));
+                match result {
+                    Ok(id) => {
+                        view.content.update(cx, |form, cx| form.cancel_pending(cx));
+                        window.remove_window();
+                        if request.start_now {
+                            view._owner
+                                .update(cx, |owner, cx| owner.open_details(id, window, cx));
+                        }
+                    }
+                    Err(error) => window.push_notification(error, cx),
+                }
+            },
+        );
+        let torrent_dismiss = cx.subscribe_in(
+            &review,
+            window,
+            |view, _, _: &DismissTorrent, window, cx| {
+                if !view.content.read(cx).picker_active(cx) {
+                    view.content.update(cx, |form, cx| form.cancel_pending(cx));
+                    window.remove_window();
+                }
+            },
+        );
         Self {
             content,
             _owner: owner,
-            _subscriptions: vec![submit, dismiss, crate::palette::observe_window(window, cx)],
+            _subscriptions: vec![
+                submit,
+                dismiss,
+                torrent_submit,
+                torrent_dismiss,
+                crate::palette::observe_window(window, cx),
+            ],
         }
     }
 }

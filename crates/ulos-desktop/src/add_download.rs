@@ -3,6 +3,8 @@ use std::{
     time::Duration,
 };
 
+use crate::add_torrent::{AddTorrent, TorrentRequest};
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     component::{
@@ -84,6 +86,7 @@ pub struct DismissAdd;
 
 pub struct AddDownload {
     pub source: Entity<InputState>,
+    pub(crate) magnet_review: Entity<AddTorrent>,
     pub destination: Entity<InputState>,
     pub choosing_path: bool,
     pub(crate) options: TransferOptions,
@@ -108,6 +111,42 @@ impl EventEmitter<AddRequest> for AddDownload {}
 impl EventEmitter<DismissAdd> for AddDownload {}
 
 impl AddDownload {
+    pub(crate) fn is_magnet(&self, cx: &App) -> bool {
+        // Keep even malformed magnet addresses in torrent mode. Parsing the
+        // complete URI here would accidentally send invalid magnets to HTTP.
+        self.source
+            .read(cx)
+            .value()
+            .trim()
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("magnet"))
+    }
+
+    pub(crate) fn picker_active(&self, cx: &App) -> bool {
+        self.choosing_path || self.magnet_review.read(cx).choosing_path
+    }
+
+    pub(crate) fn accepts_torrent_request(&self, request: &TorrentRequest, cx: &App) -> bool {
+        self.is_magnet(cx)
+            && !self.choosing_path
+            && self
+                .magnet_review
+                .read(cx)
+                .matches_magnet_address(self.source.read(cx).value().trim(), cx)
+            && self.magnet_review.read(cx).matches_request(request, cx)
+    }
+
+    fn sync_magnet_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let address = if self.is_magnet(cx) {
+            self.source.read(cx).value().trim().to_owned()
+        } else {
+            String::new()
+        };
+        self.magnet_review.update(cx, |review, cx| {
+            review.set_magnet_address(address, window, cx)
+        });
+    }
+
     fn category(&self, cx: &App) -> crate::queue::Category {
         let path = self.destination_path(cx).unwrap_or_else(|| {
             PathBuf::from(suggest_filename(self.source.read(cx).value().trim()).unwrap_or_default())
@@ -131,6 +170,9 @@ impl AddDownload {
     }
 
     fn check_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_magnet(cx) {
+            return;
+        }
         self.overwrite_confirmed = false;
         self.options.collision = CollisionPolicy::Reject;
         self.target_generation = self.target_generation.wrapping_add(1);
@@ -169,6 +211,9 @@ impl AddDownload {
 
     fn schedule_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.invalidate_preview();
+        if self.is_magnet(cx) {
+            return;
+        }
         if suggest_filename(self.source.read(cx).value().trim()).is_err() {
             return;
         }
@@ -187,21 +232,40 @@ impl AddDownload {
         cx: &mut Context<Self>,
     ) -> Self {
         let source =
-            cx.new(|cx| InputState::new(window, cx).placeholder("https://example.org/file.zip"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://… or magnet:?xt=…"));
+        let magnet_review = cx.new(|cx| {
+            AddTorrent::embedded(
+                source.clone(),
+                default_directory.clone(),
+                runtime.clone(),
+                window,
+                cx,
+            )
+        });
         let destination =
             cx.new(|cx| InputState::new(window, cx).placeholder("Full destination path"));
         let source_sub = cx.subscribe_in(&source, window, |view, _, event, window, cx| {
             if matches!(event, InputEvent::Change) {
-                view.detect_name(window, cx);
-                view.schedule_preview(window, cx);
-                view.check_target(window, cx);
+                view.invalidate_preview();
+                view.sync_magnet_address(window, cx);
+                if view.is_magnet(cx) {
+                    // Invalidate an outstanding HTTP target check without
+                    // touching the user's HTTP destination draft.
+                    view.target_generation = view.target_generation.wrapping_add(1);
+                    view._target_task = None;
+                } else {
+                    view.detect_name(window, cx);
+                    view.schedule_preview(window, cx);
+                    view.check_target(window, cx);
+                }
             }
             if matches!(event, InputEvent::PressEnter { .. }) {
                 view.submit_from_input(window, cx);
             }
             cx.notify();
         });
-        let mut subscriptions = vec![source_sub];
+        let review_observer = cx.observe_in(&magnet_review, window, |_, _, _, cx| cx.notify());
+        let mut subscriptions = vec![source_sub, review_observer];
         subscriptions.push(
             cx.subscribe_in(&destination, window, |view, _, event, window, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -217,6 +281,7 @@ impl AddDownload {
         );
         Self {
             source,
+            magnet_review,
             destination,
             choosing_path: false,
             options: TransferOptions {
@@ -324,14 +389,26 @@ impl AddDownload {
     }
 
     pub fn prefill(&mut self, source: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker_active(cx) {
+            return;
+        }
         self.invalidate_preview();
         self.source
             .update(cx, |input, cx| input.set_value(source, window, cx));
-        self.detect_name(window, cx);
-        self.check_target(window, cx);
+        self.sync_magnet_address(window, cx);
+        if self.is_magnet(cx) {
+            self.target_generation = self.target_generation.wrapping_add(1);
+            self._target_task = None;
+        } else {
+            self.detect_name(window, cx);
+            self.check_target(window, cx);
+        }
     }
 
     fn detect_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_magnet(cx) {
+            return;
+        }
         let source = self.source.read(cx).value();
         let Ok(name) = suggest_filename(source.trim()) else {
             return;
@@ -360,7 +437,19 @@ impl AddDownload {
         self.preview = PreviewState::NotRequested;
     }
 
+    /// Cancel both kinds of work when the owning native window is dismissed.
+    pub(crate) fn cancel_pending(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_preview();
+        self.target_generation = self.target_generation.wrapping_add(1);
+        self._target_task = None;
+        self.magnet_review
+            .update(cx, |review, _| review.cancel_pending());
+    }
+
     pub(crate) fn refresh_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_magnet(cx) {
+            return;
+        }
         let source = self.source.read(cx).value().trim().to_owned();
         if suggest_filename(&source).is_err() {
             return;
@@ -405,7 +494,7 @@ impl AddDownload {
     }
 
     pub fn can_submit(&self, cx: &App) -> bool {
-        self.submission_issue(cx).is_none()
+        !self.is_magnet(cx) && !self.picker_active(cx) && self.submission_issue(cx).is_none()
     }
 
     fn submission_issue(&self, cx: &App) -> Option<&'static str> {
@@ -454,6 +543,14 @@ impl AddDownload {
     }
 
     fn submit_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_magnet(cx) {
+            if !self.picker_active(cx) {
+                self.sync_magnet_address(window, cx);
+                self.magnet_review
+                    .update(cx, |review, cx| review.submit_from_address(window, cx));
+            }
+            return;
+        }
         self.submit(true, cx);
         if !self.can_submit(cx) && !self.choosing_path {
             if suggest_filename(self.source.read(cx).value().trim()).is_err() {
@@ -466,6 +563,18 @@ impl AddDownload {
     }
 
     pub fn submit(&mut self, start_now: bool, cx: &mut Context<Self>) {
+        if self.is_magnet(cx) {
+            if !self.picker_active(cx)
+                && self
+                    .magnet_review
+                    .read(cx)
+                    .matches_magnet_address(self.source.read(cx).value().trim(), cx)
+            {
+                self.magnet_review
+                    .update(cx, |review, cx| review.submit(start_now, cx));
+            }
+            return;
+        }
         if !self.can_submit(cx) {
             self.validation_requested = true;
             cx.notify();
@@ -483,7 +592,7 @@ impl AddDownload {
     }
 
     pub fn choose_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.choosing_path {
+        if self.is_magnet(cx) || self.picker_active(cx) {
             return;
         }
         self.detect_name(window, cx);
@@ -536,6 +645,26 @@ impl AddDownload {
 
 impl Render for AddDownload {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.is_magnet(cx) && !self.choosing_path {
+            return v_flex()
+                .size_full()
+                .child(
+                    v_flex().p_4().pb_0().child(
+                        Form::new().child(
+                            Field::new()
+                                .label("Address")
+                                .child(Input::new(&self.source).disabled(self.picker_active(cx))),
+                        ),
+                    ),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.magnet_review.clone()),
+                )
+                .into_any_element();
+        }
         v_flex()
             .size_full()
             .p_4()
@@ -684,6 +813,7 @@ impl Render for AddDownload {
                             .on_click(cx.listener(|view, _, _, cx| view.submit(true, cx))),
                     ),
             )
+            .into_any_element()
     }
 }
 
@@ -722,6 +852,35 @@ mod tests {
         net::{TcpListener, TcpStream},
     };
     use ulos_core::transfer::CollisionPolicy;
+
+    #[gpui::test]
+    fn malformed_magnet_modes_never_schedule_http_preview(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.update(gpui_kit::init);
+        let mut form = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| AddDownload::new(None, runtime.handle().clone(), window, cx));
+            form = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let form = form.unwrap();
+        for address in ["magnet:", " MaGnEt:?xt=bad ", "magnet:?xt=urn:btih:bad"] {
+            cx.update(|window, cx| {
+                form.update(cx, |view, cx| {
+                    view.prefill(address.into(), window, cx);
+                    assert!(view.is_magnet(cx));
+                    view.schedule_preview(window, cx);
+                    view.refresh_preview(window, cx);
+                    view.submit_from_input(window, cx);
+                    assert!(view.preview_worker.is_none());
+                    assert!(view._preview_debounce.is_none());
+                    assert_eq!(view.preview, super::PreviewState::NotRequested);
+                    assert!(!view.can_submit(cx));
+                })
+            });
+            cx.run_until_parked();
+        }
+    }
 
     #[gpui::test]
     fn enter_validates_fields_then_starts_a_complete_form(cx: &mut TestAppContext) {

@@ -71,6 +71,8 @@ impl Drop for Worker {
 }
 
 pub struct AddTorrent {
+    embedded: bool,
+    embedded_address: Option<Entity<InputState>>,
     pub source: Option<TorrentSource>,
     pub destination: Entity<InputState>,
     pub magnet: Entity<InputState>,
@@ -164,6 +166,8 @@ impl AddTorrent {
             );
         }
         let mut view = Self {
+            embedded: false,
+            embedded_address: None,
             available_native: ulos_core::torrent::native_worker_available(),
             download_rate,
             upload_rate,
@@ -199,9 +203,90 @@ impl AddTorrent {
         view
     }
 
+    pub(crate) fn embedded(
+        address: Entity<InputState>,
+        default_directory: Option<PathBuf>,
+        runtime: tokio::runtime::Handle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::new(None, default_directory, runtime, window, cx);
+        view.embedded = true;
+        view.embedded_address = Some(address);
+        view
+    }
+
+    pub(crate) fn set_magnet_address(
+        &mut self,
+        address: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.magnet.read(cx).value().as_ref() == address {
+            return;
+        }
+        self.cancel_pending();
+        self.source = None;
+        self.source_filename = None;
+        self.source_error = None;
+        self.resolved_magnet = None;
+        self.resolution_dht = false;
+        self.validation_requested = false;
+        self.reset_settings(window, cx);
+        self.magnet
+            .update(cx, |input, cx| input.set_value(address, window, cx));
+        cx.notify();
+    }
+
+    pub(crate) fn matches_magnet_address(&self, address: &str, cx: &App) -> bool {
+        self.resolved_magnet.as_deref() == Some(address)
+            && self.magnet.read(cx).value().as_ref() == address
+            && self
+                .embedded_address
+                .as_ref()
+                .is_none_or(|input| input.read(cx).value().trim() == address)
+    }
+
+    pub(crate) fn cancel_pending(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.loader = None;
+        self._load_task = None;
+        self.loading = false;
+        self.invalidate_target();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_resolved_fixture(
+        &mut self,
+        source: TorrentSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // UI fixture provenance only; resolver/hash verification is tested in core.
+        self.resolved_magnet = Some(self.magnet.read(cx).value().to_string());
+        self.source = Some(source);
+        self.suggest_destination(window, cx);
+        self.check_target(window, cx);
+    }
+
+    pub(crate) fn submit_from_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.source.is_some() {
+            self.submit(true, cx);
+        } else {
+            self.validation_requested = true;
+            self.source_error =
+                Some("Choose Resolve magnet to review metadata before starting a download.".into());
+            cx.notify();
+        }
+        if self.source.is_some() && self.destination_path(cx).is_none() {
+            self.destination
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
     /// Replace the draft, invalidating both old metadata and any conflict choice.
     pub fn set_source_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.choosing_path {
+        if self.embedded || self.choosing_path {
             return;
         }
         self.generation = self.generation.wrapping_add(1);
@@ -252,6 +337,13 @@ impl AddTorrent {
                 if view.generation != generation {
                     return;
                 }
+                if let Some(address) = &view.embedded_address {
+                    let address = address.read(cx).value().trim().to_owned();
+                    if view.magnet.read(cx).value().as_ref() != address {
+                        view.set_magnet_address(address, window, cx);
+                        return;
+                    }
+                }
                 view.loading = false;
                 view.loader = None;
                 match result {
@@ -295,6 +387,10 @@ impl AddTorrent {
     pub fn resolve_magnet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.choosing_path || self.loading {
             return;
+        }
+        if let Some(address) = &self.embedded_address {
+            let address = address.read(cx).value().trim().to_owned();
+            self.set_magnet_address(address, window, cx);
         }
         if !self.valid_magnet(cx) {
             self.source_error =
@@ -409,7 +505,7 @@ impl AddTorrent {
         self.choose_path(true, window, cx);
     }
     fn choose_path(&mut self, directory: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.choosing_path {
+        if self.choosing_path || (self.embedded && (!directory || self.source.is_none())) {
             return;
         }
         let prompt = cx.prompt_for_paths(PathPromptOptions {
@@ -498,6 +594,10 @@ impl AddTorrent {
         if self.source.is_none() {
             return Some("Choose a valid .torrent file or explicitly resolve a magnet.");
         }
+        if self.embedded && !self.matches_magnet_address(self.magnet.read(cx).value().as_ref(), cx)
+        {
+            return Some("Resolve the current magnet link before starting a download.");
+        }
         if let Err(issue) = self.parsed_settings(cx) {
             return Some(issue);
         }
@@ -573,6 +673,7 @@ impl AddTorrent {
     }
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
         if !self.choosing_path {
+            self.cancel_pending();
             cx.emit(DismissTorrent);
         }
     }
@@ -583,7 +684,7 @@ impl AddTorrent {
         }
     }
     fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
-        if self.choosing_path {
+        if self.embedded || self.choosing_path {
             return;
         }
         if paths.0.len() == 1 {
@@ -709,7 +810,7 @@ impl Render for AddTorrent {
                     .gap_3()
                     .child(
                         Form::new()
-                            .child(
+                            .when(!self.embedded, |form| form.child(
                                 Field::new().label("Torrent file").child(
                                     h_flex()
                                         .gap_2()
@@ -728,8 +829,8 @@ impl Render for AddTorrent {
                                                 })),
                                         ),
                                 ),
-                            )
-                            .child(Field::new().label("Magnet link").child(Input::new(&self.magnet).disabled(self.choosing_path || self.loading)))
+                            ))
+                            .when(!self.embedded, |form| form.child(Field::new().label("Magnet link").child(Input::new(&self.magnet).disabled(self.choosing_path || self.loading))))
                             .child(Field::new().child(
                                 Checkbox::new("magnet-resolution-dht")
                                     .label("Allow public DHT during magnet resolution")
@@ -920,6 +1021,43 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[gpui::test]
+    fn embedded_address_change_aborts_pending_metadata_and_resets_consent(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.update(gpui_kit::init);
+        let mut form = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let address = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
+            let view = cx.new(|cx| {
+                AddTorrent::embedded(address, None, runtime.handle().clone(), window, cx)
+            });
+            form = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let form = form.unwrap();
+        let worker = runtime.spawn(std::future::pending());
+        let abort = worker.abort_handle();
+        cx.update(|window, cx| {
+            form.update(cx, |view, cx| {
+                view.loading = true;
+                view.options.settings.allow_upload = true;
+                view.resolution_dht = true;
+                view.observe_source(worker, true, window, cx);
+                view.set_magnet_address("magnet:?xt=urn:btih:bad".into(), window, cx);
+                assert!(!view.loading && view.loader.is_none());
+                assert!(view.source.is_none() && view.resolved_magnet.is_none());
+                assert!(!view.resolution_dht);
+                assert_eq!(
+                    view.options.settings,
+                    ulos_core::torrent::TorrentSettings::default()
+                );
+                view.resolve_magnet(window, cx);
+                assert!(!view.loading && view.loader.is_none());
+            })
+        });
+        settle(cx, |_| abort.is_finished());
     }
 
     #[gpui::test]
