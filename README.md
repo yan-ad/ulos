@@ -16,20 +16,22 @@
 
 **[Open the Releases page →](https://github.com/yan-ad/ulos/releases/latest)**
 
-Choose the file for your computer. No terminal or build tools are needed.
+Choose the file for your computer from the assets actually listed on that release. No terminal or build tools are needed. Windows ARM64 and Linux ARM64 are configured for a future release; older releases may not include them.
 
 | Computer | Download | Install |
 | --- | --- | --- |
 | Mac with Apple silicon (M1 or newer) | `macos-arm64.dmg` | Open the disk image and drag **Ulos** to **Applications**. |
 | Mac with an Intel processor | `macos-x86_64.dmg` | Open the disk image and drag **Ulos** to **Applications**. |
-| Windows, 64-bit | `windows-x86_64.zip` | Extract the entire ZIP, then open **Ulos.exe**. |
-| Linux, 64-bit (Ubuntu 24.04 baseline) | `linux-x86_64.tar.gz` | Extract the archive in your file manager, allow **Ulos** to run as a program, then open it. |
+| Windows, Intel/AMD x86-64 | `windows-x86_64.zip` | Extract the entire ZIP, then open **Ulos.exe**. |
+| Windows, ARM64 (for example Snapdragon) | `windows-arm64.zip` | Extract the entire ZIP, then open **Ulos.exe** (when published). |
+| Linux, Intel/AMD x86-64 (Ubuntu 24.04 baseline) | `linux-x86_64.tar.gz` | Extract the archive in your file manager, allow **Ulos** to run as a program, then open it. |
+| Linux, ARM64 (Ubuntu 24.04 baseline) | `linux-arm64.tar.gz` | Extract the archive in your file manager, allow **Ulos** to run as a program, then open it (when published). |
 
 These first builds are not Developer ID–signed/notarized on macOS or publisher-signed on Windows. Your system may show a security warning. Review the source and release before deciding whether to allow it; do not disable system security. On macOS, an approved exception can be made in **System Settings → Privacy & Security**. Linux packages depend on the system libraries listed in the release notes.
 
 ## What you can do
 
-- Add an HTTP/HTTPS link or open/drop a `.torrent` file with **Add New**.
+- Add an HTTP/HTTPS link or open/drop a v1, v2 or hybrid `.torrent` file with **Add New** (next build; see [release notes](RELEASE_NOTES.md)).
 - Organize downloads into named queues and set one-time or weekly schedules.
 - Pause supported transfers, track progress and speed, and choose how file conflicts are handled.
 - Use light, dark, or system appearance.
@@ -39,7 +41,7 @@ These first builds are not Developer ID–signed/notarized on macOS or publisher
 
 Ulos is early software. Keep it open for schedules to run. Queue sources and schedules are not restored after quitting; saved history cannot restart a transfer.
 
-Torrent support currently uses trackers only, with uploads and seeding disabled. Trackerless torrents may not find peers. Magnet links and pure v2 torrents are not supported yet. Only download content you have permission to use.
+In the next build, torrent format detection and engine selection are automatic. V1 defaults to tracker-only downloads without payload uploads. V2/hybrid downloads use a bundled native engine and require explicit **Allow peer uploads while downloading** consent; public DHT and download/upload/peer limits are optional with that consent. Known-private payload transfers never use DHT. The Torrent file draft also accepts a magnet link through explicit **Resolve magnet**: native metadata-only discovery uses trackers/direct numeric peers, with a separate default-off public-DHT checkbox. Private status is unknown before resolution, so opting into DHT can expose a private hash. Resolving does not start or queue payload downloads. V2/hybrid magnets needing piece layers fail closed; choose a `.torrent` file instead. Local discovery, port forwarding, post-completion seeding and durable resume remain unsupported; metadata and safety limits still apply. See the [torrent guide](docs/TORRENTS.md). These changes are not retroactive to existing release assets. Only download content you have permission to use.
 
 ## Help and feedback
 

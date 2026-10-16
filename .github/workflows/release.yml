@@ -78,6 +78,14 @@ jobs:
             platform: windows
             arch: x86_64
             target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            platform: windows
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
           - runner: ubuntu-24.04
             platform: linux
             arch: x86_64
@@ -98,9 +106,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Configure native Windows ARM64 CMake builds
+        if: matrix.runner == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          "CMAKE_GENERATOR=Visual Studio 17 2022" >> $env:GITHUB_ENV
+          "CMAKE_GENERATOR_PLATFORM=ARM64" >> $env:GITHUB_ENV
+          "CMAKE_GENERATOR_TOOLSET=host=arm64" >> $env:GITHUB_ENV
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |
@@ -111,8 +132,24 @@ jobs:
           python3 scripts/release-version.py "$RELEASE_VERSION"
           rustc -vV
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$CARGO_BUILD_TARGET"
+      - name: Build and test bundled native torrent worker
+        run: python3 scripts/build-torrent-worker.py --profile release --test --install-deps
+      - name: Select native worker for Rust integration tests
+        shell: bash
+        run: |
+          python3 - <<'PYWORKER'
+          import os
+          from pathlib import Path
+          target = Path(os.environ.get('CARGO_TARGET_DIR', 'target')) / os.environ.get('CARGO_BUILD_TARGET', '') / 'release'
+          worker = target / ('ulos-torrent-worker.exe' if os.name == 'nt' else 'ulos-torrent-worker')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('ULOS_TORRENT_WORKER=' + str(worker.resolve()) + '\n')
+          PYWORKER
       - name: Test engine and CLI (serial fixtures; no native power-provider exercise)
         run: cargo test --locked -p ulos-core -p ulos-cli -- --test-threads=1
+      - name: Verify real v2 and hybrid task publication
+        timeout-minutes: 5
+        run: cargo test --locked -p ulos-core --test torrent_native_integration -- --ignored --test-threads=1
       - name: Check desktop compilation and strict lint
         run: |
           cargo check --locked -p ulos-desktop
@@ -146,6 +183,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          architecture: arm64
+      - name: Build and test bundled native torrent worker
+        run: python3 scripts/build-torrent-worker.py --profile debug --test --install-deps
+      - name: Select native worker for Rust integration tests
+        shell: bash
+        run: |
+          python3 - <<'PYWORKER'
+          import os
+          from pathlib import Path
+          target = Path(os.environ.get('CARGO_TARGET_DIR', 'target')) / os.environ.get('CARGO_BUILD_TARGET', '') / 'debug'
+          worker = target / ('ulos-torrent-worker.exe' if os.name == 'nt' else 'ulos-torrent-worker')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('ULOS_TORRENT_WORKER=' + str(worker.resolve()) + '\n')
+          PYWORKER
       - run: cargo fmt --all -- --check
       - name: Compile desktop adapter tests
         timeout-minutes: 15
@@ -176,8 +230,8 @@ jobs:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          expected=("Ulos-$RELEASE_VERSION-macos-arm64.dmg" "Ulos-$RELEASE_VERSION-macos-x86_64.dmg" "Ulos-$RELEASE_VERSION-windows-x86_64.zip" "Ulos-$RELEASE_VERSION-linux-x86_64.tar.gz")
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+          expected=("Ulos-$RELEASE_VERSION-macos-arm64.dmg" "Ulos-$RELEASE_VERSION-macos-x86_64.dmg" "Ulos-$RELEASE_VERSION-windows-x86_64.zip" "Ulos-$RELEASE_VERSION-linux-x86_64.tar.gz" "Ulos-$RELEASE_VERSION-windows-arm64.zip" "Ulos-$RELEASE_VERSION-linux-arm64.tar.gz")
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
           for asset in "${expected[@]}"; do test -s "$asset"; done
           sha256sum "${expected[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS

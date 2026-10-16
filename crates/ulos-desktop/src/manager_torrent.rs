@@ -3,6 +3,68 @@ use crate::{add_torrent::TorrentRequest, native_windows::NativeTorrentWindow};
 use std::path::PathBuf;
 
 impl DownloadManager {
+    fn can_set_torrent_controls(&self, id: DownloadId) -> bool {
+        self.queue.item(id).is_some_and(|item| {
+            item.is_torrent
+                && item.torrent_settings.allow_upload
+                && !item.cancelling
+                && (self.active == Some(id) || item.is_queued() || item.can_retry())
+        })
+    }
+    pub(crate) fn set_torrent_limits(
+        &mut self,
+        id: DownloadId,
+        download: Option<u64>,
+        upload: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_set_torrent_controls(id)
+            || [download, upload]
+                .into_iter()
+                .flatten()
+                .any(|rate| !(1..=1_073_741_824).contains(&rate))
+        {
+            return;
+        }
+        if self.active == Some(id)
+            && !self
+                .transfer
+                .as_ref()
+                .is_some_and(|task| task.set_torrent_limits(download, upload))
+        {
+            return;
+        }
+        if let Some(item) = self.queue.item_mut(id) {
+            item.torrent_settings.download_bytes_per_second = download;
+            item.torrent_settings.upload_bytes_per_second = upload;
+        }
+        self.refresh_details(cx);
+        cx.notify();
+    }
+    pub(crate) fn set_torrent_peers(
+        &mut self,
+        id: DownloadId,
+        peers: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_set_torrent_controls(id) || !(1..=10000).contains(&peers) {
+            return;
+        }
+        if self.active == Some(id)
+            && !self
+                .transfer
+                .as_ref()
+                .is_some_and(|task| task.set_peer_limit(peers))
+        {
+            return;
+        }
+        if let Some(item) = self.queue.item_mut(id) {
+            item.torrent_settings.peer_limit = peers;
+        }
+        self.refresh_details(cx);
+        cx.notify();
+    }
+
     pub(crate) fn watch_torrent_intake(
         &mut self,
         inbox: std::rc::Rc<std::cell::RefCell<Vec<PathBuf>>>,
@@ -139,10 +201,46 @@ impl DownloadManager {
         if request.options.collision == CollisionPolicy::Overwrite {
             return Err("Torrent overwrite is not supported.");
         }
+        let settings = &request.options.settings;
+        if !(1..=10000).contains(&settings.peer_limit)
+            || [
+                settings.download_bytes_per_second,
+                settings.upload_bytes_per_second,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|rate| !(1..=1_073_741_824).contains(&rate))
+        {
+            return Err("Invalid torrent limits.");
+        }
+        if settings.dht && request.source.is_private() {
+            return Err("Private torrents cannot use DHT.");
+        }
+        let native = ulos_core::torrent::native_worker_available();
+        if request.source.protocol() != ulos_core::torrent::TorrentProtocol::V1
+            && !settings.allow_upload
+        {
+            return Err("V2 and hybrid torrents require explicit peer-upload consent.");
+        }
+        if (request.source.protocol() != ulos_core::torrent::TorrentProtocol::V1
+            || settings.allow_upload)
+            && !native
+        {
+            return Err("The native torrent worker is unavailable.");
+        }
+        if !settings.allow_upload
+            && (settings.dht
+                || settings.download_bytes_per_second.is_some()
+                || settings.upload_bytes_per_second.is_some()
+                || settings.peer_limit != 100)
+        {
+            return Err("Torrent limits and DHT require peer-upload consent.");
+        }
         let id = self
             .queue
             .add_torrent(request.source.clone(), request.destination.clone())?;
         self.queue.item_mut(id).unwrap().options.collision = request.options.collision;
+        self.queue.item_mut(id).unwrap().torrent_settings = settings.clone();
         self.cancel_all_shutdowns(cx);
         self.notice = None;
         if request.start_now && self.active.is_none() {

@@ -1,14 +1,30 @@
 # Local opener packaging
 
-These are development packaging aids, not signed/notarized installers or a
+These are development packaging aids, not publisher-signed/notarized installers or a
 verified cross-platform distribution. No magnet scheme is advertised. No custom
 icon or unsupported minimum OS baseline is invented. Keep `LICENSE`,
 `THIRD_PARTY_NOTICES.md`, and `licenses/Apache-2.0.txt` with redistributed binaries;
-the notices are not a full transitive compliance audit.
+the supplied `licenses/libtorrent-BSD-3-Clause.txt`, `licenses/libtorrent-2.1.2-NOTICES.txt` (full component notices), `licenses/OpenSSL-Apache-2.0.txt`, `licenses/Boost-1.0.txt` and `licenses/nlohmann-json-MIT.txt` must also accompany the native helper/runtime closure. Review additional or changed dependency obligations before distribution; supplied notices are not a full transitive compliance audit.
+
+## Native torrent worker: mandatory next-build payload
+
+Build the desktop and matching native sidecar before packaging. The packager now **fails** if `ulos-torrent-worker(.exe)` is absent; a desktop-only archive is not a complete next-build distribution. The mandatory helper also supplies explicit metadata-only magnet resolution, including for v1. No OS magnet scheme is registered. Worker discovery is not proof that dependencies load. Keep its relocated `lib/` closure with it on macOS/Linux; Windows uses static dependencies/CRT and rejects unexpected non-system DLL imports. Do not distribute the test fixture.
+
+For a development build with explicit dependency-install authorization:
+
+```sh
+python3 scripts/build-torrent-worker.py --profile debug --test --install-deps
+```
+
+Use `--profile release` for packaging. Dependency installation occurs **only** with `--install-deps`: Homebrew on macOS; apt through sudo on Linux; a pinned local vcpkg checkout on Windows. Without that flag, provide CMake, C++17, libtorrent 2, Boost/OpenSSL and nlohmann-json packages yourself, plus `patchelf` on Linux; use `--cmake-prefix` / `--toolchain` where needed. The flag does not authorize SDK/OS-permission bypass. The build respects `CARGO_TARGET_DIR` and requires `CARGO_BUILD_TARGET`, if set, to match native hardware. `--output` selects the directory containing the desktop executable; its `lib/` is reserved for this helper's managed dependency closure and replaced during staging.
+
+The source uses libtorrent 2 API (2.0.15 baseline; local Homebrew installation 2.1.2), not an embedded v1-client feature switch. macOS/Homebrew and Linux resolve installed system libtorrent 2 packages (Homebrew 2.1.2 on the development host; Linux 2.0.x), not one exact pin across OSes. Windows uses vcpkg baseline `3cd21e48a75f67acfef289da52893ce79144aaa1` (libtorrent 2.1.2), `libtorrent[core,deprfun]` and `x64-windows-static` / `arm64-windows-static`. `deprfun` retains ABI 2; `core` avoids default WebTorrent/libdatachannel dependencies, not BitTorrent v2. Use a native MSVC C++ environment with Windows SDK/CMake already provided. Windows console-helper pipes, UTF-8 argv and `CREATE_NO_WINDOW` are source-implemented; no Windows runtime success is inferred here. No GPL engine is selected, but the BSD engine and transitive runtime licenses remain independent obligations; the provided full license/component-notice files must remain with redistributed packages, and binary copying alone does not establish compliance for changed dependency versions.
+
+`--test` runs CTest plus acceptance against the relocated helper. The separate ignored Rust parent-task tests must also be explicitly run as described in [Testing](../docs/TESTING.md#explicit-native-acceptance-phase-not-results). Bundling uses `@loader_path` on macOS and relative ELF runtime paths on Linux, verifies dependency architecture and keeps platform ABI libraries on the system. Validate relocated binaries on clean native hosts before release.
 
 ## macOS
 
-Build the desktop, then run `./scripts/bundle-macos.sh [release|debug] [absent-output.app]`.
+Build the desktop and matching worker/runtime closure, then run `./scripts/bundle-macos.sh [release|debug] [absent-output.app]`.
 The default output is `dist/Ulos.app`. The bundle executable is named **Ulos**,
 with the supplied icon, numeric Apple version, full `UlosVersion`, LICENSE and
 third-party notices. `CARGO_TARGET_DIR` and `CARGO_BUILD_TARGET` are respected.
@@ -40,7 +56,7 @@ Linux desktop discovery and native launch remain unverified on this macOS host.
 ## Windows
 
 After placing the binary in a stable local location, deliberately invoke
-`packaging/windows/register-open-with.ps1 -ExecutablePath 'C:\\Apps\\Ulos\\ulos-desktop.exe'`.
+`packaging/windows/register-open-with.ps1 -ExecutablePath 'C:\\Apps\\Ulos\\Ulos.exe'`.
 `-WhatIf` previews the intended registration without registry writes. This
 per-user HKCU-only script requires no administrator rights. It adds the
 `Ulos.Torrent` ProgID, `.torrent\\OpenWithProgids`, and RegisteredApplications
@@ -82,9 +98,25 @@ transfer. Parent UI must present each accepted file for review.
 ## Release workflow
 
 `.github/workflows/release.yml` accepts an existing `v` tag and verifies that its
-Cargo version matches. It builds native Apple silicon/Intel macOS DMGs, a Windows
-x64 ZIP and an Ubuntu 24.04 x64 portable tar archive, with engine tests on each
-platform and full desktop tests/lint on macOS. All builds must succeed before
-publication. SHA256SUMS is generated from the four artifacts; publishing uses
+Cargo version matches. It is configured to build six native archives: Apple
+silicon/Intel macOS DMGs, Windows x86-64/ARM64 ZIPs, and Ubuntu 24.04 x86-64/ARM64
+portable tar archives. The ARM64 additions are pending a future release, not
+retroactive assets for an existing release. Engine tests run on each build target;
+full desktop adapter tests/lint also run in CI on Windows ARM64 and Linux ARM64
+(and the existing platforms). The workflow explicitly runs native worker/loopback and ignored Rust parent-task tests as well as engine/CLI checks; this is configuration, not evidence of their completion or native visual validation.
+
+The hosted runner labels `windows-11-arm` and `ubuntu-24.04-arm` are listed in
+[GitHub's hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+The Windows ARM64 [image inventory](https://github.com/actions/runner-images/blob/main/images/windows/Windows11-Arm64-Readme.md)
+includes Visual Studio 2022 ARM64 C++ tools, Windows SDKs and CMake. Workflows
+select the ARM64 MSVC environment and Visual Studio CMake generator/platform/host
+toolset explicitly (including for native dependencies such as aws-lc-sys).
+Each matrix entry requires the exact `rustc -vV` host to equal its Cargo target;
+installing a cross target alone does not pass. The packager checks PE Machine,
+ELF e_machine, or thin Mach-O cputype against the requested architecture before
+creating an archive. Header tests use synthetic fixtures and do not claim native
+compilation or runtime testing. A sibling `ulos-torrent-worker(.exe)` is mandatory and architecture-checked, with relocated runtime libraries checked/copied when present. The workflow builds it first; the archive packager itself does not manufacture a worker.
+
+All builds must succeed before publication. SHA256SUMS is generated from the six artifacts; publishing uses
 `--verify-tag --draft=false --prerelease=false --latest`, including `-pre` names.
-The workflow never creates a source commit or tag. See INSTALL.md for GUI steps.
+The workflow never creates a source commit or tag, and refuses replacing an existing release. See INSTALL.md for GUI steps.

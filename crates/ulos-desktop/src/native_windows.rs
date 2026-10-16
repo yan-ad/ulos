@@ -4,7 +4,8 @@ use crate::{
     add_torrent::{AddTorrent, DismissTorrent, TorrentRequest},
     download_details::{
         CancelDownload, CancelShutdown, CloseDetails, DetailsSnapshot, DownloadDetails,
-        RequestShutdown, RetryDownload, SetConnections, SetRateLimit, TogglePause,
+        RequestShutdown, RetryDownload, SetConnections, SetRateLimit, SetTorrentLimits,
+        SetTorrentPeers, TogglePause,
     },
     manager::DownloadManager,
     scheduler_window::{SchedulerRequest, SchedulerSnapshot, SchedulerWindow},
@@ -330,6 +331,24 @@ impl StatusWindow {
                 });
             },
         );
+        let torrent_limits = cx.subscribe_in(
+            &content,
+            window,
+            |view, _, event: &SetTorrentLimits, _, cx| {
+                view._owner.update(cx, |owner, cx| {
+                    owner.set_torrent_limits(event.id, event.download, event.upload, cx)
+                });
+            },
+        );
+        let torrent_peers = cx.subscribe_in(
+            &content,
+            window,
+            |view, _, event: &SetTorrentPeers, _, cx| {
+                view._owner.update(cx, |owner, cx| {
+                    owner.set_torrent_peers(event.id, event.peers, cx)
+                });
+            },
+        );
         let retry = cx.subscribe_in(
             &content,
             window,
@@ -364,6 +383,8 @@ impl StatusWindow {
                 pause,
                 rate,
                 connections,
+                torrent_limits,
+                torrent_peers,
                 retry,
                 shutdown,
                 cancel_shutdown,

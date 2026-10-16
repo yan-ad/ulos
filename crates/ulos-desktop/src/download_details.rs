@@ -58,6 +58,7 @@ pub struct DetailsSnapshot {
     pub output_directory: bool,
     pub torrent: Option<ulos_core::torrent::TorrentTelemetry>,
     pub torrent_fresh: bool,
+    pub torrent_settings: ulos_core::torrent::TorrentSettings,
 }
 
 pub struct CancelDownload(pub DownloadId);
@@ -66,6 +67,15 @@ pub struct TogglePause(pub DownloadId);
 pub struct SetRateLimit {
     pub id: DownloadId,
     pub bytes_per_second: Option<u64>,
+}
+pub struct SetTorrentLimits {
+    pub id: DownloadId,
+    pub download: Option<u64>,
+    pub upload: Option<u64>,
+}
+pub struct SetTorrentPeers {
+    pub id: DownloadId,
+    pub peers: usize,
 }
 pub struct SetConnections {
     pub id: DownloadId,
@@ -92,6 +102,8 @@ pub struct DownloadDetails {
     tab: DetailsTab,
     pub(crate) rate_input: Option<Entity<InputState>>,
     pub(crate) connections_input: Option<Entity<InputState>>,
+    torrent_upload_input: Option<Entity<InputState>>,
+    torrent_peers_input: Option<Entity<InputState>>,
     rate_enabled: bool,
     input_error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -102,6 +114,8 @@ impl EventEmitter<CloseDetails> for DownloadDetails {}
 impl EventEmitter<TogglePause> for DownloadDetails {}
 impl EventEmitter<SetRateLimit> for DownloadDetails {}
 impl EventEmitter<SetConnections> for DownloadDetails {}
+impl EventEmitter<SetTorrentLimits> for DownloadDetails {}
+impl EventEmitter<SetTorrentPeers> for DownloadDetails {}
 impl EventEmitter<RetryDownload> for DownloadDetails {}
 impl EventEmitter<RequestShutdown> for DownloadDetails {}
 impl EventEmitter<CancelShutdown> for DownloadDetails {}
@@ -134,6 +148,20 @@ pub(crate) fn status_color(status: &str, cx: &App) -> Hsla {
     }
 }
 
+pub(crate) fn parse_optional_rate(text: &str) -> Result<Option<u64>, &'static str> {
+    if text.trim().is_empty() {
+        Ok(None)
+    } else {
+        parse_rate(text).map(Some)
+    }
+}
+pub(crate) fn parse_peers(text: &str) -> Result<usize, &'static str> {
+    text.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=10000).contains(value))
+        .ok_or("Peers must be a whole number from 1 to 10000.")
+}
 fn parse_rate(text: &str) -> Result<u64, &'static str> {
     let kib = text
         .trim()
@@ -165,6 +193,8 @@ impl DownloadDetails {
             tab: DetailsTab::Status,
             rate_input: None,
             connections_input: None,
+            torrent_upload_input: None,
+            torrent_peers_input: None,
             input_error: None,
             _subscriptions: Vec::new(),
         }
@@ -191,6 +221,38 @@ impl DownloadDetails {
         cx.notify();
     }
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot.is_torrent
+            && self.snapshot.torrent_settings.allow_upload
+            && self.rate_input.is_none()
+        {
+            let settings = &self.snapshot.torrent_settings;
+            let down = settings
+                .download_bytes_per_second
+                .map(|rate| (rate / 1024).to_string())
+                .unwrap_or_default();
+            let up = settings
+                .upload_bytes_per_second
+                .map(|rate| (rate / 1024).to_string())
+                .unwrap_or_default();
+            let peers = settings.peer_limit.to_string();
+            self.rate_input = Some(cx.new(|cx| {
+                let mut input =
+                    InputState::new(window, cx).placeholder("Download KiB/s; blank = unlimited");
+                input.set_value(down, window, cx);
+                input
+            }));
+            self.torrent_upload_input = Some(cx.new(|cx| {
+                let mut input =
+                    InputState::new(window, cx).placeholder("Upload KiB/s; blank = unlimited");
+                input.set_value(up, window, cx);
+                input
+            }));
+            self.torrent_peers_input = Some(cx.new(|cx| {
+                let mut input = InputState::new(window, cx).placeholder("1–10000 peers");
+                input.set_value(peers, window, cx);
+                input
+            }));
+        }
         if self.snapshot.is_torrent || self.rate_input.is_some() {
             return;
         }
@@ -230,6 +292,54 @@ impl DownloadDetails {
         ));
         self.rate_input = Some(rate_input);
         self.connections_input = Some(connections_input);
+    }
+    fn can_configure_torrent(&self) -> bool {
+        self.snapshot.is_torrent
+            && self.snapshot.torrent_settings.allow_upload
+            && !self.snapshot.cancelling
+            && (self.snapshot.active || self.snapshot.status == "Added" || self.snapshot.can_retry)
+    }
+    pub(crate) fn apply_torrent_limits(&mut self, cx: &mut Context<Self>) {
+        if !self.can_configure_torrent() {
+            return;
+        }
+        let (Some(down), Some(up)) = (&self.rate_input, &self.torrent_upload_input) else {
+            return;
+        };
+        match (
+            parse_optional_rate(down.read(cx).value().as_ref()),
+            parse_optional_rate(up.read(cx).value().as_ref()),
+        ) {
+            (Ok(download), Ok(upload)) => {
+                self.input_error = None;
+                cx.emit(SetTorrentLimits {
+                    id: self.snapshot.id,
+                    download,
+                    upload,
+                });
+            }
+            (Err(error), _) | (_, Err(error)) => self.input_error = Some(error.into()),
+        }
+        cx.notify();
+    }
+    pub(crate) fn apply_torrent_peers(&mut self, cx: &mut Context<Self>) {
+        if !self.can_configure_torrent() {
+            return;
+        }
+        let Some(input) = &self.torrent_peers_input else {
+            return;
+        };
+        match parse_peers(input.read(cx).value().as_ref()) {
+            Ok(peers) => {
+                self.input_error = None;
+                cx.emit(SetTorrentPeers {
+                    id: self.snapshot.id,
+                    peers,
+                });
+            }
+            Err(error) => self.input_error = Some(error.into()),
+        }
+        cx.notify();
     }
     pub(crate) fn apply_rate(&mut self, cx: &mut Context<Self>) {
         if !self.can_configure_rate() {
@@ -443,7 +553,7 @@ impl DownloadDetails {
             return vec![
                 ("Peers", "Not available".into()),
                 ("Download speed", "Not available".into()),
-                ("Upload speed", "Disabled".into()),
+                ("Upload speed", "Not available".into()),
             ];
         };
         let transferring = self.snapshot.active
@@ -482,23 +592,40 @@ impl DownloadDetails {
             (
                 "Upload speed",
                 if transferring && !live {
-                    format!("{unavailable} (payload upload disabled)")
+                    format!(
+                        "{unavailable}{}",
+                        if telemetry.upload_enabled {
+                            ""
+                        } else {
+                            " (payload upload disabled)"
+                        }
+                    )
                 } else {
                     format!(
-                        "{}/s (payload upload disabled)",
+                        "{}/s{}",
                         formatting::bytes(if live {
                             telemetry.upload_bytes_per_second
                         } else {
                             0
-                        })
+                        }),
+                        if telemetry.upload_enabled {
+                            ""
+                        } else {
+                            " (payload upload disabled)"
+                        }
                     )
                 },
             ),
             (
                 "Trackers",
                 format!(
-                    "{} configured (tracker-only discovery)",
-                    telemetry.tracker_count
+                    "{} configured ({})",
+                    telemetry.tracker_count,
+                    if telemetry.dht_enabled {
+                        "DHT enabled"
+                    } else {
+                        "DHT disabled"
+                    }
                 ),
             ),
         ]
@@ -607,12 +734,51 @@ impl DownloadDetails {
     }
     fn speed_content(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.snapshot.is_torrent {
-            return GroupBox::new()
+            let enabled = self.can_configure_torrent();
+            let mut group = GroupBox::new()
                 .outline()
-                .title(Label::new("Torrent settings"))
-                .child(Label::new(
-                    "Torrent rate limits and connection configuration are not supported.",
-                ))
+                .title(Label::new("Torrent limits"));
+            if let (Some(down), Some(up), Some(peers)) = (
+                &self.rate_input,
+                &self.torrent_upload_input,
+                &self.torrent_peers_input,
+            ) {
+                group = group
+                    .child(Label::new(
+                        "Download / upload KiB/s (blank = unlimited; 1–1048576)",
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Input::new(down).disabled(!enabled))
+                            .child(Input::new(up).disabled(!enabled))
+                            .child(
+                                Button::new("torrent-rates-apply")
+                                    .label("Apply rates")
+                                    .disabled(!enabled)
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.apply_torrent_limits(cx)),
+                                    ),
+                            ),
+                    )
+                    .child(Label::new("Peer limit (1–10000)"))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Input::new(peers).disabled(!enabled))
+                            .child(
+                                Button::new("torrent-peers-apply")
+                                    .label("Apply peers")
+                                    .disabled(!enabled)
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.apply_torrent_peers(cx)),
+                                    ),
+                            ),
+                    );
+            }
+            return group.child(Label::new(format!("Applied download: {} · upload: {} · peers: {}", self.snapshot.torrent_settings.download_bytes_per_second.map(|r| format!("{}/s", formatting::bytes(r))).unwrap_or_else(|| "unlimited".into()), self.snapshot.torrent_settings.upload_bytes_per_second.map(|r| format!("{}/s", formatting::bytes(r))).unwrap_or_else(|| "unlimited".into()), self.snapshot.torrent_settings.peer_limit)))
+                .child(Label::new("Limits require native peer-upload consent. Paused transfers accept changes; queued/retry changes apply next start. No post-completion seeding or magnet links."))
+                .when_some(self.input_error.clone(), |group, error| group.child(Label::new(error)))
                 .into_any_element();
         }
         let enabled = self.can_configure_rate();
@@ -1154,6 +1320,95 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(events.get(), 0);
+    }
+
+    #[test]
+    fn torrent_limits_parse_unlimited_and_bounds() {
+        assert_eq!(super::parse_optional_rate(" "), Ok(None));
+        assert_eq!(
+            super::parse_optional_rate("1048576"),
+            Ok(Some(1_073_741_824))
+        );
+        for value in ["0", "-1", "1.5", "1048577"] {
+            assert!(super::parse_optional_rate(value).is_err());
+        }
+        assert_eq!(super::parse_peers("1"), Ok(1));
+        assert_eq!(super::parse_peers("10000"), Ok(10000));
+        for value in ["", "0", "10001", "1.5"] {
+            assert!(super::parse_peers(value).is_err());
+        }
+    }
+
+    #[gpui::test]
+    fn native_torrent_controls_emit_bounded_intents_and_honor_live_upload_telemetry(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, component::Root};
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let mut content = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|_| {
+                let mut view = torrent_details();
+                view.snapshot.torrent_settings.allow_upload = true;
+                view.snapshot.torrent.as_mut().unwrap().upload_enabled = true;
+                view
+            });
+            content = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = content.unwrap();
+        let rates = Rc::new(RefCell::new(Vec::new()));
+        let peers = Rc::new(RefCell::new(Vec::new()));
+        let rates_out = rates.clone();
+        let peers_out = peers.clone();
+        let _rates = cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event: &super::SetTorrentLimits, _| {
+                rates_out
+                    .borrow_mut()
+                    .push((event.id, event.download, event.upload))
+            })
+        });
+        let _peers = cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event: &super::SetTorrentPeers, _| {
+                peers_out.borrow_mut().push((event.id, event.peers))
+            })
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.ensure_inputs(window, cx);
+                assert!(view.can_configure_torrent());
+                assert!(!view.torrent_summary_fields()[2].1.contains("disabled"));
+                assert!(view.connections_input.is_none());
+                view.rate_input
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |input, cx| input.set_value("1024", window, cx));
+                view.torrent_upload_input
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                view.torrent_peers_input
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |input, cx| input.set_value("200", window, cx));
+                view.apply_torrent_limits(cx);
+                view.apply_torrent_peers(cx);
+                view.rate_input
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |input, cx| input.set_value("0", window, cx));
+                view.apply_torrent_limits(cx);
+                view.snapshot.cancelling = true;
+                view.apply_torrent_peers(cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(rates.borrow().len(), 1);
+        assert_eq!(rates.borrow()[0].1, Some(1_048_576));
+        assert_eq!(rates.borrow()[0].2, None);
+        assert_eq!(peers.borrow().len(), 1);
+        assert_eq!(peers.borrow()[0].1, 200);
     }
 
     #[test]

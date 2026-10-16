@@ -1,0 +1,53 @@
+cmake_minimum_required(VERSION 3.20)
+project(ulos_torrent_worker VERSION 1.0 LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# A predictable build-root path for single and multi-config generators.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+foreach(config Debug Release RelWithDebInfo MinSizeRel)
+  string(TOUPPER "${config}" config_upper)
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${CMAKE_BINARY_DIR}")
+endforeach()
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
+if(MINGW)
+  add_link_options(-municode)
+endif()
+find_package(LibtorrentRasterbar 2 CONFIG REQUIRED)
+# Some libtorrent packages (including Homebrew 2.1.2) export assertions as
+# $<$<CONFIG:Debug>:TORRENT_USE_ASSERTS>, even when they only ship a Release
+# library. CMake falls back to that library for Debug consumers but still
+# evaluates the interface against the consumer configuration. Assertions change
+# public header layouts (torrent_status is 576 vs 592 bytes here), corrupting
+# status results.
+# Match the available library ABI without removing our own Debug symbols or
+# assertions. Packages with an actual Debug library retain their Debug ABI.
+set(libtorrent_target LibtorrentRasterbar::torrent-rasterbar)
+get_target_property(libtorrent_configs ${libtorrent_target} IMPORTED_CONFIGURATIONS)
+if(libtorrent_configs)
+  list(TRANSFORM libtorrent_configs TOUPPER)
+  if(NOT "DEBUG" IN_LIST libtorrent_configs)
+    get_target_property(libtorrent_definitions ${libtorrent_target} INTERFACE_COMPILE_DEFINITIONS)
+    if(libtorrent_definitions)
+      list(REMOVE_ITEM libtorrent_definitions "$<$<CONFIG:Debug>:TORRENT_USE_ASSERTS>")
+      set_property(TARGET ${libtorrent_target} PROPERTY INTERFACE_COMPILE_DEFINITIONS "${libtorrent_definitions}")
+    endif()
+  endif()
+endif()
+find_package(nlohmann_json 3.9 CONFIG REQUIRED)
+add_executable(ulos-torrent-worker worker.cpp)
+target_link_libraries(ulos-torrent-worker PRIVATE LibtorrentRasterbar::torrent-rasterbar nlohmann_json::nlohmann_json)
+install(TARGETS ulos-torrent-worker RUNTIME DESTINATION bin)
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(ulos-torrent-fixture fixture.cpp)
+  target_link_libraries(ulos-torrent-fixture PRIVATE LibtorrentRasterbar::torrent-rasterbar nlohmann_json::nlohmann_json)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME worker-loopback COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/loopback.py $<TARGET_FILE:ulos-torrent-worker> $<TARGET_FILE:ulos-torrent-fixture>)
+    set_tests_properties(worker-loopback PROPERTIES TIMEOUT 120)
+    add_test(NAME worker-magnet COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/magnet.py $<TARGET_FILE:ulos-torrent-worker> $<TARGET_FILE:ulos-torrent-fixture>)
+    set_tests_properties(worker-magnet PROPERTIES TIMEOUT 120)
+  endif()
+endif()

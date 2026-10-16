@@ -1,10 +1,10 @@
-//! Tracker-only, explicitly started v1 `.torrent` downloads (including v1 hybrids).
+//! Bounded, offline torrent preview and explicitly started verified downloads.
 //!
-//! Preview is bounded and entirely offline. Sources deliberately have no Debug
-//! implementation: tracker queries can contain secrets. Uploads are disabled by
-//! both the engine feature and session option; reciprocity-dependent swarms may
-//! therefore not make progress. No magnet, DHT, LSD, listener, UPnP, persistence,
-//! HTTP server, seeding, or rate-control API is enabled here.
+//! Default v1 transfers use tracker-only librqbit with uploads disabled at build
+//! time. BEP 52 v2/hybrid transfers and explicit discovery/upload/rate settings
+//! use the bundled libtorrent worker and require opt-in peer-upload permission.
+//! DHT is opt-in and is always disabled for private torrents. No magnet, LSD,
+//! UPnP, persistence, HTTP server, or post-download seeding is enabled here.
 //!
 //! Each worker owns a private Tokio runtime. After `Session::stop` it drops that
 //! runtime, joining blocking work and destroying remaining engine tasks/file
@@ -35,6 +35,18 @@ use tokio::{
 };
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
+
+#[path = "torrent_magnet.rs"]
+mod magnet;
+#[path = "torrent_native.rs"]
+mod native;
+#[path = "torrent_v2.rs"]
+mod v2;
+pub use magnet::{resolve_magnet, validate_magnet};
+
+pub fn native_worker_available() -> bool {
+    native::available()
+}
 
 pub const MAX_METAINFO_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILES: usize = 4096;
@@ -70,6 +82,18 @@ pub enum TorrentError {
     Cleanup,
     #[error("Torrent worker could not run")]
     Worker,
+    #[error("The bundled BitTorrent v2 worker is unavailable or could not start")]
+    NativeUnavailable,
+    #[error("BitTorrent v2 requires peer-upload permission for this engine")]
+    UploadRequired,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TorrentProtocol {
+    #[default]
+    V1,
+    V2,
+    Hybrid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +102,12 @@ pub struct TorrentFile {
     /// the metadata name for a single-file torrent. Never includes the root name.
     pub path: PathBuf,
     pub length: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V1Entry {
+    path: Option<PathBuf>,
+    length: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -91,8 +121,23 @@ pub struct TorrentSource {
     hash: String,
     piece_length: usize,
     pieces: Arc<[u8]>,
+    v1_layout: Arc<[V1Entry]>,
+    protocol: TorrentProtocol,
+    roots: Arc<[Option<[u8; 32]>]>,
+    hash_v1: Option<String>,
+    hash_v2: Option<String>,
+    is_private: bool,
 }
 impl TorrentSource {
+    pub fn protocol(&self) -> TorrentProtocol {
+        self.protocol
+    }
+    pub fn is_private(&self) -> bool {
+        self.is_private
+    }
+    pub fn native_worker_available() -> bool {
+        native::available()
+    }
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -282,9 +327,10 @@ fn regular(d: &BTreeMap<&[u8], Value<'_>>) -> Result<(), TorrentError> {
     Ok(())
 }
 
-/// Validates v1 metadata without touching disk or the network. Pure v2, negative
-/// bencode integers, non-canonical dictionaries, padding and symlink files are
-/// intentionally outside this initial strict profile. Empty total is rejected.
+/// Validates v1, v2 and hybrid metadata without touching disk or the network.
+/// Negative integers, non-canonical dictionaries, symlinks and webseeds are
+/// rejected. Padding is accepted only in a validated hybrid v1 layout.
+/// Empty total is rejected.
 pub fn parse(bytes: Vec<u8>) -> Result<TorrentSource, TorrentError> {
     if bytes.len() > MAX_METAINFO_BYTES {
         return Err(TorrentError::Limit);
@@ -300,6 +346,11 @@ pub fn parse(bytes: Vec<u8>) -> Result<TorrentSource, TorrentError> {
         return Err(TorrentError::InvalidMetadata);
     }
     let d = root.dict()?;
+    // Webseeds bypass the approved tracker/peer policy. Reject even empty or
+    // malformed declarations before either engine can parse the metainfo.
+    if d.contains_key(b"url-list".as_slice()) || d.contains_key(b"httpseeds".as_slice()) {
+        return Err(TorrentError::UnsafeTracker);
+    }
     if let Some(enc) = d.get(b"encoding".as_slice())
         && !enc.bytes()?.eq_ignore_ascii_case(b"utf-8")
     {
@@ -307,10 +358,54 @@ pub fn parse(bytes: Vec<u8>) -> Result<TorrentSource, TorrentError> {
     }
     let info = field(d, b"info")?.dict()?;
     regular(info)?;
+    if info
+        .get(b"private".as_slice())
+        .map(Value::int)
+        .transpose()?
+        .is_some_and(|v| v > 1)
+    {
+        return Err(TorrentError::InvalidMetadata);
+    }
     let name = component(field(info, b"name")?.bytes()?)?;
     let piece_length = field(info, b"piece length")?.int()?;
     if !(16_384..=64 * 1024 * 1024).contains(&piece_length) || !piece_length.is_power_of_two() {
         return Err(TorrentError::Limit);
+    }
+    let info_range = parser.info.clone().ok_or(TorrentError::InvalidMetadata)?;
+    if info.contains_key(b"meta version".as_slice()) {
+        let parsed = v2::parse(info, d, &bytes[info_range.clone()], &name)?;
+        let total = parsed.files.iter().map(|file| file.length).sum();
+        let trackers = validate_trackers(d)?;
+        let hash_v1 = parsed
+            .hybrid
+            .then(|| format!("{:x}", Sha1::digest(&bytes[info_range])));
+        let is_private = info
+            .get(b"private".as_slice())
+            .map(Value::int)
+            .transpose()?
+            .unwrap_or(0)
+            == 1;
+        return Ok(TorrentSource {
+            bytes: bytes.into(),
+            name,
+            files: parsed.files.into(),
+            total,
+            multi: parsed.multi,
+            trackers,
+            hash: parsed.hash.clone(),
+            piece_length: parsed.piece_length,
+            pieces: parsed.pieces.into(),
+            v1_layout: parsed.v1_layout.into(),
+            protocol: if parsed.hybrid {
+                TorrentProtocol::Hybrid
+            } else {
+                TorrentProtocol::V2
+            },
+            roots: parsed.roots.into(),
+            hash_v1,
+            hash_v2: Some(parsed.hash),
+            is_private,
+        });
     }
     let pieces = field(info, b"pieces")?.bytes()?;
     if pieces.len() % 20 != 0 || pieces.len() / 20 > MAX_PIECES {
@@ -390,6 +485,52 @@ pub fn parse(bytes: Vec<u8>) -> Result<TorrentSource, TorrentError> {
     {
         return Err(TorrentError::InvalidMetadata);
     }
+    let tracker_count = validate_trackers(d)?;
+    let hash = format!("{:x}", Sha1::digest(&bytes[info_range]));
+    let is_private = info
+        .get(b"private".as_slice())
+        .map(Value::int)
+        .transpose()?
+        .unwrap_or(0)
+        == 1;
+    // The engine is invoked only after bounded validation and must agree on paths.
+    let _quiet = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+    let meta = librqbit::torrent_from_bytes(&bytes).map_err(|_| TorrentError::InvalidMetadata)?;
+    let validated = meta
+        .info
+        .data
+        .validate()
+        .map_err(|_| TorrentError::InvalidMetadata)?;
+    let engine_files: Vec<_> = validated.iter_file_details().collect();
+    if engine_files.len() != files.len()
+        || engine_files
+            .iter()
+            .zip(&files)
+            .any(|(a, b)| a.filename.to_pathbuf() != b.path || a.len != b.length)
+    {
+        return Err(TorrentError::UnsafePath);
+    }
+    let pieces = Arc::from(pieces);
+    Ok(TorrentSource {
+        bytes: bytes.into(),
+        name,
+        files: files.into(),
+        total,
+        multi,
+        trackers: tracker_count,
+        hash: hash.clone(),
+        piece_length: piece_length as usize,
+        pieces,
+        v1_layout: Arc::from([]),
+        protocol: TorrentProtocol::V1,
+        roots: Arc::from([]),
+        hash_v1: Some(hash),
+        hash_v2: None,
+        is_private,
+    })
+}
+
+fn validate_trackers(d: &BTreeMap<&[u8], Value<'_>>) -> Result<usize, TorrentError> {
     let mut trackers = BTreeSet::new();
     let mut tracker_entries = 0usize;
     let mut add_tracker = |v: &Value<'_>| -> Result<(), TorrentError> {
@@ -428,41 +569,7 @@ pub fn parse(bytes: Vec<u8>) -> Result<TorrentSource, TorrentError> {
             }
         }
     }
-    let hash = format!(
-        "{:x}",
-        Sha1::digest(&bytes[parser.info.ok_or(TorrentError::InvalidMetadata)?])
-    );
-    // The engine is invoked only after the bounded, strict validation above.
-    let _quiet = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
-    let meta = librqbit::torrent_from_bytes(&bytes).map_err(|_| TorrentError::InvalidMetadata)?;
-    let validated = meta
-        .info
-        .data
-        .validate()
-        .map_err(|_| TorrentError::InvalidMetadata)?;
-    // Engine encoding detection must produce precisely the approved manifest,
-    // never a lossy reinterpretation of an accepted UTF-8 path.
-    let engine_files: Vec<_> = validated.iter_file_details().collect();
-    if engine_files.len() != files.len()
-        || engine_files
-            .iter()
-            .zip(&files)
-            .any(|(a, b)| a.filename.to_pathbuf() != b.path || a.len != b.length)
-    {
-        return Err(TorrentError::UnsafePath);
-    }
-    let pieces = Arc::from(pieces);
-    Ok(TorrentSource {
-        bytes: bytes.into(),
-        name,
-        files: files.into(),
-        total,
-        multi,
-        trackers: trackers.len(),
-        hash,
-        piece_length: piece_length as usize,
-        pieces,
-    })
+    Ok(trackers.len())
 }
 
 /// Bounded worker-side regular-file read. Symlinks (including a replacement
@@ -500,6 +607,26 @@ pub async fn load(path: PathBuf) -> Result<TorrentSource, TorrentError> {
 #[derive(Clone, Default)]
 pub struct TorrentOptions {
     pub collision: CollisionPolicy,
+    pub settings: TorrentSettings,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TorrentSettings {
+    pub dht: bool,
+    pub allow_upload: bool,
+    pub download_bytes_per_second: Option<u64>,
+    pub upload_bytes_per_second: Option<u64>,
+    pub peer_limit: usize,
+}
+impl Default for TorrentSettings {
+    fn default() -> Self {
+        Self {
+            dht: false,
+            allow_upload: false,
+            download_bytes_per_second: None,
+            upload_bytes_per_second: None,
+            peer_limit: 100,
+        }
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TorrentPhase {
@@ -526,6 +653,8 @@ pub struct TorrentTelemetry {
     /// Accepted tracker URLs in the source; not successful announces.
     pub tracker_count: usize,
     pub stalled_for_secs: u64,
+    pub dht_enabled: bool,
+    pub upload_enabled: bool,
 }
 impl TorrentTelemetry {
     pub fn activity_label(&self) -> &'static str {
@@ -536,6 +665,7 @@ impl TorrentTelemetry {
             TorrentPhase::Publishing => "Verifying / publishing",
             TorrentPhase::Downloading => {
                 if self.tracker_count == 0
+                    && !self.dht_enabled
                     && self.peers == 0
                     && self.connecting_peers == 0
                     && self.queued_peers == 0
@@ -561,6 +691,21 @@ impl TorrentTelemetry {
     pub fn diagnostic(&self) -> Option<&'static str> {
         if self.phase != TorrentPhase::Downloading {
             return None;
+        }
+        if self.upload_enabled || self.dht_enabled {
+            return if self.peers == 0 {
+                Some(if self.dht_enabled {
+                    "Peer discovery is enabled through trackers and DHT. No peers are currently connected; tracker failure is not confirmed. Peer upload is permitted."
+                } else {
+                    "Tracker discovery is enabled; DHT and local discovery are disabled. No peers are currently connected. Peer upload is permitted."
+                })
+            } else if self.stalled_for_secs >= 15 {
+                Some(
+                    "Connected peers are not sending data. They may be choked or have no needed pieces. Peer upload is permitted.",
+                )
+            } else {
+                None
+            };
         }
         if self.peers == 0 {
             return Some(if self.connecting_peers > 0 || self.queued_peers > 0 {
@@ -628,6 +773,7 @@ pub struct TorrentDownloadTask {
     telemetry: watch::Receiver<TorrentTelemetry>,
     cancellation: Option<oneshot::Sender<()>>,
     control: watch::Sender<bool>,
+    settings: watch::Sender<TorrentSettings>,
 }
 impl TorrentDownloadTask {
     /// Destination is the complete final filename/directory, not its parent.
@@ -645,6 +791,7 @@ impl TorrentDownloadTask {
         });
         let (cancellation, cancelled) = oneshot::channel();
         let (control, commands) = watch::channel(false);
+        let (settings, settings_rx) = watch::channel(options.settings.clone());
         runtime.spawn(async move {
             let updates = state_tx.clone();
             let final_telemetry = telemetry_tx.clone();
@@ -661,6 +808,7 @@ impl TorrentDownloadTask {
                     telemetry_tx,
                     cancelled,
                     commands,
+                    settings_rx,
                 )
             })
             .await;
@@ -681,6 +829,7 @@ impl TorrentDownloadTask {
             telemetry,
             cancellation: Some(cancellation),
             control,
+            settings,
         }
     }
     pub fn subscribe(&self) -> watch::Receiver<TransferState> {
@@ -708,6 +857,40 @@ impl TorrentDownloadTask {
         self.control.send_replace(false);
         true
     }
+    pub fn set_limits(&self, download: Option<u64>, upload: Option<u64>) -> bool {
+        if self.state.borrow().is_terminal()
+            || !self.settings.borrow().allow_upload
+            || download == Some(0)
+            || upload == Some(0)
+            || download.is_some_and(|rate| rate > 1_073_741_824)
+            || upload.is_some_and(|rate| rate > 1_073_741_824)
+        {
+            return false;
+        }
+        self.settings.send_modify(|settings| {
+            settings.download_bytes_per_second = download;
+            settings.upload_bytes_per_second = upload;
+        });
+        true
+    }
+    pub fn current_settings(&self) -> TorrentSettings {
+        self.settings.borrow().clone()
+    }
+    pub fn set_rate_limit(&self, download: Option<u64>) -> bool {
+        let upload = self.settings.borrow().upload_bytes_per_second;
+        self.set_limits(download, upload)
+    }
+    pub fn set_peer_limit(&self, peers: usize) -> bool {
+        if self.state.borrow().is_terminal()
+            || !self.settings.borrow().allow_upload
+            || !(1..=10_000).contains(&peers)
+        {
+            return false;
+        }
+        self.settings
+            .send_modify(|settings| settings.peer_limit = peers);
+        true
+    }
     pub fn cancel(&mut self) {
         if let Some(tx) = self.cancellation.take() {
             let _ = tx.send(());
@@ -722,6 +905,7 @@ impl Drop for TorrentDownloadTask {
 
 thread_local! {static QUIET: std::cell::RefCell<Option<tracing::subscriber::DefaultGuard>> = const { std::cell::RefCell::new(None) };}
 
+#[allow(clippy::too_many_arguments)]
 fn worker(
     source: TorrentSource,
     destination: PathBuf,
@@ -730,7 +914,30 @@ fn worker(
     telemetry: watch::Sender<TorrentTelemetry>,
     mut cancelled: oneshot::Receiver<()>,
     commands: watch::Receiver<bool>,
+    settings: watch::Receiver<TorrentSettings>,
 ) -> Result<Option<DownloadReceipt>, TorrentError> {
+    let settings_policy = &options.settings;
+    if settings_policy.download_bytes_per_second == Some(0)
+        || settings_policy.upload_bytes_per_second == Some(0)
+        || settings_policy
+            .download_bytes_per_second
+            .is_some_and(|n| n > 1_073_741_824)
+        || settings_policy
+            .upload_bytes_per_second
+            .is_some_and(|n| n > 1_073_741_824)
+        || !(1..=10_000).contains(&settings_policy.peer_limit)
+    {
+        return Err(TorrentError::Limit);
+    }
+    let use_native = source.protocol != TorrentProtocol::V1
+        || settings_policy.allow_upload
+        || settings_policy.dht
+        || settings_policy.download_bytes_per_second.is_some()
+        || settings_policy.upload_bytes_per_second.is_some()
+        || settings_policy.peer_limit != 100;
+    if use_native && !settings_policy.allow_upload {
+        return Err(TorrentError::UploadRequired);
+    }
     if options.collision == CollisionPolicy::Overwrite {
         return Err(TorrentError::OverwriteUnsupported);
     }
@@ -773,14 +980,36 @@ fn worker(
             })
             .build()
             .map_err(|_| TorrentError::Worker)?;
-        let result = engine.block_on(run_engine(
-            &source,
-            &output,
-            &state,
-            &telemetry,
-            &mut cancelled,
-            commands,
-        ));
+        // The native worker lays multi-file torrents under their metadata root.
+        let native_output = if source.multi {
+            output.join(&source.name)
+        } else {
+            output.clone()
+        };
+        let result = engine.block_on(async {
+            if use_native {
+                native::run(
+                    &source,
+                    &output,
+                    &state,
+                    &telemetry,
+                    &mut cancelled,
+                    commands,
+                    settings,
+                )
+                .await
+            } else {
+                run_engine(
+                    &source,
+                    &output,
+                    &state,
+                    &telemetry,
+                    &mut cancelled,
+                    commands,
+                )
+                .await
+            }
+        });
         // Session::stop alone has a timed heuristic. Runtime destruction is the
         // ownership barrier: all child futures and blocking I/O are gone afterward.
         drop(engine);
@@ -794,16 +1023,19 @@ fn worker(
             t.phase = TorrentPhase::Publishing;
             t.stop_activity();
         });
-        if !verify(&source, &output, || cancellation_requested(&mut cancelled))? {
+        let verified_output = if use_native { &native_output } else { &output };
+        if !verify(&source, verified_output, || {
+            cancellation_requested(&mut cancelled)
+        })? {
             return Ok(None);
         }
         if cancellation_requested(&mut cancelled) {
             return Ok(None);
         }
         let payload = if source.multi {
-            output
+            verified_output.to_path_buf()
         } else {
-            output.join(&source.name)
+            verified_output.join(&source.name)
         };
         let published = publish(&payload, &destination, source.multi, options.collision)?;
         Ok(Some(DownloadReceipt {
@@ -955,7 +1187,7 @@ fn verify(
     let mut in_piece = 0usize;
     let mut index = 0usize;
     let mut buffer = vec![0u8; 64 * 1024];
-    for entry in source.files.iter() {
+    for (file_index, entry) in source.files.iter().enumerate() {
         if cancelled() {
             return Ok(false);
         }
@@ -971,6 +1203,18 @@ fn verify(
             .write(true)
             .open(path)
             .map_err(|_| TorrentError::Verification)?;
+        if source.protocol != TorrentProtocol::V1 {
+            if let Some(root) = source.roots.get(file_index).copied().flatten() {
+                if !v2::verify_file(&mut file, entry.length, root, &mut cancelled)? {
+                    return Ok(false);
+                }
+            } else if entry.length != 0 {
+                return Err(TorrentError::Verification);
+            }
+            // Sync verified file contents before the independent hybrid SHA-1 pass.
+            file.sync_all().map_err(|_| TorrentError::Verification)?;
+            continue;
+        }
         let mut remaining = entry.length;
         while remaining > 0 {
             if cancelled() {
@@ -1002,11 +1246,83 @@ fn verify(
     if cancelled() {
         return Ok(false);
     }
+    if source.protocol == TorrentProtocol::Hybrid {
+        return verify_hybrid_v1(source, output, &mut cancelled);
+    }
     if in_piece > 0 && piece.finalize().as_slice() != &source.pieces[index * 20..(index + 1) * 20] {
         return Err(TorrentError::Verification);
     }
     Ok(true)
 }
+// Rebuild the v1 byte stream from approved real paths and metadata-only zero
+// padding. Never open a padding path or rely on the engine's seeding status.
+fn verify_hybrid_v1(
+    source: &TorrentSource,
+    output: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool, TorrentError> {
+    let mut hash = Sha1::new();
+    let mut in_piece = 0usize;
+    let mut index = 0usize;
+    let mut buffer = [0u8; 64 * 1024];
+    for entry in source.v1_layout.iter() {
+        if cancelled() {
+            return Ok(false);
+        }
+        let mut file = entry
+            .path
+            .as_ref()
+            .map(|path| fs::File::open(output.join(path)).map_err(|_| TorrentError::Verification))
+            .transpose()?;
+        let mut remaining = entry.length;
+        while remaining > 0 {
+            if cancelled() {
+                return Ok(false);
+            }
+            let n = remaining
+                .min(buffer.len() as u64)
+                .min((source.piece_length - in_piece) as u64) as usize;
+            if let Some(file) = &mut file {
+                file.read_exact(&mut buffer[..n])
+                    .map_err(|_| TorrentError::Verification)?;
+            } else {
+                buffer[..n].fill(0);
+            }
+            hash.update(&buffer[..n]);
+            remaining -= n as u64;
+            in_piece += n;
+            if in_piece == source.piece_length {
+                let expected = source
+                    .pieces
+                    .get(index * 20..(index + 1) * 20)
+                    .ok_or(TorrentError::Verification)?;
+                if hash.finalize_reset().as_slice() != expected {
+                    return Err(TorrentError::Verification);
+                }
+                index += 1;
+                in_piece = 0;
+            }
+        }
+    }
+    if cancelled() {
+        return Ok(false);
+    }
+    if in_piece > 0 {
+        let expected = source
+            .pieces
+            .get(index * 20..(index + 1) * 20)
+            .ok_or(TorrentError::Verification)?;
+        if hash.finalize().as_slice() != expected {
+            return Err(TorrentError::Verification);
+        }
+        index += 1;
+    }
+    if index * 20 != source.pieces.len() {
+        return Err(TorrentError::Verification);
+    }
+    Ok(true)
+}
+
 fn publish(
     payload: &Path,
     destination: &Path,
@@ -1234,6 +1550,12 @@ mod tests {
             hash: String::new(),
             piece_length: data.len(),
             pieces: Arc::from([0; 20]),
+            v1_layout: Arc::from([]),
+            protocol: TorrentProtocol::V1,
+            roots: Arc::from([]),
+            hash_v1: None,
+            hash_v2: None,
+            is_private: false,
         };
         let (tx, mut rx) = oneshot::channel();
         let mut tx = Some(tx);
@@ -1297,6 +1619,12 @@ mod tests {
             hash: String::new(),
             piece_length: 16384,
             pieces: Arc::from(Sha1::digest(b"abc").to_vec()),
+            v1_layout: Arc::from([]),
+            protocol: TorrentProtocol::V1,
+            roots: Arc::from([]),
+            hash_v1: None,
+            hash_v2: None,
+            is_private: false,
         };
         fs::write(dir.path().join(&path), b"bad").unwrap();
         assert!(verify(&source, dir.path(), || false).is_err());

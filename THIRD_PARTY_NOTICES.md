@@ -37,3 +37,23 @@ still requires reviewing all bundled dependencies, notices, and assets.
 Used for Windows exclusive directory publication (`MoveFileExW` without replacement
 flags). The full MIT notice is bundled in `packaging/licenses/renamore-MIT.txt`.
 No non-atomic rename fallback is used.
+
+## Native BitTorrent worker (next build)
+
+Ulos's protocol-1 worker links libtorrent-rasterbar 2.x (locally verified with
+2.1.2), nlohmann-json, and platform runtime dependencies. The application remains
+MIT; these dependencies keep their own licenses.
+
+- libtorrent: Copyright (c) 2003–2020 Arvid Norberg. BSD-3-Clause plus the bundled
+  component notices retained in `packaging/licenses/libtorrent-BSD-3-Clause.txt`
+  and `packaging/licenses/libtorrent-2.1.2-NOTICES.txt`.
+- nlohmann-json 3.12.0: Copyright (c) 2013–2025 Niels Lohmann. MIT notice retained
+  in `packaging/licenses/nlohmann-json-MIT.txt`.
+- Boost: Boost Software License 1.0, retained in `packaging/licenses/Boost-1.0.txt`.
+- OpenSSL: Apache License 2.0, retained in
+  `packaging/licenses/OpenSSL-Apache-2.0.txt`. The locally bundled runtime is 4.0.3;
+  build environments may supply a different compatible OpenSSL runtime.
+
+Windows native builds use a pinned vcpkg baseline; macOS/Linux packages include
+the worker's non-system runtime libraries and preserve their notices. This is
+not a complete transitive compliance audit or an endorsement by these authors.

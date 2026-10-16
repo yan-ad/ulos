@@ -494,6 +494,29 @@ fn add_new_dropdown_opens_independent_torrent_review(cx: &mut TestAppContext) {
         assert!(form.read(cx).source.is_none());
         assert!(!form.read(cx).can_submit(cx));
     });
+    let (form, mut child) = draft(&view, cx);
+    child.update(|window, cx| {
+        form.update(cx, |form, cx| {
+            form.magnet.update(cx, |input, cx| {
+                input.set_value(
+                    "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                    window,
+                    cx,
+                );
+                cx.emit(InputEvent::Change);
+            });
+        });
+    });
+    draw(&mut child);
+    form.update(&mut child, |form, cx| {
+        assert!(form.source.is_none(), "paste must not resolve metadata");
+        form.submit(true, cx);
+        form.submit(false, cx);
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.queue.items.is_empty() && view.active.is_none());
+    });
 }
 
 #[gpui::test]
@@ -540,4 +563,72 @@ fn torrent_callback_inbox_survives_main_close_while_review_owns_manager(cx: &mut
     drop(observer);
     child.run_until_parked();
     assert!(weak.upgrade().is_none());
+}
+
+#[gpui::test]
+fn torrent_settings_controls_validate_bounds_preserve_retry_and_do_not_enter_history(
+    cx: &mut TestAppContext,
+) {
+    let runtime = runtime();
+    let (_root, view, cx) = mount(cx, &runtime);
+    view.update(cx, |view, cx| {
+        let source = ulos_core::torrent::parse(metainfo(b"file.bin")).unwrap();
+        let id = view
+            .queue
+            .add_torrent(source, "controls.bin".into())
+            .unwrap();
+        view.set_torrent_limits(id, Some(1024), None, cx);
+        assert_eq!(
+            view.queue
+                .item(id)
+                .unwrap()
+                .torrent_settings
+                .download_bytes_per_second,
+            None
+        );
+        view.queue
+            .item_mut(id)
+            .unwrap()
+            .torrent_settings
+            .allow_upload = true;
+        view.set_torrent_limits(id, Some(0), None, cx);
+        view.set_torrent_limits(id, None, Some(1_073_741_825), cx);
+        assert_eq!(
+            view.queue
+                .item(id)
+                .unwrap()
+                .torrent_settings
+                .upload_bytes_per_second,
+            None
+        );
+        view.set_torrent_limits(id, Some(2048), Some(1024), cx);
+        view.set_torrent_peers(id, 250, cx);
+        view.set_torrent_peers(id, 10001, cx);
+        assert_eq!(
+            view.queue.item(id).unwrap().torrent_settings.peer_limit,
+            250
+        );
+        assert_eq!(
+            view.snapshot(id)
+                .unwrap()
+                .torrent_settings
+                .download_bytes_per_second,
+            Some(2048)
+        );
+        let item = view.queue.item_mut(id).unwrap();
+        item.apply_state(
+            TransferState::Failed("fixture failure".into()),
+            Instant::now(),
+        );
+        let settings = item.torrent_settings.clone();
+        assert!(item.reset_for_retry(CollisionPolicy::Rename));
+        assert_eq!(item.torrent_settings, settings);
+        let records = view.queue.history_records();
+        let mut restored = crate::queue::SessionQueue::default();
+        restored.restore_history(records).unwrap();
+        assert_eq!(
+            restored.items[0].torrent_settings,
+            ulos_core::torrent::TorrentSettings::default()
+        );
+    });
 }

@@ -232,7 +232,10 @@ async fn reject_and_overwrite_fail_before_network() {
             &tokio::runtime::Handle::current(),
             fixture(),
             destination.clone(),
-            TorrentOptions { collision },
+            TorrentOptions {
+                collision,
+                ..Default::default()
+            },
         );
         assert!(matches!(terminal(&task).await, TransferState::Failed(_)));
         assert_eq!(std::fs::read(&destination).unwrap(), b"original");
@@ -386,6 +389,7 @@ async fn verified_local_peer_single_multi_and_rename() {
             destination.clone(),
             TorrentOptions {
                 collision: CollisionPolicy::Rename,
+                ..Default::default()
             },
         );
         let state = terminal(&task).await;
@@ -533,7 +537,8 @@ fn v1_hybrid_and_symlink_extensions_are_explicit() {
         map.insert(b"meta version".to_vec(), B::I(2));
         map.insert(b"file tree".to_vec(), d(vec![]));
     }
-    assert!(parse(metainfo(hybrid, None)).is_ok());
+    // An empty v2 tree is malformed, even when v1 pieces are present.
+    assert!(parse(metainfo(hybrid, None)).is_err());
     let mut symlink = info("ok", b"x", None);
     if let B::D(ref mut map) = symlink {
         map.insert(b"symlink path".to_vec(), B::L(vec![s("elsewhere")]));

@@ -1,4 +1,4 @@
-//! Local-only torrent confirmation. This view never creates a download task or a session.
+//! Torrent review. Only an explicit Resolve contacts peers; this view never queues payloads.
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -9,6 +9,7 @@ use gpui_kit::{
     component::{
         Disableable,
         button::Button,
+        checkbox::Checkbox,
         description_list::{DescriptionItem, DescriptionList},
         form::{Field, Form},
         group_box::GroupBox,
@@ -24,7 +25,7 @@ use gpui_kit::{
 };
 use ulos_core::{
     naming::sanitize_filename,
-    torrent::{TorrentOptions, TorrentSource},
+    torrent::{TorrentOptions, TorrentProtocol, TorrentSettings, TorrentSource},
     transfer::CollisionPolicy,
 };
 
@@ -36,7 +37,7 @@ pub struct TorrentRequest {
 }
 pub struct DismissTorrent;
 
-const PRIVACY: &str = "Confirm before contacting trackers and peers. Download later may start in a running queue. DHT, local discovery, port forwarding, payload upload and seeding are disabled.";
+const PRIVACY: &str = "Trackers and peers learn your network address. Optional DHT contacts the public network; peer uploads send downloaded payload to others. Download later may start in a running queue. Resolving a magnet contacts trackers/peers only after Resolve; Start or Download later is a separate payload decision. No local discovery, port forwarding or post-completion seeding. The worker stops before verified publication.";
 const COLLISIONS: [CollisionPolicy; 2] = [CollisionPolicy::Reject, CollisionPolicy::Rename];
 const FILE_PREVIEW_LIMIT: usize = 20;
 
@@ -72,8 +73,15 @@ impl Drop for Worker {
 pub struct AddTorrent {
     pub source: Option<TorrentSource>,
     pub destination: Entity<InputState>,
+    pub magnet: Entity<InputState>,
+    resolution_dht: bool,
+    resolved_magnet: Option<String>,
     pub choosing_path: bool,
     pub options: TorrentOptions,
+    available_native: bool,
+    download_rate: Entity<InputState>,
+    upload_rate: Entity<InputState>,
+    peer_limit: Entity<InputState>,
     default_directory: Option<PathBuf>,
     suggested_path: Option<String>,
     source_filename: Option<String>,
@@ -115,9 +123,56 @@ impl AddTorrent {
             }
             cx.notify();
         });
+        let magnet = cx.new(|cx| InputState::new(window, cx).placeholder("magnet:?xt=…"));
+        let magnet_subscription = cx.subscribe_in(&magnet, window, |view, _, event, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                // Editing a magnet never starts discovery, and a separate local file stays valid.
+                if view
+                    .resolved_magnet
+                    .as_deref()
+                    .is_some_and(|uri| uri != view.magnet.read(cx).value().as_ref())
+                {
+                    view.generation = view.generation.wrapping_add(1);
+                    view.loader = None;
+                    view._load_task = None;
+                    view.loading = false;
+                    view.source = None;
+                    view.source_filename = None;
+                    view.resolved_magnet = None;
+                    view.reset_settings(window, cx);
+                    view.invalidate_target();
+                }
+                view.source_error = None;
+            }
+            cx.notify();
+        });
+        let download_rate =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Blank = unlimited"));
+        let upload_rate = cx.new(|cx| InputState::new(window, cx).placeholder("Blank = unlimited"));
+        let peer_limit = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value("100", window, cx);
+            input
+        });
+        let mut subscriptions = vec![subscription, magnet_subscription];
+        for input in [&download_rate, &upload_rate, &peer_limit] {
+            subscriptions.push(
+                cx.subscribe_in(input, window, |view, _, _: &InputEvent, _, cx| {
+                    view.refresh_option_draft(cx);
+                    cx.notify();
+                }),
+            );
+        }
         let mut view = Self {
+            available_native: ulos_core::torrent::native_worker_available(),
+            download_rate,
+            upload_rate,
+            peer_limit,
             source: None,
             destination,
+            magnet,
+            resolution_dht: false,
+            resolved_magnet: None,
             choosing_path: false,
             options: TorrentOptions::default(),
             default_directory,
@@ -135,7 +190,7 @@ impl AddTorrent {
             target_worker: None,
             _target_task: None,
             validation_requested: false,
-            _subscriptions: vec![subscription],
+            _subscriptions: subscriptions,
             _prompt: None,
         };
         if let Some(path) = source_path {
@@ -153,6 +208,11 @@ impl AddTorrent {
         self.loader = None;
         self._load_task = None;
         self.source = None;
+        self.resolved_magnet = None;
+        self.resolution_dht = false;
+        self.magnet
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.reset_settings(window, cx);
         self.loading = false;
         self.source_error = None;
         self.source_filename = path
@@ -166,9 +226,19 @@ impl AddTorrent {
             return;
         }
         self.loading = true;
-        let generation = self.generation;
         // Core load is bounded local parsing, not tracker/peer discovery.
         let worker = self.runtime.spawn(ulos_core::torrent::load(path));
+        self.observe_source(worker, false, window, cx);
+    }
+
+    fn observe_source(
+        &mut self,
+        worker: tokio::task::JoinHandle<Result<TorrentSource, ulos_core::torrent::TorrentError>>,
+        magnet: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.generation;
         self.loader = Some(Worker(worker.abort_handle()));
         self._load_task = Some(cx.spawn_in(window, async move |view, cx| {
             // Do not await a pending Tokio handle on GPUI's test executor.
@@ -186,22 +256,73 @@ impl AddTorrent {
                 view.loader = None;
                 match result {
                     Ok(Ok(source)) => {
+                        view.reset_settings(window, cx);
                         view.source = Some(source);
                         view.suggest_destination(window, cx);
                         view.check_target(window, cx);
                     }
                     Ok(Err(error)) => {
-                        view.source_error = Some(error.to_string().chars().take(240).collect())
+                        view.source_error = Some(if magnet {
+                            "Could not resolve magnet metadata. Check the link and peer availability, or choose a .torrent file. V2 / hybrid magnets without required piece layers are unsupported.".into()
+                        } else { error.to_string().chars().take(240).collect() })
                     }
                     Err(_) => {
                         view.source_error =
-                            Some("Could not read this torrent. Choose the file again.".into())
+                            Some(if magnet { "Could not resolve magnet metadata. Retry Resolve or choose a .torrent file." } else { "Could not read this torrent. Choose the file again." }.into())
                     }
                 }
                 cx.notify();
             });
         }));
         cx.notify();
+    }
+
+    fn reset_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.options.settings = TorrentSettings::default();
+        self.download_rate
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.upload_rate
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.peer_limit
+            .update(cx, |input, cx| input.set_value("100", window, cx));
+    }
+
+    fn valid_magnet(&self, cx: &App) -> bool {
+        ulos_core::torrent::validate_magnet(self.magnet.read(cx).value().as_ref()).is_ok()
+    }
+
+    /// Explicit metadata-only network action; editing/pasting never calls this method.
+    pub fn resolve_magnet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.choosing_path || self.loading {
+            return;
+        }
+        if !self.valid_magnet(cx) {
+            self.source_error =
+                Some("Enter a valid supported magnet link, or choose a .torrent file.".into());
+            cx.notify();
+            return;
+        }
+        if !self.available_native {
+            self.source_error = Some("Resolving magnets requires the native torrent worker. Choose a .torrent file instead.".into());
+            cx.notify();
+            return;
+        }
+        let uri = self.magnet.read(cx).value().to_string();
+        self.generation = self.generation.wrapping_add(1);
+        self.loader = None;
+        self._load_task = None;
+        self.source = None;
+        self.source_error = None;
+        self.source_filename = Some("Magnet metadata".into());
+        self.resolved_magnet = Some(uri.clone());
+        self.reset_settings(window, cx);
+        self.validation_requested = false;
+        self.invalidate_target();
+        self.loading = true;
+        let worker = self
+            .runtime
+            .spawn(ulos_core::torrent::resolve_magnet(uri, self.resolution_dht));
+        self.observe_source(worker, true, window, cx);
     }
 
     fn destination_path(&self, cx: &App) -> Option<PathBuf> {
@@ -336,6 +457,34 @@ impl AddTorrent {
         cx.notify();
     }
 
+    fn parsed_settings(&self, cx: &App) -> Result<TorrentSettings, &'static str> {
+        let mut settings = self.options.settings.clone();
+        settings.download_bytes_per_second = crate::download_details::parse_optional_rate(
+            self.download_rate.read(cx).value().as_ref(),
+        )?;
+        settings.upload_bytes_per_second = crate::download_details::parse_optional_rate(
+            self.upload_rate.read(cx).value().as_ref(),
+        )?;
+        settings.peer_limit =
+            crate::download_details::parse_peers(self.peer_limit.read(cx).value().as_ref())?;
+        if settings.dht && self.source.as_ref().is_some_and(TorrentSource::is_private) {
+            return Err("DHT cannot be used for private torrents.");
+        }
+        if (!self.available_native || !settings.allow_upload)
+            && (settings.dht
+                || settings.download_bytes_per_second.is_some()
+                || settings.upload_bytes_per_second.is_some()
+                || settings.peer_limit != 100)
+        {
+            return Err("DHT and limits require the native worker and peer-upload consent.");
+        }
+        Ok(settings)
+    }
+    fn refresh_option_draft(&mut self, cx: &App) {
+        if let Ok(settings) = self.parsed_settings(cx) {
+            self.options.settings = settings;
+        }
+    }
     pub fn can_submit(&self, cx: &App) -> bool {
         self.submission_issue(cx).is_none()
     }
@@ -344,10 +493,22 @@ impl AddTorrent {
             return Some("Finish choosing a path first.");
         }
         if self.loading {
-            return Some("Wait for the torrent file to finish loading.");
+            return Some("Wait for torrent metadata to finish loading.");
         }
         if self.source.is_none() {
-            return Some("Choose a valid local .torrent file.");
+            return Some("Choose a valid .torrent file or explicitly resolve a magnet.");
+        }
+        if let Err(issue) = self.parsed_settings(cx) {
+            return Some(issue);
+        }
+        let source = self.source.as_ref().unwrap();
+        if source.protocol() != TorrentProtocol::V1 && !self.options.settings.allow_upload {
+            return Some("V2 and hybrid torrents require explicit peer-upload consent.");
+        }
+        if (source.protocol() != TorrentProtocol::V1 || self.options.settings.allow_upload)
+            && !self.available_native
+        {
+            return Some("The native torrent worker is unavailable.");
         }
         let Some(path) = self.destination_path(cx) else {
             return Some("Choose a destination folder or enter the full destination path.");
@@ -391,8 +552,11 @@ impl AddTorrent {
                 .is_some_and(|source| source == &request.source)
             && self.destination_path(cx).as_ref() == Some(&request.destination)
             && self.options.collision == request.options.collision
+            && self.parsed_settings(cx).ok().as_ref() == Some(&request.options.settings)
+            && self.options.settings == request.options.settings
     }
     pub fn submit(&mut self, start_now: bool, cx: &mut Context<Self>) {
+        self.refresh_option_draft(cx);
         if !self.can_submit(cx) {
             self.validation_requested = true;
             cx.notify();
@@ -430,6 +594,9 @@ impl AddTorrent {
             self.loader = None;
             self._load_task = None;
             self.source = None;
+            self.reset_settings(window, cx);
+            self.resolved_magnet = None;
+            self.resolution_dht = false;
             self.source_filename = None;
             self.loading = false;
             self.source_error = Some("Drop exactly one local .torrent file.".into());
@@ -456,6 +623,25 @@ impl AddTorrent {
             ("Files", source.file_count().to_string()),
             ("Trackers", source.tracker_count().to_string()),
             ("Info hash", source.info_hash()),
+            ("Protocol", format!("{:?}", source.protocol())),
+            (
+                "Engine",
+                if source.protocol() != TorrentProtocol::V1 || self.options.settings.allow_upload {
+                    "Native worker"
+                } else {
+                    "Built-in download-only"
+                }
+                .into(),
+            ),
+            (
+                "Privacy",
+                if source.is_private() {
+                    "Private"
+                } else {
+                    "Public"
+                }
+                .into(),
+            ),
         ];
         GroupBox::new()
             .title(Label::new("Torrent contents"))
@@ -543,6 +729,26 @@ impl Render for AddTorrent {
                                         ),
                                 ),
                             )
+                            .child(Field::new().label("Magnet link").child(Input::new(&self.magnet).disabled(self.choosing_path || self.loading)))
+                            .child(Field::new().child(
+                                Checkbox::new("magnet-resolution-dht")
+                                    .label("Allow public DHT during magnet resolution")
+                                    .checked(self.resolution_dht)
+                                    .disabled(!self.available_native || self.choosing_path || self.loading)
+                                    .on_click(cx.listener(|view, checked, _, cx| {
+                                        if view.available_native && !view.choosing_path && !view.loading { view.resolution_dht = *checked; }
+                                        cx.notify();
+                                    }))
+                            ))
+                            .child(Field::new().child(Label::new("Private status unknown before resolution; DHT can expose this hash. Resolution uses the native worker for metadata only, not payload downloads.")))
+                            .child(Field::new().child(Label::new("V2 / hybrid magnets without required piece layers may fail; choose a .torrent file instead.")))
+                            .child(Field::new().child(
+                                Button::new("resolve-magnet")
+                                    .debug_selector(|| "resolve-magnet".into())
+                                    .label("Resolve magnet")
+                                    .disabled(!self.available_native || self.choosing_path || self.loading || !self.valid_magnet(cx))
+                                    .on_click(cx.listener(|view, _, window, cx| view.resolve_magnet(window, cx)))
+                            ))
                             .child(
                                 Field::new()
                                     .label("Destination (full file or root folder path)")
@@ -607,14 +813,34 @@ impl Render for AddTorrent {
                                 "Existing files and folders are never overwritten.",
                             ))),
                     )
+                    .when(!self.magnet.read(cx).value().is_empty() && !self.valid_magnet(cx), |content| {
+                        content.child(Label::new("Enter a valid supported magnet link, or choose a .torrent file."))
+                    })
                     .when(self.loading, |content| {
-                        content.child(Label::new("Reading torrent file…"))
+                        content.child(Label::new(if self.resolved_magnet.is_some() { "Resolving magnet metadata with the native worker…" } else { "Reading torrent file…" }))
                     })
                     .when_some(self.source_error.clone(), |content, error| {
                         content.child(Label::new(error))
                     })
                     .child(self.metadata(cx))
-                    .when(self.source.as_ref().is_some_and(|source| source.tracker_count() == 0), |content| {
+                    .when(self.source.as_ref().is_some_and(|source| source.protocol() != TorrentProtocol::V1) && !self.options.settings.allow_upload, |content| content.child(Label::new("V2 / hybrid detected: native engine requires explicit peer-upload consent below.")))
+                    .when(!self.available_native, |content| content.child(Label::new("Native torrent worker unavailable. V1 download-only remains available; uploads, DHT and torrent limits require the native worker.")))
+                    .child(Checkbox::new("torrent-upload-consent").label("Allow peer uploads while downloading").checked(self.options.settings.allow_upload).disabled(!self.available_native || self.choosing_path || self.loading)
+                        .on_click(cx.listener(|view, checked, window, cx| { view.options.settings.allow_upload = *checked; if !*checked {
+                            view.options.settings = TorrentSettings::default();
+                            view.download_rate.update(cx, |input, cx| input.set_value("", window, cx));
+                            view.upload_rate.update(cx, |input, cx| input.set_value("", window, cx));
+                            view.peer_limit.update(cx, |input, cx| input.set_value("100", window, cx));
+                        } cx.notify(); })))
+                    .child(Checkbox::new("torrent-dht").label("Use DHT for public torrents").checked(self.options.settings.dht)
+                        .disabled(!self.available_native || !self.options.settings.allow_upload || self.source.as_ref().is_none_or(TorrentSource::is_private))
+                        .on_click(cx.listener(|view, checked, _, cx| { if view.available_native && view.options.settings.allow_upload && view.source.as_ref().is_some_and(|source| !source.is_private()) { view.options.settings.dht = *checked; } cx.notify(); })))
+                    .child(Label::new("Native limits: 1–1048576 KiB/s (blank = unlimited); 1–10000 peers. Requires peer-upload consent."))
+                    .child(Form::new()
+                        .child(Field::new().label("Download KiB/s").child(Input::new(&self.download_rate).disabled(!self.available_native || !self.options.settings.allow_upload)))
+                        .child(Field::new().label("Upload KiB/s").child(Input::new(&self.upload_rate).disabled(!self.available_native || !self.options.settings.allow_upload)))
+                        .child(Field::new().label("Peer limit").child(Input::new(&self.peer_limit).disabled(!self.available_native || !self.options.settings.allow_upload))))
+                    .when(self.source.as_ref().is_some_and(|source| source.tracker_count() == 0) && !self.options.settings.dht, |content| {
                         content.child(Label::new("This torrent has no trackers. Peer discovery is unavailable while DHT and local discovery are disabled."))
                     })
                     .when(
@@ -694,6 +920,150 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[gpui::test]
+    fn magnet_edit_and_invalid_resolve_never_start_workers_or_queue(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.update(gpui_kit::init);
+        let mut form = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view =
+                cx.new(|cx| AddTorrent::new(None, None, runtime.handle().clone(), window, cx));
+            form = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let form = form.unwrap();
+        let (sender, requests) = mpsc::channel();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&form, move |_, _: &TorrentRequest, _| {
+                sender.send(()).unwrap();
+            })
+        });
+        cx.update(|window, cx| {
+            form.update(cx, |view, cx| {
+                assert!(!view.resolution_dht);
+                view.resolve_magnet(window, cx);
+                assert!(view.source_error.is_some());
+                for text in ["not a magnet", "magnet:?xt=urn:btih:bad"] {
+                    view.magnet
+                        .update(cx, |input, cx| input.set_value(text, window, cx));
+                    view.resolve_magnet(window, cx);
+                    assert!(!view.loading);
+                    assert!(view.loader.is_none());
+                    assert_eq!(view.generation, 0);
+                }
+                view.magnet.update(cx, |input, cx| {
+                    input.set_value(
+                        "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                        window,
+                        cx,
+                    );
+                    cx.emit(gpui_kit::component::input::InputEvent::Change);
+                });
+            })
+        });
+        cx.run_until_parked();
+        form.update(cx, |view, cx| {
+            assert!(view.valid_magnet(cx));
+            assert!(view.source.is_none());
+            assert!(!view.loading);
+            assert!(view.loader.is_none());
+            assert_eq!(view.generation, 0);
+            assert_eq!(
+                view.options.settings,
+                ulos_core::torrent::TorrentSettings::default()
+            );
+            view.submit(true, cx);
+            view.submit(false, cx);
+        });
+        assert!(requests.try_recv().is_err());
+        cx.update(|window, cx| {
+            form.update(cx, |view, cx| {
+                view.available_native = false;
+                view.resolve_magnet(window, cx);
+                assert!(
+                    view.source_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("native torrent worker")
+                );
+                assert!(view.loader.is_none());
+                assert!(!view.loading);
+                assert_eq!(view.generation, 0);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn magnet_draft_keeps_local_source_and_edit_invalidates_resolved_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local.torrent");
+        std::fs::write(&path, metainfo()).unwrap();
+        cx.update(gpui_kit::init);
+        let mut form = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                AddTorrent::new(
+                    Some(path.clone()),
+                    None,
+                    runtime.handle().clone(),
+                    window,
+                    cx,
+                )
+            });
+            form = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let form = form.unwrap();
+        settle(cx, |cx| form.read_with(cx, |view, _| view.source.is_some()));
+        cx.update(|window, cx| {
+            form.update(cx, |view, cx| {
+                view.magnet.update(cx, |input, cx| {
+                    input.set_value(
+                        "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                        window,
+                        cx,
+                    );
+                    cx.emit(gpui_kit::component::input::InputEvent::Change);
+                });
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            form.update(cx, |view, cx| {
+                assert!(
+                    view.source.is_some(),
+                    "editing separate magnet draft must keep a local file"
+                );
+                // Simulate the provenance of completed resolution, not a network operation.
+                view.resolved_magnet = Some(view.magnet.read(cx).value().to_string());
+                view.options.settings.allow_upload = true;
+                view.resolution_dht = true;
+                view.magnet.update(cx, |input, cx| {
+                    input.set_value("changed", window, cx);
+                    cx.emit(gpui_kit::component::input::InputEvent::Change);
+                });
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            form.update(cx, |view, cx| {
+                assert!(view.source.is_none());
+                assert_eq!(
+                    view.options.settings,
+                    ulos_core::torrent::TorrentSettings::default()
+                );
+                view.set_source_path(path, window, cx);
+                assert!(view.resolved_magnet.is_none());
+                assert!(!view.resolution_dht);
+                assert!(view.magnet.read(cx).value().is_empty());
+            })
+        });
+        settle(cx, |cx| form.read_with(cx, |view, _| !view.loading));
     }
 
     #[test]
@@ -801,6 +1171,17 @@ mod tests {
                     options: view.options.clone(),
                 };
                 assert!(view.matches_request(&request, cx));
+                let mut forged = TorrentRequest {
+                    source: request.source.clone(),
+                    destination: request.destination.clone(),
+                    start_now: request.start_now,
+                    options: request.options.clone(),
+                };
+                forged.options.settings.allow_upload = true;
+                assert!(!view.matches_request(&forged, cx));
+                forged.options.settings = request.options.settings.clone();
+                forged.options.settings.peer_limit = 999;
+                assert!(!view.matches_request(&forged, cx));
                 view.choosing_path = true;
                 assert!(!view.matches_request(&request, cx));
                 view.submit(false, cx);
@@ -859,6 +1240,8 @@ mod tests {
             assert!(!view.can_submit(cx));
             view.set_collision(CollisionPolicy::Rename, cx);
             assert!(view.can_submit(cx));
+            view.options.settings.allow_upload = true;
+            view.options.settings.dht = true;
         });
         cx.update(|window, cx| {
             form.update(cx, |view, cx| {
@@ -866,6 +1249,10 @@ mod tests {
                 view.set_source_path(bad, window, cx);
                 assert!(view.source.is_none());
                 assert_eq!(view.options.collision, CollisionPolicy::Reject);
+                assert_eq!(
+                    view.options.settings,
+                    ulos_core::torrent::TorrentSettings::default()
+                );
             })
         });
         settle(cx, |cx| form.read_with(cx, |view, _| !view.loading));

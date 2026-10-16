@@ -46,10 +46,28 @@ impl DownloadTask {
             Self::Torrent(task) => task.resume(),
         }
     }
+    pub fn torrent_settings(&self) -> Option<ulos_core::torrent::TorrentSettings> {
+        match self {
+            Self::Torrent(task) => Some(task.current_settings()),
+            Self::Http(_) => None,
+        }
+    }
+    pub fn set_torrent_limits(&self, download: Option<u64>, upload: Option<u64>) -> bool {
+        match self {
+            Self::Torrent(task) => task.set_limits(download, upload),
+            Self::Http(_) => false,
+        }
+    }
+    pub fn set_peer_limit(&self, peers: usize) -> bool {
+        match self {
+            Self::Torrent(task) => task.set_peer_limit(peers),
+            Self::Http(_) => false,
+        }
+    }
     pub fn set_rate_limit(&self, value: Option<u64>) -> bool {
         match self {
             Self::Http(task) => task.set_rate_limit(value),
-            Self::Torrent(_) => false,
+            Self::Torrent(task) => task.set_rate_limit(value),
         }
     }
 }

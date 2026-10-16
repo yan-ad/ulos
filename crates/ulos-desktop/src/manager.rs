@@ -393,6 +393,7 @@ impl DownloadManager {
         item.last_try = Some(std::time::SystemTime::now());
         item.apply_state(TransferState::Preparing, Instant::now());
         let options = item.options.clone();
+        let torrent_settings = item.torrent_settings.clone();
         self.active = Some(id);
         self.save_history();
         self._updates = None;
@@ -403,6 +404,7 @@ impl DownloadManager {
                 destination,
                 ulos_core::torrent::TorrentOptions {
                     collision: options.collision,
+                    settings: torrent_settings,
                 },
             ))
         } else {
@@ -767,6 +769,14 @@ impl DownloadManager {
             is_torrent: item.is_torrent,
             output_directory: item.output_directory,
             torrent: item.torrent_telemetry.clone(),
+            torrent_settings: if self.active == Some(id) {
+                self.transfer
+                    .as_ref()
+                    .and_then(DownloadTask::torrent_settings)
+                    .unwrap_or_else(|| item.torrent_settings.clone())
+            } else {
+                item.torrent_settings.clone()
+            },
             torrent_fresh: item.is_torrent && item.speed_bytes_per_second().is_some(),
             error: match &item.state {
                 Some(TransferState::Failed(error)) => {
@@ -871,8 +881,13 @@ impl DownloadManager {
         cx: &mut Context<Self>,
     ) {
         if self.queue.item(id).is_some_and(|item| item.is_torrent) {
-            self.notice = Some("Torrent rate controls are not available.".into());
-            cx.notify();
+            let upload = self
+                .queue
+                .item(id)
+                .unwrap()
+                .torrent_settings
+                .upload_bytes_per_second;
+            self.set_torrent_limits(id, rate, upload, cx);
             return;
         }
         if rate == Some(0) {

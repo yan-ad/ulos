@@ -109,6 +109,7 @@ pub struct QueueItem {
     pub cancelling: bool,
     pub options: TransferOptions,
     pub telemetry: TransferTelemetry,
+    pub torrent_settings: ulos_core::torrent::TorrentSettings,
     pub torrent_source: Option<TorrentSource>,
     pub torrent_telemetry: Option<TorrentTelemetry>,
     pub is_torrent: bool,
@@ -474,6 +475,7 @@ impl SessionQueue {
                     },
                     is_torrent: record.is_torrent,
                     output_directory: record.output_directory,
+                    torrent_settings: Default::default(),
                     torrent_source: None,
                     torrent_telemetry: None,
                     telemetry: TransferTelemetry {
@@ -570,6 +572,7 @@ impl SessionQueue {
                 initial_torrent_telemetry(source.total_bytes(), source.tracker_count())
             }),
             torrent_source,
+            torrent_settings: Default::default(),
             // Four HTTP connections, not CPU workers; core's default stays one.
             options: TransferOptions {
                 connections: 4,

@@ -17,6 +17,8 @@ target=${CARGO_TARGET_DIR:-"$root/target"}
 case "$target" in /*) ;; *) target="$root/$target" ;; esac
 if [ -n "${CARGO_BUILD_TARGET:-}" ]; then target="$target/$CARGO_BUILD_TARGET"; fi
 binary="$target/$profile/ulos-desktop"
+worker="$target/$profile/ulos-torrent-worker"
+[ -f "$worker" ] && [ -x "$worker" ] || { echo "Build the native worker first: $worker" >&2; exit 1; }
 [ -f "$binary" ] && [ -x "$binary" ] || { echo "Build the selected desktop profile first: $binary" >&2; exit 1; }
 [ ! -e "$output" ] && [ ! -L "$output" ] || { echo 'Output exists (no overwrite).' >&2; exit 1; }
 version=$(cd "$root" && python3 scripts/release-version.py)
@@ -27,6 +29,15 @@ mkdir -p -- "$(dirname -- "$output")"
 mkdir -- "$output"
 mkdir -- "$output/Contents" "$output/Contents/MacOS" "$output/Contents/Resources"
 cp -- "$binary" "$output/Contents/MacOS/Ulos"
+cp -- "$worker" "$output/Contents/MacOS/ulos-torrent-worker"
+if [ -d "$target/$profile/lib" ]; then
+    cp -R -- "$target/$profile/lib" "$output/Contents/MacOS/lib"
+    for library in "$output/Contents/MacOS/lib/"*; do
+        [ -f "$library" ] || continue
+        codesign --force --sign - "$library"
+    done
+fi
+codesign --force --sign - "$output/Contents/MacOS/ulos-torrent-worker"
 cp -- "$root/packaging/macos/Info.plist" "$output/Contents/Info.plist"
 cp -- "$root/assets/branding/ulos.icns" "$output/Contents/Resources/Ulos.icns"
 cp -- "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$output/Contents/Resources/"

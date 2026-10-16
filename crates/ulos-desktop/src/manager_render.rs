@@ -227,10 +227,12 @@ impl DownloadManager {
                                 },
                             ))
                             .item(
-                                PopupMenuItem::new("Torrent file…").on_click(move |_, _, cx| {
-                                    let _ =
-                                        torrent.update(cx, |view, cx| view.open_torrent(None, cx));
-                                }),
+                                PopupMenuItem::new("Torrent file or magnet…").on_click(
+                                    move |_, _, cx| {
+                                        let _ = torrent
+                                            .update(cx, |view, cx| view.open_torrent(None, cx));
+                                    },
+                                ),
                             )
                         }
                     }),

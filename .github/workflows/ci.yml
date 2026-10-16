@@ -18,13 +18,43 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - name: Verify native Rust compiler host
+        shell: bash
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$CARGO_BUILD_TARGET"
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Configure native Windows ARM64 CMake builds
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          "CMAKE_GENERATOR=Visual Studio 17 2022" >> $env:GITHUB_ENV
+          "CMAKE_GENERATOR_PLATFORM=ARM64" >> $env:GITHUB_ENV
+          "CMAKE_GENERATOR_TOOLSET=host=arm64" >> $env:GITHUB_ENV
+      - name: Test release packager (synthetic headers)
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -34,17 +64,67 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - name: Verify native Rust compiler host
+        shell: bash
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$CARGO_BUILD_TARGET"
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Configure native Windows ARM64 CMake builds
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          "CMAKE_GENERATOR=Visual Studio 17 2022" >> $env:GITHUB_ENV
+          "CMAKE_GENERATOR_PLATFORM=ARM64" >> $env:GITHUB_ENV
+          "CMAKE_GENERATOR_TOOLSET=host=arm64" >> $env:GITHUB_ENV
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config clang cmake libfontconfig-dev libwayland-dev libwebkit2gtk-4.1-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev libvulkan1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Build and test bundled native torrent worker
+        run: python3 scripts/build-torrent-worker.py --profile debug --test --install-deps
+      - name: Select native worker for Rust integration tests
+        shell: bash
+        run: |
+          python3 - <<'PYWORKER'
+          import os
+          from pathlib import Path
+          target = Path(os.environ.get('CARGO_TARGET_DIR', 'target')) / os.environ.get('CARGO_BUILD_TARGET', '') / 'debug'
+          worker = target / ('ulos-torrent-worker.exe' if os.name == 'nt' else 'ulos-torrent-worker')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('ULOS_TORRENT_WORKER=' + str(worker.resolve()) + '\n')
+          PYWORKER
       - run: cargo check --locked -p ulos-desktop
+      - name: Verify real v2 and hybrid task publication
+        timeout-minutes: 5
+        run: cargo test --locked -p ulos-core --test torrent_native_integration -- --ignored --test-threads=1
       - name: Compile desktop adapter tests
         timeout-minutes: 15
         run: cargo test --locked --workspace --no-run

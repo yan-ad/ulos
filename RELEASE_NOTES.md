@@ -1,3 +1,46 @@
+# Next build (unreleased; no version/tag change)
+
+These are source/workflow changes for a future build, **not features or new assets
+in the already-published 0.0.1-pre.0 release**. Existing tags/releases are not rewritten.
+
+- Automatic v1/v2/hybrid `.torrent` detection and backend selection. Genuine BEP 52
+  v2/hybrid uses a bundled BSD libtorrent 2 native process, not a v2 toggle on rqbit.
+- V1 defaults remain tracker-only/no payload upload. Native v2/hybrid requires
+  explicit peer-upload consent; advanced v1 can opt in too. Optional public DHT,
+  initial/live download/upload limits and peer caps use the native engine. Private
+  payload DHT stays off; local discovery, UPnP/port forwarding, post-completion
+  seeding and durable resume remain unavailable. This is not unlimited/every-torrent support.
+- Explicit **Resolve magnet** in the Torrent file draft and public Rust API validate
+  bounded btih hex/base32 and btmh SHA-256/hybrid identities. Native metadata-only
+  discovery uses trackers/direct numeric peers; a separate public-DHT checkbox is
+  off by default and warns that private status is unknown before resolution. No
+  paste-triggered networking, automatic payload dispatch or OS magnet association.
+  Exact requested hashes/core validation precede review; required v2/hybrid piece
+  layers unavailable through BEP 9 fail closed with `.torrent` fallback. Resolution
+  uses private temporary storage, zero file priorities/`upload_mode` and bounded
+  120-second engine/125-second host deadlines; see the [contract](docs/TORRENTS.md).
+- Offline manifest approval precedes native session Start; bounded shell-free IPC,
+  independent v2 SHA-256 Merkle and hybrid SHA-1 verification, resource/path limits,
+  teardown-before-verification and no-clobber publication retain safety boundaries.
+- The next-build app requires the matching native helper/runtime closure. Packaging
+  fails on a missing worker, checks binary architecture and must retain engine and
+  runtime notices/licenses, including supplied libtorrent BSD/full component,
+  OpenSSL Apache-2.0, Boost and nlohmann-json MIT files. macOS/Linux use system
+  libtorrent 2 packages; Windows pins 2.1.2 through vcpkg, not an all-OS version pin.
+  See [packaging](packaging/README.md).
+- Future workflow targets six packages: macOS ARM64/x86-64 DMGs, Windows ARM64/x86-64
+  ZIPs and Ubuntu 24.04 ARM64/x86-64 tar archives. Windows ARM64 uses `windows-11-arm`,
+  native MSVC/SDK and explicit CMake ARM64 host/toolset; Linux ARM64 uses
+  `ubuntu-24.04-arm`. Exact Rust host/target and executable-header checks protect
+  architecture identity.
+- CI configures real worker loopback and explicitly invoked ignored parent-task
+  integration tests, plus desktop adapter checks. Configuration and synthetic
+  packaging-header tests are not successful six-platform compile/runtime results.
+  Native ARM runtime, clean-install and visual/accessibility validation remain
+  separate gates; no current CI result is claimed here.
+
+---
+
 # Ulos 0.0.1-pre.0
 
 First public Ulos build. This version is published as a normal GitHub release, not marked as a GitHub prerelease, despite the early-version tag.

@@ -1,6 +1,8 @@
 # Install Ulos
 
 Download the archive for your operating system and CPU from the release assets.
+Windows ARM64 and Linux ARM64 are configured for future releases; use only assets
+actually listed on the selected release. Older releases may not include them.
 SHA256SUMS records the archive digests; it is not a signature or publisher identity.
 
 - **macOS Apple silicon:** use `macos-arm64.dmg`.
@@ -11,10 +13,12 @@ SHA256SUMS records the archive digests; it is not a signature or publisher ident
   normal Finder Open / System Settings Privacy & Security approval flow. Do not
   disable Gatekeeper or remove quarantine globally. Runner build/test success does
   not certify compatibility with older macOS releases.
-- **Windows x86-64:** extract the ZIP to a folder, then double-click **Ulos.exe**.
+- **Windows Intel/AMD x86-64** (`windows-x86_64.zip`) or **Windows ARM64**
+  (`windows-arm64.zip`, for ARM-based PCs): extract the ZIP to a folder, then double-click **Ulos.exe**.
   The executable is not publisher-signed; Windows SmartScreen may warn. No registry
   changes or administrator access are required to start the application.
-- **Linux x86-64:** extract the `.tar.gz` with your archive manager, then open
+- **Linux x86-64** (`linux-x86_64.tar.gz`) or **Linux ARM64**
+  (`linux-arm64.tar.gz`): extract the `.tar.gz` with your archive manager, then open
   **Ulos** in the extracted folder. Some file managers require confirming that it
   is executable. This is a portable folder, **not** an AppImage or fully static
   application: it is built on Ubuntu 24.04 and needs a compatible desktop runtime
@@ -26,3 +30,16 @@ SHA256SUMS records the archive digests; it is not a signature or publisher ident
 No installer changes default torrent handlers. Choose Ulos explicitly in Open With
 when desired, or use the app's file picker. Keep LICENSE, THIRD_PARTY_NOTICES.md
 and the licenses folder with redistributed copies.
+
+## Next-build torrent files
+
+Extract/copy the complete application, not just its main executable: the native
+`ulos-torrent-worker` helper and included `lib/` runtime libraries are required
+for v2/hybrid torrents, explicit magnet metadata resolution (including v1), peer uploads, public DHT and torrent rate/peer controls. Next-build application bundles require this helper and its complete runtime closure.
+Keep them in their supplied locations; no separate end-user engine installation
+is intended. The old 0.0.1-pre.0 assets are not retroactively changed.
+
+Ulos detects v1/v2/hybrid automatically, but v2/hybrid requires explicit **Allow
+peer uploads while downloading** consent. Default v1 remains tracker-only with
+no payload upload. Known-private payload DHT is always off. In the Torrent file draft, paste a magnet and explicitly choose **Resolve magnet** for metadata-only discovery; nothing resolves on paste or downloads payload automatically. A separate public-DHT resolution checkbox is off by default: private status is unknown until metadata arrives, so enabling it can expose a private hash. Review the verified result before Start/Download later. V2/hybrid magnets with files larger than one piece cannot supply required piece layers through BEP 9 and fail closed; choose a `.torrent` file instead. There is no OS magnet-handler registration. Local discovery, port forwarding, post-completion seeding and durable resume remain unavailable; safety/resource limits still apply. A missing/unlaunchable helper is an error, not permission to silently
+change engines or upload policy. See the [torrent guide](../docs/TORRENTS.md).
