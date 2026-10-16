@@ -20,33 +20,6 @@ pub fn merge_pending(
         if !merged.contains(&path) {
             merged.push(path);
         }
-
-        #[cfg(windows)]
-        #[test]
-        fn windows_drive_file_urls_roundtrip_but_remote_and_driveless_urls_do_not() {
-            let path = PathBuf::from("C:\\Users\\Example\\Downloads\\日 a.torrent");
-            assert_eq!(
-                opened_urls(vec![
-                    "file:///C:/Users/Example/Downloads/%E6%97%A5%20a.torrent".into()
-                ]),
-                Ok(vec![path.clone()])
-            );
-            assert_eq!(
-                argument_paths([path.as_os_str().to_owned()]),
-                Ok(vec![path])
-            );
-            for value in [
-                "file:///tmp/a.torrent",
-                "file://server/share/a.torrent",
-                "\\\\server\\share\\a.torrent",
-                "\\\\?\\C:\\tmp\\a.torrent",
-            ] {
-                assert!(
-                    opened_urls(vec![value.into()]).is_err(),
-                    "unsupported path was accepted"
-                );
-            }
-        }
     }
     if merged.len() > MAX_INTAKE_FILES {
         return Err(TOO_MANY);
@@ -228,6 +201,33 @@ fn local_path(text: &str) -> Result<PathBuf, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_file_urls_roundtrip_but_remote_and_driveless_urls_do_not() {
+        let path = PathBuf::from("C:\\Users\\Example\\Downloads\\日 a.torrent");
+        assert_eq!(
+            opened_urls(vec![
+                "file:///C:/Users/Example/Downloads/%E6%97%A5%20a.torrent".into()
+            ]),
+            Ok(vec![path.clone()])
+        );
+        assert_eq!(
+            argument_paths([path.as_os_str().to_owned()]),
+            Ok(vec![path])
+        );
+        for value in [
+            "file:///tmp/a.torrent",
+            "file://server/share/a.torrent",
+            "\\\\server\\share\\a.torrent",
+            "\\\\?\\C:\\tmp\\a.torrent",
+        ] {
+            assert!(
+                opened_urls(vec![value.into()]).is_err(),
+                "unsupported path was accepted"
+            );
+        }
+    }
 
     #[test]
     fn preserves_unicode_spaces_case_and_first_seen_order() {
