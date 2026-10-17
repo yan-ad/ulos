@@ -809,6 +809,7 @@ impl DownloadManager {
         }
     }
 
+    #[cfg(any(not(target_os = "windows"), test))]
     fn open_selected_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.queue.selected.iter().next().copied() {
             self.open_details(id, window, cx);
