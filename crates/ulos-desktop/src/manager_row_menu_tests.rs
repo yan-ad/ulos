@@ -143,7 +143,9 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     });
     draw(cx);
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.run_row_command(second, RowCommand::Remove, window, cx));
+        view.update(cx, |view, cx| {
+            view.run_row_command(second, RowCommand::Remove, window, cx)
+        });
     });
     view.read_with(cx, |view, _| {
         assert!(view.removal_open);
@@ -165,7 +167,9 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     view.read_with(cx, |view, _| assert!(view.queue.item(second).is_some()));
     right_click(&view, second, cx);
     cx.update(|window, cx| {
-        view.update(cx, |view, cx| view.run_row_command(second, RowCommand::Remove, window, cx));
+        view.update(cx, |view, cx| {
+            view.run_row_command(second, RowCommand::Remove, window, cx)
+        });
     });
     view.read_with(cx, |view, _| {
         assert!(view.removal_open, "Remove must open the confirmation");
