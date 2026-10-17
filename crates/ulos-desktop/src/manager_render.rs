@@ -250,24 +250,27 @@ impl DownloadManager {
                             .label("Add New")
                             .dropdown_menu({
                                 let owner = cx.weak_entity();
-                                move |menu, _, _| {
+                                move |menu, window, cx| {
                                     let http = owner.clone();
                                     let torrent = owner.clone();
-                                    menu.item(PopupMenuItem::new("URL or magnet link…").on_click(
-                                        move |_, window, cx| {
-                                            let _ = http
-                                                .update(cx, |view, cx| view.open_add(window, cx));
-                                        },
-                                    ))
-                                    .item(
-                                        PopupMenuItem::new("Torrent file or magnet…").on_click(
-                                            move |_, _, cx| {
-                                                let _ = torrent.update(cx, |view, cx| {
-                                                    view.open_torrent(None, cx)
+                                    let menu = menu
+                                        .item(PopupMenuItem::new("URL or magnet link…").on_click(
+                                            move |_, window, cx| {
+                                                let _ = http.update(cx, |view, cx| {
+                                                    view.open_add(window, cx)
                                                 });
                                             },
-                                        ),
-                                    )
+                                        ))
+                                        .item(
+                                            PopupMenuItem::new("Torrent file or magnet…").on_click(
+                                                move |_, _, cx| {
+                                                    let _ = torrent.update(cx, |view, cx| {
+                                                        view.open_torrent(None, cx)
+                                                    });
+                                                },
+                                            ),
+                                        );
+                                    Self::migration_menu(menu, window, cx, owner.clone())
                                 }
                             }),
                     )
@@ -379,39 +382,38 @@ impl DownloadManager {
             .px_2()
             .gap_1()
             .flex_shrink_0()
-            .child(
-                Button::new("menu-tasks")
-                    .label("Tasks")
-                    .dropdown_menu(move |menu, _, _| {
-                        menu.item(manager_menu_item(
-                            "Add URL…",
-                            tasks.clone(),
-                            MenuCommand::Add,
-                        ))
-                        .item(manager_menu_item(
-                            "Open Torrent…",
-                            tasks.clone(),
-                            MenuCommand::Torrent,
-                        ))
-                        .item(
-                            manager_menu_item("Start Queue", tasks.clone(), MenuCommand::Start)
-                                .disabled(!can_start),
-                        )
-                        .item(
-                            manager_menu_item("Stop Queue", tasks.clone(), MenuCommand::StopQueue)
-                                .disabled(!running),
-                        )
-                        .item(
-                            manager_menu_item("Stop All", tasks.clone(), MenuCommand::StopAll)
-                                .disabled(!can_stop),
-                        )
-                        .item(manager_menu_item(
-                            "Scheduling & queues…",
-                            tasks.clone(),
-                            MenuCommand::Scheduler,
-                        ))
-                    }),
-            )
+            .child(Button::new("menu-tasks").label("Tasks").dropdown_menu(
+                move |menu, window, cx| {
+                    menu.item(manager_menu_item(
+                        "Add URL…",
+                        tasks.clone(),
+                        MenuCommand::Add,
+                    ))
+                    .item(manager_menu_item(
+                        "Open Torrent…",
+                        tasks.clone(),
+                        MenuCommand::Torrent,
+                    ))
+                    .item(
+                        manager_menu_item("Start Queue", tasks.clone(), MenuCommand::Start)
+                            .disabled(!can_start),
+                    )
+                    .item(
+                        manager_menu_item("Stop Queue", tasks.clone(), MenuCommand::StopQueue)
+                            .disabled(!running),
+                    )
+                    .item(
+                        manager_menu_item("Stop All", tasks.clone(), MenuCommand::StopAll)
+                            .disabled(!can_stop),
+                    )
+                    .item(manager_menu_item(
+                        "Scheduling & queues…",
+                        tasks.clone(),
+                        MenuCommand::Scheduler,
+                    ))
+                    .map(|menu| Self::migration_menu(menu, window, cx, tasks.clone()))
+                },
+            ))
             .child(
                 Button::new("menu-file")
                     .label("File")
@@ -628,6 +630,21 @@ impl Render for DownloadManager {
         let command_toolbar = self.render_windows_command_toolbar(cx).into_any_element();
         #[cfg(not(target_os = "windows"))]
         let command_toolbar = self.render_queue_toolbar(cx).into_any_element();
+        #[cfg(target_os = "macos")]
+        let sidebar_header = Some(
+            gpui_kit::component::TitleBar::new()
+                .h(px(40.))
+                .flex_shrink_0()
+                .bg(cx.theme().background)
+                .into_any_element(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let sidebar_header: Option<AnyElement> = None;
+        let sidebar_width = if self.sidebar_collapsed {
+            if cfg!(target_os = "macos") { 80. } else { 48. }
+        } else {
+            255.
+        };
 
         div()
             .id("manager-shell")
@@ -661,17 +678,17 @@ impl Render for DownloadManager {
             .child(
                 div()
                     .flex()
-                    .h_full()
+                    .w_full()
                     .flex_1()
-                    .flex_shrink_0()
+                    .min_h_0()
                     .child(
                         gpui_kit::component::v_flex()
                             .h_full()
-                            .child(
-                                #[cfg(target_os = "macos")]
-                                gpui_kit::component::TitleBar::new().h(px(40.)).bg(cx.theme().background),
-                            )
-                            .child(self.render_queue_sidebar(cx)),
+                            .min_h_0()
+                            .w(px(sidebar_width))
+                            .flex_shrink_0()
+                            .children(sidebar_header)
+                            .child(div().flex_1().min_h_0().child(self.render_queue_sidebar(cx))),
                     )
                     .child(
                         div()
@@ -698,7 +715,7 @@ impl Render for DownloadManager {
             .child(
                 StatusBar::new()
                     .flex_shrink_0()
-                    .left(h_flex().debug_selector(|| "download-count-controls".into()).gap_2().items_center()
+                    .left(h_flex().debug_selector(|| "download-count-controls".into()).ml(px(-4.)).gap_2().items_center()
                         .child(self.sidebar_toggle(cx))
                         .child(Label::new(format!("{count} downloads · {selected_count} selected"))))
                     .child(Label::new(format!(

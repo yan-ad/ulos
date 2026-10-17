@@ -60,7 +60,12 @@ impl DownloadManager {
             });
             return;
         }
-        if self.options_open || self.about_open || self.removal_open || self.removal_busy {
+        if self.migration.busy
+            || self.options_open
+            || self.about_open
+            || self.removal_open
+            || self.removal_busy
+        {
             return;
         }
         self.scheduler_window = None;

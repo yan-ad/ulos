@@ -75,7 +75,12 @@ impl DownloadManager {
     }
 
     pub(crate) fn about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.about_open || self.options_open || self.removal_open || self.removal_busy {
+        if self.migration.busy
+            || self.about_open
+            || self.options_open
+            || self.removal_open
+            || self.removal_busy
+        {
             return;
         }
         self.about_open = true;

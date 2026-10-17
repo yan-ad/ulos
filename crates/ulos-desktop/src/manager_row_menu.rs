@@ -87,6 +87,28 @@ impl DownloadManager {
         }
     }
 
+    fn row_menu_item(
+        &self,
+        id: DownloadId,
+        command: RowCommand,
+        label: &'static str,
+        handle: AnyWindowHandle,
+        owner: WeakEntity<Self>,
+    ) -> PopupMenuItem {
+        PopupMenuItem::new(label)
+            .disabled(!self.row_command_enabled(id, command))
+            .on_click(move |_, _, cx| {
+                let owner = owner.clone();
+                // Re-enter only after the table/menu delegate borrow has ended.
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = owner
+                            .update(cx, |view, cx| view.run_row_command(id, command, window, cx));
+                    });
+                });
+            })
+    }
+
     pub(crate) fn row_context_menu(
         &self,
         id: DownloadId,
@@ -119,22 +141,7 @@ impl DownloadManager {
             if matches!(command, RowCommand::Retry | RowCommand::Remove) {
                 menu = menu.separator();
             }
-            let owner = owner.clone();
-            menu = menu.item(
-                PopupMenuItem::new(label)
-                    .disabled(!self.row_command_enabled(id, command))
-                    .on_click(move |_, _, cx| {
-                        let owner = owner.clone();
-                        // The delegate may still own TableState while opening its popup.
-                        cx.defer(move |cx| {
-                            let _ = handle.update(cx, |_, window, cx| {
-                                let _ = owner.update(cx, |view, cx| {
-                                    view.run_row_command(id, command, window, cx)
-                                });
-                            });
-                        });
-                    }),
-            );
+            menu = menu.item(self.row_menu_item(id, command, label, handle, owner.clone()));
         }
         menu
     }

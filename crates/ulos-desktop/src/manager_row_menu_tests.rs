@@ -43,6 +43,43 @@ fn row_menu_filter_changes_keep_target_and_escape_preserves_selection(cx: &mut T
     });
 }
 
+fn capture_remove(
+    view: &Entity<DownloadManager>,
+    id: DownloadId,
+    cx: &mut VisualTestContext,
+) -> gpui_kit::component::menu::PopupMenuItem {
+    cx.update(|window, cx| {
+        view.read(cx).row_menu_item(
+            id,
+            RowCommand::Remove,
+            "Remove…",
+            window.window_handle(),
+            view.downgrade(),
+        )
+    })
+}
+
+fn activate_remove(item: &gpui_kit::component::menu::PopupMenuItem, cx: &mut VisualTestContext) {
+    // Menu keyboard selection can depend on pointer hover after window snapping.
+    // Exercise the exact production callback, captured before sorting, rather
+    // than assuming a fixed arrow-key count. Other tests cover popup navigation.
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    let gpui_kit::component::menu::PopupMenuItem::Item {
+        label,
+        disabled,
+        handler: Some(handler),
+        ..
+    } = item
+    else {
+        panic!("Remove must be a real enabled menu action");
+    };
+    assert_eq!(label.as_ref(), "Remove…");
+    assert!(!disabled);
+    cx.update(|window, cx| handler(&gpui_kit::ClickEvent::default(), window, cx));
+    draw(cx);
+}
+
 fn dialog_button(
     cx: &mut VisualTestContext,
     selector: &'static str,
@@ -134,6 +171,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     let (_root, view, cx) = mount(cx, &runtime);
     let (first, second) = queued_pair(&view, directory.path(), cx);
     right_click(&view, second, cx);
+    let remove_intent = capture_remove(&view, second, cx);
     view.update(cx, |view, cx| {
         view.sort_table(
             SortColumn::Name,
@@ -142,11 +180,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
         )
     });
     draw(cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.run_row_command(second, RowCommand::Remove, window, cx)
-        });
-    });
+    activate_remove(&remove_intent, cx);
     view.read_with(cx, |view, _| {
         assert!(view.removal_open);
         assert_eq!(view.pending_removal, Some(vec![second]));
@@ -166,11 +200,8 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     draw(cx);
     view.read_with(cx, |view, _| assert!(view.queue.item(second).is_some()));
     right_click(&view, second, cx);
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.run_row_command(second, RowCommand::Remove, window, cx)
-        });
-    });
+    let remove_intent = capture_remove(&view, second, cx);
+    activate_remove(&remove_intent, cx);
     view.read_with(cx, |view, _| {
         assert!(view.removal_open, "Remove must open the confirmation");
         assert_eq!(view.pending_removal, Some(vec![second]));

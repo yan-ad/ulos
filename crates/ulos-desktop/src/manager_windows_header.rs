@@ -318,12 +318,7 @@ mod tests {
             ),
             (
                 CommandTab::Downloads,
-                vec![
-                    "windows-stop-selected",
-                    "windows-remove",
-                    "windows-clear",
-                    "windows-options",
-                ],
+                vec!["windows-stop-selected", "windows-remove", "windows-clear"],
             ),
             (
                 CommandTab::View,

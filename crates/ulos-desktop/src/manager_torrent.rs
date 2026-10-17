@@ -97,6 +97,9 @@ impl DownloadManager {
         }));
     }
     pub(crate) fn open_torrent(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.migration.busy {
+            return;
+        }
         self.torrent_windows
             .retain(|_, child| child.upgrade().is_some());
         if self.add_windows.len() + self.torrent_windows.len() >= crate::intake::MAX_INTAKE_FILES {
@@ -156,7 +159,8 @@ impl DownloadManager {
     }
 
     pub(crate) fn choose_torrent_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.torrent_picker_open
+        if self.migration.busy
+            || self.torrent_picker_open
             || self.removal_busy
             || self.options_open
             || self.about_open

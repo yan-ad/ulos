@@ -23,6 +23,10 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("test runtime")
 }
 
+fn collapsed_sidebar_width() -> f32 {
+    if cfg!(target_os = "macos") { 80. } else { 48. }
+}
+
 #[gpui::test]
 fn running_named_queues_share_one_slot_and_exhausted_state_refreshes(cx: &mut TestAppContext) {
     let runtime = runtime();
@@ -2017,8 +2021,8 @@ fn native_menu_toolbar_uses_stock_sizes_and_one_row_at_minimum_width(cx: &mut Te
             "Keep native traffic lights clear"
         );
         assert!(
-            add.top() >= gpui_kit::px(40.),
-            "Commands are below native chrome"
+            add.top() >= gpui_kit::px(0.),
+            "Commands remain inside the immersive content column"
         );
     }
     assert!((add.center().y - search.center().y).abs() <= gpui_kit::px(1.));
@@ -2513,7 +2517,14 @@ fn sidebar_mouse_toggle_restores_geometry_without_changing_queue_state(cx: &mut 
     assert_sidebar_width(cx, 255.);
     for collapsed in [true, false] {
         click_sidebar_toggle(cx);
-        assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+        assert_sidebar_width(
+            cx,
+            if collapsed {
+                collapsed_sidebar_width()
+            } else {
+                255.
+            },
+        );
         view.read_with(cx, |view, cx| {
             assert_eq!(view.sidebar_collapsed, collapsed);
             assert_eq!(
@@ -2562,10 +2573,7 @@ fn sidebar_collapsed_filter_survives_expansion_without_resetting_selection(
     });
     draw(cx);
     click_sidebar_toggle(cx);
-    #[cfg(target_os = "macos")]
-    assert_sidebar_width(cx, 80.);
-    #[cfg(not(target_os = "macos"))]
-    assert_sidebar_width(cx, 48.);
+    assert_sidebar_width(cx, collapsed_sidebar_width());
     // This application enables GPUI's test support, but not Kit/Base's
     // optional observation registry. SidebarMenuItem's generated IDs therefore
     // have no public bounds hook here. Exercise the real filter callback while
@@ -2633,7 +2641,14 @@ fn sidebar_keyboard_from_search_and_native_action_from_child_share_state(cx: &mu
     for collapsed in [true, false] {
         cx.simulate_keystrokes("secondary-b");
         settle_sidebar(cx);
-        assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+        assert_sidebar_width(
+            cx,
+            if collapsed {
+                collapsed_sidebar_width()
+            } else {
+                255.
+            },
+        );
         view.read_with(cx, |view, cx| {
             assert_eq!(view.sidebar_collapsed, collapsed);
             assert_eq!(view.search.read(cx).value().as_ref(), "alpha");
@@ -2658,7 +2673,14 @@ fn sidebar_keyboard_from_search_and_native_action_from_child_share_state(cx: &mu
         child.dispatch_action(crate::native_menu::ToggleDownloadsSidebar);
         draw(&mut child);
         settle_sidebar(cx);
-        assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+        assert_sidebar_width(
+            cx,
+            if collapsed {
+                collapsed_sidebar_width()
+            } else {
+                255.
+            },
+        );
         assert_sidebar_menu_label(
             &view,
             cx,
@@ -2693,7 +2715,14 @@ fn sidebar_empty_light_and_dark_layout_stays_in_one_row_at_minimum_size(cx: &mut
             if view.read_with(cx, |view, _| view.sidebar_collapsed) != collapsed {
                 click_sidebar_toggle(cx);
             }
-            assert_sidebar_width(cx, if collapsed { 48. } else { 255. });
+            assert_sidebar_width(
+                cx,
+                if collapsed {
+                    collapsed_sidebar_width()
+                } else {
+                    255.
+                },
+            );
             let search = cx.debug_bounds("download-search").expect("search wrapper");
             let toggle = cx.debug_bounds("toggle-sidebar").expect("sidebar toggle");
             let options = cx.debug_bounds("options").expect("options button");
@@ -2713,6 +2742,13 @@ fn sidebar_empty_light_and_dark_layout_stays_in_one_row_at_minimum_size(cx: &mut
             assert!(cx.debug_bounds("selected-details").is_none());
             let sidebar = cx.debug_bounds("manager-sidebar").expect("sidebar wrapper");
             assert!(sidebar.bottom() <= gpui_kit::px(540.));
+            let commands = cx.debug_bounds("download-toolbar").unwrap();
+            assert!(
+                commands.size.width >= gpui_kit::px(600.),
+                "Content row must not inherit sidebar width"
+            );
+            assert!(table.right() <= gpui_kit::px(880.));
+            assert!(search.right() <= gpui_kit::px(880.));
             view.read_with(cx, |view, _| {
                 assert!(view.queue.items.is_empty());
                 assert_eq!(view.queue.filter, Filter::All);

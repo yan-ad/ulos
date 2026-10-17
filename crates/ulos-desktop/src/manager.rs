@@ -85,6 +85,7 @@ pub struct DownloadManager {
     _history_updates: Option<Task<()>>,
     removal_open: bool,
     removal_busy: bool,
+    migration: migration::MigrationState,
     pending_removal: Option<Vec<DownloadId>>,
     _file_removal: Option<Task<()>>,
     scheduler: Scheduler,
@@ -133,11 +134,21 @@ impl DownloadManager {
                 };
                 view.open_details(id, window, cx);
             });
+        let close_owner = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            close_owner.upgrade().is_none_or(|owner| {
+                let view = owner.read(cx);
+                !view.migration.busy && !view.torrent_picker_open
+            })
+        });
         let owner = cx.weak_entity();
         let window_closed = cx.on_window_closed(move |cx, closed| {
             let owner = owner.clone();
             cx.defer(move |cx| {
                 let _ = owner.update(cx, |view, cx| {
+                    if closed == view.main_window.window_id() {
+                        view.migration.reset();
+                    }
                     if cx.windows().is_empty() {
                         view.cancel_all_shutdowns(cx);
                     }
@@ -185,6 +196,7 @@ impl DownloadManager {
                         && !view.about_open
                         && !view.removal_open
                         && !view.removal_busy
+                        && !view.migration.busy
                         && view.scheduler_window.is_none()
                 });
                 match enabled {
@@ -263,6 +275,7 @@ impl DownloadManager {
             _history_updates: None,
             removal_open: false,
             removal_busy: false,
+            migration: migration::MigrationState::default(),
             pending_removal: None,
             _file_removal: None,
             scheduler: Scheduler::default(),
@@ -297,6 +310,9 @@ impl DownloadManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.migration.busy {
+            return;
+        }
         self.add_windows
             .retain(|_, child| child.upgrade().is_some());
         if self.add_windows.len() + self.torrent_windows.len() >= 16 {
@@ -695,7 +711,8 @@ impl DownloadManager {
     }
 
     fn offer_clipboard(&mut self, text: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.clipboard_enabled
+        if self.migration.busy
+            || !self.clipboard_enabled
             || !self.add_windows.is_empty()
             || !self.torrent_windows.is_empty()
             || self.torrent_picker_open
@@ -823,6 +840,9 @@ impl DownloadManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.migration.busy {
+            return;
+        }
         if let Some(child) = self.detail_windows.get(&id)
             && child.upgrade().is_some()
             && child
@@ -1255,7 +1275,11 @@ impl DownloadManager {
     }
 
     fn open_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.options_open || self.about_open || self.scheduler_window.is_some() {
+        if self.migration.busy
+            || self.options_open
+            || self.about_open
+            || self.scheduler_window.is_some()
+        {
             return;
         }
         self.options_open = true;
@@ -1305,7 +1329,8 @@ impl DownloadManager {
                 .items
                 .iter()
                 .any(|item| self.queue.selected.contains(&item.id) && item.is_finished()),
-            can_options: !self.options_open
+            can_options: !self.migration.busy
+                && !self.options_open
                 && !self.about_open
                 && self.add_windows.is_empty()
                 && self.torrent_windows.is_empty()
@@ -1333,6 +1358,7 @@ impl DownloadManager {
         match command {
             Command::Add => self.open_add(window, cx),
             Command::Torrent => self.choose_torrent_files(window, cx),
+            Command::TorrentReview => self.open_torrent(None, cx),
             Command::ImportIdm => self.import_migration(ulos_core::migration::MigrationFormat::IdmEf2, window, cx),
             Command::ImportText => self.import_migration(ulos_core::migration::MigrationFormat::Text, window, cx),
             Command::ExportIdm => self.export_migration(ulos_core::migration::MigrationFormat::IdmEf2, window, cx),

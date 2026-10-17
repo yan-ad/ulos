@@ -52,6 +52,7 @@ gpui_kit::actions!(
 pub enum Command {
     Add,
     Torrent,
+    TorrentReview,
     ImportIdm,
     ImportText,
     ExportIdm,
@@ -102,9 +103,10 @@ impl Command {
     pub fn enabled(self, state: &MenuState) -> bool {
         match self {
             Self::Add => state.can_add,
-            Self::Torrent => state.can_add,
-            Self::ImportIdm | Self::ImportText => state.can_add,
-            Self::ExportIdm | Self::ExportText => state.selected,
+            Self::Torrent | Self::TorrentReview => state.can_add,
+            Self::ImportIdm | Self::ImportText | Self::ExportIdm | Self::ExportText => {
+                state.can_options
+            }
             Self::Start => state.can_start,
             Self::StopQueue => state.queue_running,
             Self::StopAll => state.can_stop,
@@ -149,7 +151,7 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
             item(
                 "Add Torrent or Magnet…",
                 OpenTorrentOrMagnet,
-                Command::Torrent,
+                Command::TorrentReview,
                 state,
             ),
             item("Start Queue", StartDownloads, Command::Start, state),
@@ -290,7 +292,13 @@ fn register<A: Action>(
         }
         let target = if matches!(
             command,
-            Command::Options | Command::About | Command::Updates
+            Command::Options
+                | Command::About
+                | Command::Updates
+                | Command::ImportIdm
+                | Command::ImportText
+                | Command::ExportIdm
+                | Command::ExportText
         ) {
             main
         } else {
@@ -317,7 +325,7 @@ pub fn install(
 ) -> Vec<Subscription> {
     register::<NewDownload>(cx, &owner, main, Command::Add);
     register::<OpenTorrentFile>(cx, &owner, main, Command::Torrent);
-    register::<OpenTorrentOrMagnet>(cx, &owner, main, Command::Torrent);
+    register::<OpenTorrentOrMagnet>(cx, &owner, main, Command::TorrentReview);
     register::<ImportIdmExport>(cx, &owner, main, Command::ImportIdm);
     register::<ImportText>(cx, &owner, main, Command::ImportText);
     register::<ExportIdmExport>(cx, &owner, main, Command::ExportIdm);
