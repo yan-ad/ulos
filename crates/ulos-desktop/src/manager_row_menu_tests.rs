@@ -127,10 +127,19 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     view.read_with(cx, |view, _| {
         assert!(view.removal_open);
         assert_eq!(view.pending_removal, Some(vec![second]));
+    });
+    view.read_with(cx, |view, _| {
+        assert!(view.removal_open);
+        assert_eq!(view.pending_removal, Some(vec![second]));
         assert!(view.queue.selected.contains(&first));
     });
     let cancel = cx.debug_bounds("cancel-removal").unwrap();
     cx.simulate_click(cancel.center(), Default::default());
+    draw(cx);
+    // Kit retains the closing dialog through its transition; it can still
+    // intercept pointer input until the deterministic clock advances.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(250));
     draw(cx);
     view.read_with(cx, |view, _| assert!(view.queue.item(second).is_some()));
     right_click(&view, second, cx);
