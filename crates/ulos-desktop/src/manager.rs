@@ -632,6 +632,7 @@ impl DownloadManager {
         cx.notify();
     }
 
+    #[cfg(any(not(target_os = "windows"), test))]
     fn stop_queue(&mut self, cx: &mut Context<Self>) {
         self.queue_running = false;
         self.scheduler
