@@ -43,6 +43,15 @@ fn row_menu_filter_changes_keep_target_and_escape_preserves_selection(cx: &mut T
     });
 }
 
+fn click_remove_menu(cx: &mut VisualTestContext) {
+    // Popup opening can hover-select an item after snapping to the window.
+    // Leave it with a pointer event before using Up to select the last item.
+    cx.simulate_mouse_move(point(px(2.), px(2.)), None, Default::default());
+    draw(cx);
+    cx.simulate_keystrokes("up enter");
+    draw(cx);
+}
+
 fn dialog_button(
     cx: &mut VisualTestContext,
     selector: &'static str,
@@ -142,8 +151,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
         )
     });
     draw(cx);
-    cx.simulate_keystrokes("down down down enter");
-    draw(cx);
+    click_remove_menu(cx);
     view.read_with(cx, |view, _| {
         assert!(view.removal_open);
         assert_eq!(view.pending_removal, Some(vec![second]));
@@ -163,8 +171,15 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     draw(cx);
     view.read_with(cx, |view, _| assert!(view.queue.item(second).is_some()));
     right_click(&view, second, cx);
-    cx.simulate_keystrokes("down down down enter");
-    draw(cx);
+    click_remove_menu(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.removal_open, "Remove must open the confirmation");
+        assert_eq!(view.pending_removal, Some(vec![second]));
+        assert!(
+            view.detail_windows.is_empty(),
+            "Do not accidentally activate Details"
+        );
+    });
     let remove = dialog_button(cx, "remove-records");
     cx.simulate_click(remove.center(), Default::default());
     draw(cx);
