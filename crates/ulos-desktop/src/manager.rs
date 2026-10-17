@@ -1333,6 +1333,10 @@ impl DownloadManager {
         match command {
             Command::Add => self.open_add(window, cx),
             Command::Torrent => self.choose_torrent_files(window, cx),
+            Command::ImportIdm => self.import_migration(ulos_core::migration::MigrationFormat::IdmEf2, window, cx),
+            Command::ImportText => self.import_migration(ulos_core::migration::MigrationFormat::Text, window, cx),
+            Command::ExportIdm => self.export_migration(ulos_core::migration::MigrationFormat::IdmEf2, window, cx),
+            Command::ExportText => self.export_migration(ulos_core::migration::MigrationFormat::Text, window, cx),
             Command::Start => self.start_queue(cx),
             Command::StopQueue => self.stop_queue(cx),
             Command::StopAll => self.stop_all(cx),
@@ -1373,6 +1377,8 @@ impl DownloadManager {
 mod application;
 #[path = "manager_history.rs"]
 mod history;
+#[path = "manager_migration.rs"]
+mod migration;
 #[path = "manager_render.rs"]
 mod rendering;
 #[path = "manager_row_menu.rs"]

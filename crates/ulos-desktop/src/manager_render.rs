@@ -619,22 +619,15 @@ impl Render for DownloadManager {
             .then(|| self.queue.total_speed());
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let menubar = Some(self.render_menu_strip(cx).into_any_element());
+        let section_header = Some(self.render_menu_strip(cx).into_any_element());
         #[cfg(target_os = "windows")]
-        let menubar = Some(self.render_windows_header(cx).into_any_element());
+        let section_header = Some(self.render_windows_header(cx).into_any_element());
         #[cfg(target_os = "macos")]
-        let menubar = Some(
-            gpui_kit::component::TitleBar::new()
-                .h(px(40.))
-                .into_any_element(),
-        );
-        #[cfg(target_os = "macos")]
-        let toolbar = self.render_queue_toolbar(cx).into_any_element();
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let toolbar = self.render_queue_toolbar(cx).into_any_element();
-
+        let section_header: Option<AnyElement> = None;
         #[cfg(target_os = "windows")]
-        let toolbar = self.render_windows_command_toolbar(cx).into_any_element();
+        let command_toolbar = self.render_windows_command_toolbar(cx).into_any_element();
+        #[cfg(not(target_os = "windows"))]
+        let command_toolbar = self.render_queue_toolbar(cx).into_any_element();
 
         div()
             .id("manager-shell")
@@ -665,14 +658,21 @@ impl Render for DownloadManager {
             .overflow_hidden()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .when_some(menubar, |this, menubar| this.child(menubar))
             .child(
                 div()
                     .flex()
+                    .h_full()
                     .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .child(self.render_queue_sidebar(cx))
+                    .flex_shrink_0()
+                    .child(
+                        gpui_kit::component::v_flex()
+                            .h_full()
+                            .child(
+                                #[cfg(target_os = "macos")]
+                                gpui_kit::component::TitleBar::new().h(px(40.)).bg(cx.theme().background),
+                            )
+                            .child(self.render_queue_sidebar(cx)),
+                    )
                     .child(
                         div()
                             .flex()
@@ -680,7 +680,14 @@ impl Render for DownloadManager {
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
-                            .child(div().debug_selector(|| "download-toolbar".into()).flex_shrink_0().min_w_0().child(toolbar))
+                            .when_some(section_header, |this, header| this.child(header))
+                            .child(
+                                div()
+                                    .debug_selector(|| "download-toolbar".into())
+                                    .flex_shrink_0()
+                                    .min_w_0()
+                                    .child(command_toolbar),
+                            )
                             .when_some(self.history_error.as_ref().map(|error| format!("History unavailable: {error} This session is not being saved.")), |this, error| { this.child(Label::new(error)) })
                             .when_some(self.notice.clone(), |this, notice| {
                                 this.child(Label::new(notice).px_4().py_2().text_xs())

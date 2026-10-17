@@ -2562,6 +2562,9 @@ fn sidebar_collapsed_filter_survives_expansion_without_resetting_selection(
     });
     draw(cx);
     click_sidebar_toggle(cx);
+    #[cfg(target_os = "macos")]
+    assert_sidebar_width(cx, 80.);
+    #[cfg(not(target_os = "macos"))]
     assert_sidebar_width(cx, 48.);
     // This application enables GPUI's test support, but not Kit/Base's
     // optional observation registry. SidebarMenuItem's generated IDs therefore

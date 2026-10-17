@@ -18,6 +18,11 @@ gpui_kit::actions!(
     [
         NewDownload,
         OpenTorrentFile,
+        OpenTorrentOrMagnet,
+        ImportIdmExport,
+        ImportText,
+        ExportIdmExport,
+        ExportText,
         StartDownloads,
         StopDownloadsQueue,
         StopDownloads,
@@ -47,6 +52,10 @@ gpui_kit::actions!(
 pub enum Command {
     Add,
     Torrent,
+    ImportIdm,
+    ImportText,
+    ExportIdm,
+    ExportText,
     Start,
     StopQueue,
     StopAll,
@@ -94,6 +103,8 @@ impl Command {
         match self {
             Self::Add => state.can_add,
             Self::Torrent => state.can_add,
+            Self::ImportIdm | Self::ImportText => state.can_add,
+            Self::ExportIdm | Self::ExportText => state.selected,
             Self::Start => state.can_start,
             Self::StopQueue => state.queue_running,
             Self::StopAll => state.can_stop,
@@ -135,6 +146,12 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
         ]),
         Menu::new("Tasks").items([
             item("Add URL…", NewDownload, Command::Add, state),
+            item(
+                "Add Torrent or Magnet…",
+                OpenTorrentOrMagnet,
+                Command::Torrent,
+                state,
+            ),
             item("Start Queue", StartDownloads, Command::Start, state),
             item("Stop Queue", StopDownloadsQueue, Command::StopQueue, state),
             item("Stop All", StopDownloads, Command::StopAll, state),
@@ -144,6 +161,25 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
                 Command::Scheduler,
                 state,
             ),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new("Import").items([
+                item(
+                    "From IDM export file…",
+                    ImportIdmExport,
+                    Command::ImportIdm,
+                    state,
+                ),
+                item("From text file…", ImportText, Command::ImportText, state),
+            ])),
+            MenuItem::submenu(Menu::new("Export").items([
+                item(
+                    "To IDM export file…",
+                    ExportIdmExport,
+                    Command::ExportIdm,
+                    state,
+                ),
+                item("To text file…", ExportText, Command::ExportText, state),
+            ])),
         ]),
         Menu::new("File").items([
             item("Add URL…", NewDownload, Command::Add, state),
@@ -281,6 +317,11 @@ pub fn install(
 ) -> Vec<Subscription> {
     register::<NewDownload>(cx, &owner, main, Command::Add);
     register::<OpenTorrentFile>(cx, &owner, main, Command::Torrent);
+    register::<OpenTorrentOrMagnet>(cx, &owner, main, Command::Torrent);
+    register::<ImportIdmExport>(cx, &owner, main, Command::ImportIdm);
+    register::<ImportText>(cx, &owner, main, Command::ImportText);
+    register::<ExportIdmExport>(cx, &owner, main, Command::ExportIdm);
+    register::<ExportText>(cx, &owner, main, Command::ExportText);
     register::<StartDownloads>(cx, &owner, main, Command::Start);
     register::<StopDownloadsQueue>(cx, &owner, main, Command::StopQueue);
     register::<StopDownloads>(cx, &owner, main, Command::StopAll);

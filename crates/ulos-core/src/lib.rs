@@ -1,4 +1,5 @@
 pub mod http;
+pub mod migration;
 pub mod naming;
 pub mod preview;
 pub mod tasks;
