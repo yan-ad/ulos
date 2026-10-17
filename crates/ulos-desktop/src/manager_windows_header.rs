@@ -62,7 +62,7 @@ enum Command {
 
 impl DownloadManager {
     pub(super) fn render_windows_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        TitleBar::new().child(
+        TitleBar::new().h(px(40.)).child(
             TabBar::new("windows-command-tabs")
                 .underline()
                 .selected_index(
@@ -226,8 +226,8 @@ mod tests {
     use super::{Command, CommandTab, DownloadManager};
     use crate::queue::Filter;
     use gpui_kit::{
-        AppContext, Context, Entity, IntoElement, Modifiers, ParentElement, Render, Styled,
-        TestAppContext, VisualTestContext, Window, component::Root, div, px, size,
+        AppContext, Context, Entity, InteractiveElement, IntoElement, Modifiers, ParentElement,
+        Render, Styled, TestAppContext, VisualTestContext, Window, component::Root, div, px, size,
     };
 
     struct HeaderHarness(Entity<DownloadManager>);
@@ -238,7 +238,12 @@ mod tests {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .child(view.render_windows_header(cx))
+                    .child(
+                        div()
+                            .debug_selector(|| "windows-titlebar".into())
+                            .flex_shrink_0()
+                            .child(view.render_windows_header(cx)),
+                    )
                     .child(view.render_windows_command_toolbar(cx))
             })
         }
@@ -327,6 +332,12 @@ mod tests {
             (CommandTab::Help, vec!["windows-about", "windows-updates"]),
         ] {
             click(cx, tab.selector());
+            let header = cx.debug_bounds("windows-titlebar").unwrap();
+            let tab_bounds = cx.debug_bounds(tab.selector()).unwrap();
+            assert!(
+                tab_bounds.top() >= header.top() && tab_bounds.bottom() <= header.bottom(),
+                "Underline tab stays inside titlebar: {tab:?}, {tab_bounds:?}, {header:?}"
+            );
             view.read_with(cx, |view, cx| {
                 assert_eq!(view.windows_command_tab, tab);
                 assert_eq!(view.search.read(cx).value().as_str(), "needle");

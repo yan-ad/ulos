@@ -8,6 +8,41 @@ use gpui_kit::{Entity, MouseButton, TestAppContext, VisualTestContext, point, px
 use std::time::Instant;
 use ulos_core::tasks::TransferState;
 
+#[gpui::test]
+fn row_menu_filter_changes_keep_target_and_escape_preserves_selection(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    let (first, second) = queued_pair(&view, directory.path(), cx);
+    right_click(&view, second, cx);
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.detail_windows.is_empty() && view.pending_removal.is_none());
+        assert_eq!(
+            view.queue.selected.iter().copied().collect::<Vec<_>>(),
+            vec![first]
+        );
+    });
+    right_click(&view, second, cx);
+    view.update(cx, |view, cx| {
+        view.queue.search = "first".into();
+        view.sync_table(cx);
+        cx.notify();
+    });
+    draw(cx);
+    cx.simulate_keystrokes("down enter");
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.detail_windows.contains_key(&second));
+        assert!(!view.detail_windows.contains_key(&first));
+        assert_eq!(
+            view.queue.selected.iter().copied().collect::<Vec<_>>(),
+            vec![first]
+        );
+    });
+}
+
 fn queued_pair(
     view: &Entity<DownloadManager>,
     directory: &std::path::Path,
@@ -87,7 +122,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
         )
     });
     draw(cx);
-    cx.simulate_keystrokes("end enter");
+    cx.simulate_keystrokes("down down down enter");
     draw(cx);
     view.read_with(cx, |view, _| {
         assert!(view.removal_open);
@@ -99,7 +134,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     draw(cx);
     view.read_with(cx, |view, _| assert!(view.queue.item(second).is_some()));
     right_click(&view, second, cx);
-    cx.simulate_keystrokes("end enter");
+    cx.simulate_keystrokes("down down down enter");
     draw(cx);
     let remove = cx.debug_bounds("remove-records").unwrap();
     cx.simulate_click(remove.center(), Default::default());
@@ -173,6 +208,12 @@ fn row_menu_rechecks_active_pause_retry_and_source_less_history(cx: &mut TestApp
                 .unwrap()
                 .apply_state(TransferState::Cancelled, Instant::now());
             assert!(view.row_command_enabled(second, RowCommand::Retry));
+            assert!(
+                view.queue
+                    .item_mut(second)
+                    .unwrap()
+                    .reset_for_retry(ulos_core::transfer::CollisionPolicy::Reject)
+            );
             view.queue.item_mut(second).unwrap().apply_state(
                 TransferState::Completed(ulos_core::DownloadReceipt {
                     destination: directory.path().join("second.bin"),
