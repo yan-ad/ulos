@@ -43,6 +43,26 @@ fn row_menu_filter_changes_keep_target_and_escape_preserves_selection(cx: &mut T
     });
 }
 
+fn dialog_button(
+    cx: &mut VisualTestContext,
+    selector: &'static str,
+) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        draw(cx);
+        if let Some(bounds) = cx.debug_bounds(selector) {
+            return bounds;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Dialog control did not render: {selector}"
+        );
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn queued_pair(
     view: &Entity<DownloadManager>,
     directory: &std::path::Path,
@@ -133,7 +153,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
         assert_eq!(view.pending_removal, Some(vec![second]));
         assert!(view.queue.selected.contains(&first));
     });
-    let cancel = cx.debug_bounds("cancel-removal").unwrap();
+    let cancel = dialog_button(cx, "cancel-removal");
     cx.simulate_click(cancel.center(), Default::default());
     draw(cx);
     // Kit retains the closing dialog through its transition; it can still
@@ -145,7 +165,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     right_click(&view, second, cx);
     cx.simulate_keystrokes("down down down enter");
     draw(cx);
-    let remove = cx.debug_bounds("remove-records").unwrap();
+    let remove = dialog_button(cx, "remove-records");
     cx.simulate_click(remove.center(), Default::default());
     draw(cx);
     view.read_with(cx, |view, _| {
