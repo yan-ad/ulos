@@ -16,16 +16,18 @@
 
 **[Open the Releases page →](https://github.com/yan-ad/ulos/releases/latest)**
 
-Choose the file for your computer from the assets actually listed on that release. No terminal or build tools are needed. Windows ARM64 and Linux ARM64 are configured for a future release; older releases may not include them.
+Choose the file for your computer from the assets actually listed on that release. No terminal or build tools are needed. Windows Setup installers and ARM64 additions are configured for the next build, not replacements for existing release assets. Older releases may still offer portable ZIPs.
 
 | Computer | Download | Install |
 | --- | --- | --- |
 | Mac with Apple silicon (M1 or newer) | `macos-arm64.dmg` | Open the disk image and drag **Ulos** to **Applications**. |
 | Mac with an Intel processor | `macos-x86_64.dmg` | Open the disk image and drag **Ulos** to **Applications**. |
-| Windows, Intel/AMD x86-64 | `windows-x86_64.zip` | Extract the entire ZIP, then open **Ulos.exe**. |
-| Windows, ARM64 (for example Snapdragon) | `windows-arm64.zip` | Extract the entire ZIP, then open **Ulos.exe** (when published). |
+| Windows, Intel/AMD x86-64 | `windows-x86_64-Setup.exe` (next build) | Open Setup, review the MIT license and third-party notices, then install for your Windows account. |
+| Windows, ARM64 (for example Snapdragon) | `windows-arm64-Setup.exe` (next build) | Open the native ARM64 Setup when published; install for your Windows account. |
 | Linux, Intel/AMD x86-64 (Ubuntu 24.04 baseline) | `linux-x86_64.tar.gz` | Extract the archive in your file manager, allow **Ulos** to run as a program, then open it. |
 | Linux, ARM64 (Ubuntu 24.04 baseline) | `linux-arm64.tar.gz` | Extract the archive in your file manager, allow **Ulos** to run as a program, then open it (when published). |
+
+Next-build Windows Setup needs no administrator access, does not launch Ulos automatically or take over file/magnet defaults, and includes an uninstaller. For historical Windows ZIP assets, extract the **entire** ZIP and open **Ulos.exe**. See the [installation guide](packaging/INSTALL.md).
 
 These first builds are not Developer ID–signed/notarized on macOS or publisher-signed on Windows. Your system may show a security warning. Review the source and release before deciding whether to allow it; do not disable system security. On macOS, an approved exception can be made in **System Settings → Privacy & Security**. Linux packages depend on the system libraries listed in the release notes.
 

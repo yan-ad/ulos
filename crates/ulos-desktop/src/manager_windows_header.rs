@@ -48,7 +48,6 @@ impl CommandTab {
 enum Command {
     Add,
     Torrent,
-    Details,
     Reveal,
     StopSelected,
     Remove,
@@ -96,11 +95,6 @@ impl DownloadManager {
             Command::Add | Command::Torrent => {
                 self.add_windows.len() + self.torrent_windows.len() < 16
             }
-            Command::Details => self
-                .queue
-                .items
-                .iter()
-                .any(|item| self.queue.selected.contains(&item.id)),
             Command::Reveal => selected(|item| item.is_finished()),
             Command::StopSelected => selected(|item| item.is_active()),
             Command::Remove => selected(|item| !item.is_active()) && !self.removal_busy,
@@ -127,8 +121,24 @@ impl DownloadManager {
     ) -> Button {
         let owner = cx.weak_entity();
         let main_window = self.main_window;
+        let icon = match command {
+            Command::Add => gpui_kit::assets::IconName::Plus,
+            Command::Torrent => gpui_kit::assets::IconName::File,
+            Command::Reveal => gpui_kit::assets::IconName::Folder,
+            Command::StopSelected => gpui_kit::assets::IconName::Square,
+            Command::Remove => gpui_kit::assets::IconName::Trash,
+            Command::Clear => gpui_kit::assets::IconName::Check,
+            Command::Options => gpui_kit::assets::IconName::Settings,
+            Command::ToggleSidebar => gpui_kit::assets::IconName::PanelLeftClose,
+            Command::Filter(Filter::All) => gpui_kit::assets::IconName::Download,
+            Command::Filter(Filter::Finished) => gpui_kit::assets::IconName::Check,
+            Command::Filter(Filter::Unfinished) => gpui_kit::assets::IconName::Clock,
+            Command::Filter(_) => gpui_kit::assets::IconName::List,
+            Command::About => gpui_kit::assets::IconName::Info,
+            Command::Updates => gpui_kit::assets::IconName::RefreshCw,
+        };
         Button::new(id)
-            .label(label)
+            .icon(icon)
             .accessibility_label(label)
             .tooltip(label)
             .debug_selector(move || id.into())
@@ -145,7 +155,6 @@ impl DownloadManager {
                             match command {
                                 Command::Add => view.open_add(window, cx),
                                 Command::Torrent => view.choose_torrent_files(window, cx),
-                                Command::Details => view.open_selected_details(window, cx),
                                 Command::Reveal => view.reveal_selected(cx),
                                 Command::StopSelected => view.stop_selected(cx),
                                 Command::Remove => view.remove_selected(window, cx),
@@ -170,7 +179,6 @@ impl DownloadManager {
             CommandTab::File => &[
                 ("windows-add", "Add URL…", Command::Add),
                 ("windows-torrent", "Open Torrent…", Command::Torrent),
-                ("windows-details", "Details", Command::Details),
                 ("windows-reveal", "Show in folder", Command::Reveal),
             ],
             CommandTab::Downloads => &[
@@ -181,7 +189,6 @@ impl DownloadManager {
                 ),
                 ("windows-remove", "Remove records", Command::Remove),
                 ("windows-clear", "Clear finished", Command::Clear),
-                ("windows-options", "Options", Command::Options),
             ],
             CommandTab::View => &[
                 ("windows-sidebar", "Toggle sidebar", Command::ToggleSidebar),
@@ -212,11 +219,15 @@ impl DownloadManager {
         for &(id, label, command) in commands {
             toolbar = toolbar.content(self.windows_command_button(id, label, command, cx));
         }
-        if self.windows_command_tab == CommandTab::View {
-            toolbar = toolbar.content(self.theme_selector("windows-theme", cx));
-        }
         toolbar
             .content(div().flex_1().min_w(px(8.)))
+            .content(self.windows_command_button(
+                "windows-options",
+                "Options",
+                Command::Options,
+                cx,
+            ))
+            .content(self.theme_selector("windows-theme", cx))
             .content(self.render_toolbar_search())
     }
 }
@@ -244,7 +255,11 @@ mod tests {
                             .flex_shrink_0()
                             .child(view.render_windows_header(cx)),
                     )
-                    .child(view.render_windows_command_toolbar(cx))
+                    .child(
+                        div()
+                            .ml(px(255.))
+                            .child(view.render_windows_command_toolbar(cx)),
+                    )
             })
         }
     }
@@ -296,18 +311,10 @@ mod tests {
         cx.simulate_input("needle");
         draw(cx);
         for (tab, controls) in [
-            (
-                CommandTab::Tasks,
-                vec!["add-url", "options", "selected-details"],
-            ),
+            (CommandTab::Tasks, vec!["add-url", "options"]),
             (
                 CommandTab::File,
-                vec![
-                    "windows-add",
-                    "windows-torrent",
-                    "windows-details",
-                    "windows-reveal",
-                ],
+                vec!["windows-add", "windows-torrent", "windows-reveal"],
             ),
             (
                 CommandTab::Downloads,
@@ -388,7 +395,6 @@ mod tests {
                 Command::StopSelected,
                 Command::Remove,
                 Command::Clear,
-                Command::Details,
                 Command::Reveal,
             ] {
                 assert!(!view.windows_command_enabled(command));

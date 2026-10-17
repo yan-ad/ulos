@@ -53,12 +53,15 @@ class BuildTests(unittest.TestCase):
             crypto = original / 'libcrypto.dylib'
             torrent.write_text('torrent')
             crypto.write_text('crypto')
-            deps = {worker: [str(torrent), '/usr/lib/libc++.1.dylib'], torrent: [str(torrent), str(crypto)], crypto: [str(crypto), '/usr/lib/libSystem.B.dylib']}
+            # Mach-O load commands use Unix syntax even when this synthetic
+            # policy test runs on Windows. Resolve loader-relative paths using
+            # the host filesystem, not fake C:\\... Mach-O absolute paths.
+            deps = {worker: ['@loader_path/original/libtorrent.dylib', '/usr/lib/libc++.1.dylib'], torrent: ['@loader_path/libtorrent.dylib', '@loader_path/libcrypto.dylib'], crypto: ['@loader_path/libcrypto.dylib', '/usr/lib/libSystem.B.dylib']}
             with mock.patch.object(build, 'mac_dependencies', side_effect=lambda p: deps[p]), mock.patch.object(build.package, 'verify_binary_architecture'), mock.patch.object(build, 'run') as run:
                 build.bundle_macos(worker, root / 'lib', 'arm64')
                 self.assertEqual({p.name for p in (root / 'lib').iterdir()}, {'libtorrent.dylib', 'libcrypto.dylib'})
-                run.assert_any_call('install_name_tool', '-change', str(torrent), '@loader_path/lib/libtorrent.dylib', worker)
-                run.assert_any_call('install_name_tool', '-change', str(crypto), '@loader_path/libcrypto.dylib', root / 'lib/libtorrent.dylib')
+                run.assert_any_call('install_name_tool', '-change', '@loader_path/original/libtorrent.dylib', '@loader_path/lib/libtorrent.dylib', worker)
+                run.assert_any_call('install_name_tool', '-change', '@loader_path/libcrypto.dylib', '@loader_path/libcrypto.dylib', root / 'lib/libtorrent.dylib')
                 calls = run.call_args_list
                 first_sign = next(i for i, call in enumerate(calls) if call.args[0] == 'codesign')
                 self.assertTrue(all(call.args[0] == 'codesign' for call in calls[first_sign:]))
@@ -69,11 +72,12 @@ class BuildTests(unittest.TestCase):
                 build.bundle_macos(Path('/worker'), Path('/lib'), 'arm64')
 
     def test_windows_rejects_runtime_dll_dependency(self):
-        with mock.patch.object(build, 'text', return_value='    KERNEL32.dll\n    WS2_32.dll\n'):
+        with mock.patch.object(build, 'text', return_value='    KERNEL32.dll\n    WS2_32.dll\n    dbghelp.dll\n'):
             build.verify_windows_static('worker.exe')
-        with mock.patch.object(build, 'text', return_value='    VCRUNTIME140.dll\n'):
-            with self.assertRaisesRegex(ValueError, 'Unexpected DLL'):
-                build.verify_windows_static('worker.exe')
+        for dependency in ('VCRUNTIME140.dll', 'torrent-rasterbar.dll', 'libcrypto-3.dll'):
+            with self.subTest(dependency=dependency), mock.patch.object(build, 'text', return_value=f'    {dependency}\n'):
+                with self.assertRaisesRegex(ValueError, 'Unexpected DLL'):
+                    build.verify_windows_static('worker.exe')
 
     def test_pinned_vcpkg_commit(self):
         self.assertRegex(build.VCPKG_BASELINE, r'^[0-9a-f]{40}$')

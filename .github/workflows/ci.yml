@@ -46,13 +46,23 @@ jobs:
         if: runner.os == 'Windows'
         with:
           arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - name: Configure native Windows ARM64 CMake builds
-        if: matrix.os == 'windows-11-arm'
+      - name: Use the activated native MSVC toolchain for CMake
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          "CMAKE_GENERATOR=Visual Studio 17 2022" >> $env:GITHUB_ENV
-          "CMAKE_GENERATOR_PLATFORM=ARM64" >> $env:GITHUB_ENV
-          "CMAKE_GENERATOR_TOOLSET=host=arm64" >> $env:GITHUB_ENV
+          # NMake uses cl.exe from msvc-dev-cmd, including native ARM64.
+          # Do not assume a VS major version: ARM runners now ship VS 18.
+          "CMAKE_GENERATOR=NMake Makefiles" >> $env:GITHUB_ENV
+      - name: Install pinned Inno Setup compiler (build tool only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $compiler = & ./scripts/install-inno-setup.ps1
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Missing ISCC compiler' }
+          "ULOS_ISCC=$compiler" >> $env:GITHUB_ENV
+      - name: Compile both Windows installers (synthetic native headers; no installation)
+        if: runner.os == 'Windows'
+        run: python3 scripts/smoke-windows-installer.py
       - name: Test release packager (synthetic headers)
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo fmt --all -- --check
@@ -60,7 +70,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
 
   desktop:
-    timeout-minutes: 45
+    # Windows also builds release-mode payloads and downloadable Setup artifacts.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -92,13 +103,13 @@ jobs:
         if: runner.os == 'Windows'
         with:
           arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - name: Configure native Windows ARM64 CMake builds
-        if: matrix.os == 'windows-11-arm'
+      - name: Use the activated native MSVC toolchain for CMake
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          "CMAKE_GENERATOR=Visual Studio 17 2022" >> $env:GITHUB_ENV
-          "CMAKE_GENERATOR_PLATFORM=ARM64" >> $env:GITHUB_ENV
-          "CMAKE_GENERATOR_TOOLSET=host=arm64" >> $env:GITHUB_ENV
+          # NMake uses cl.exe from msvc-dev-cmd, including native ARM64.
+          # Do not assume a VS major version: ARM runners now ship VS 18.
+          "CMAKE_GENERATOR=NMake Makefiles" >> $env:GITHUB_ENV
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -132,3 +143,26 @@ jobs:
         timeout-minutes: 5
         run: cargo test --locked --workspace -- --test-threads=1
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Build Windows distribution payload
+        if: runner.os == 'Windows'
+        run: |
+          python3 scripts/build-torrent-worker.py --profile release --test --install-deps
+          cargo build --locked --release -p ulos-desktop
+      - name: Build Windows Setup with license and notices pages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $compiler = & ./scripts/install-inno-setup.ps1
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Missing ISCC compiler' }
+          $env:ULOS_ISCC = $compiler
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x86_64' }
+          python3 scripts/release-package.py windows $arch $version
+          if ($LASTEXITCODE -ne 0) { throw 'Setup packaging failed' }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: Ulos-Windows-${{ runner.arch }}-Setup
+          path: dist/*-Setup.exe
+          if-no-files-found: error
+          retention-days: 7

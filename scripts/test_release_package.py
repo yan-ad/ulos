@@ -8,7 +8,6 @@ import struct
 import tempfile
 import unittest
 from unittest import mock
-import zipfile
 
 spec = importlib.util.spec_from_file_location('release_package', Path(__file__).with_name('release-package.py'))
 package = importlib.util.module_from_spec(spec)
@@ -62,43 +61,148 @@ class ArchitectureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 package.verify_binary_architecture(path, 'windows', 'arm64')
 
-    def test_windows_arm_archive_required_worker_and_absent_output(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / 'scripts').mkdir()
-            (root / 'packaging/licenses').mkdir(parents=True)
-            for filename in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'packaging/INSTALL.md', 'packaging/licenses/MIT.txt'):
-                (root / filename).write_text('test')
-            target = root / 'custom/aarch64-pc-windows-msvc/release'
-            target.mkdir(parents=True)
-            (target / 'ulos-desktop.exe').write_bytes(header('windows', 'arm64'))
-            old_cwd = Path.cwd()
-            try:
-                with mock.patch.object(package, '__file__', str(root / 'scripts/release-package.py')), mock.patch.object(package.subprocess, 'check_output', return_value='1.0.0\n'), mock.patch.dict(os.environ, {'CARGO_TARGET_DIR': str(root / 'custom'), 'CARGO_BUILD_TARGET': 'aarch64-pc-windows-msvc'}):
-                    for worker_present in (False, True):
-                        if worker_present:
-                            (target / 'ulos-torrent-worker.exe').write_bytes(header('windows', 'arm64'))
-                        if not worker_present:
-                            with self.assertRaises(SystemExit):
-                                package.main(['windows', 'arm64', '1.0.0'])
-                            self.assertFalse((root / 'dist/Ulos-1.0.0-windows-arm64.zip').exists())
-                            continue
-                        with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                            package.main(['windows', 'arm64', '1.0.0'])
-                        output = root / 'dist/Ulos-1.0.0-windows-arm64.zip'
-                        self.assertIn(output.name, stdout.getvalue())
-                        with zipfile.ZipFile(output) as archive:
-                            self.assertIn('Ulos-1.0.0-windows-arm64/Ulos.exe', archive.namelist())
-                            self.assertEqual('Ulos-1.0.0-windows-arm64/ulos-torrent-worker.exe' in archive.namelist(), worker_present)
-                        with self.assertRaises(SystemExit):
-                            package.main(['windows', 'arm64', '1.0.0'])
-                        output.unlink()
-                    (target / 'ulos-torrent-worker.exe').write_bytes(header('windows', 'x86_64'))
-                    with self.assertRaises(ValueError):
-                        package.main(['windows', 'arm64', '1.0.0'])
-                    self.assertFalse(output.exists())
-            finally:
-                os.chdir(old_cwd)
+    def test_usage_and_version_validation(self):
+        for args in ([], ['windows', 'arm64'], ['windows', 'arm64', '../bad']):
+            with self.assertRaises(SystemExit):
+                package.main(args)
+
+
+class WindowsInstallerTests(unittest.TestCase):
+    """Mock compiler orchestration only; no native installer validation claimed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        (self.root / 'scripts').mkdir()
+        (self.root / 'packaging/licenses').mkdir(parents=True)
+        (self.root / 'packaging/windows').mkdir()
+        (self.root / 'packaging/windows/ulos.iss').write_text('synthetic script')
+        for filename in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'packaging/INSTALL.md'):
+            (self.root / filename).write_text('test notices: © contributors', encoding='utf-8')
+        for filename in package.REQUIRED_LICENSES:
+            (self.root / 'packaging/licenses' / filename).write_text('license ' + filename)
+        self.compiler = self.root / 'ISCC.exe'
+        self.compiler.write_bytes(b'compiler fixture, never executed')
+        self.target = self.root / 'custom/aarch64-pc-windows-msvc/release'
+        self.target.mkdir(parents=True)
+        self.output = self.root / 'dist/Ulos-1.0.0-windows-arm64-Setup.exe'
+        self.old_cwd = Path.cwd()
+        self.addCleanup(os.chdir, self.old_cwd)
+        for patcher in (
+            mock.patch.object(package, '__file__', str(self.root / 'scripts/release-package.py')),
+            mock.patch.object(package.subprocess, 'check_output', return_value='1.0.0\n'),
+            mock.patch.dict(os.environ, {'CARGO_TARGET_DIR': str(self.root / 'custom'),
+                                        'CARGO_BUILD_TARGET': 'aarch64-pc-windows-msvc',
+                                        'ULOS_ISCC': str(self.compiler)}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.set_binaries('arm64')
+
+    def set_binaries(self, arch):
+        for filename in ('ulos-desktop.exe', 'ulos-torrent-worker.exe'):
+            (self.target / filename).write_bytes(header('windows', arch))
+
+    def compile_fixture(self, command, check):
+        self.assertTrue(check)
+        self.assertEqual(command[0], str(self.compiler))
+        self.assertEqual(command[-1], str(self.root / 'packaging/windows/ulos.iss'))
+        defines = dict(arg[2:].split('=', 1) for arg in command if arg.startswith('/D'))
+        self.assertEqual(defines['AppVersion'], '1.0.0')
+        self.assertEqual(defines['PayloadArch'], self.arch)
+        stage = Path(defines['StageDir'])
+        self.assertEqual((stage / 'Ulos.exe').read_bytes(), header('windows', self.arch))
+        self.assertEqual((stage / 'ulos-torrent-worker.exe').read_bytes(), header('windows', self.arch))
+        for filename in package.REQUIRED_LICENSES:
+            self.assertTrue((stage / 'licenses' / filename).is_file())
+        self.assertTrue((stage / 'INSTALL.md').is_file())
+        self.assertTrue((stage / 'LICENSE').is_file())
+        notices = (stage / 'OSS-NOTICES.txt').read_text(encoding='utf-8-sig')
+        self.assertIn('© contributors', notices)
+        for filename in package.REQUIRED_LICENSES:
+            self.assertIn('===== ' + filename + ' =====', notices)
+        # This MZ fixture only exercises artifact publication, not a real installer.
+        (Path(defines['BuildOutputDir']) / (defines['OutputName'] + '.exe')).write_bytes(b'MZ' + bytes(126))
+
+    def run_package(self, arch='arm64'):
+        self.arch = arch
+        with contextlib.redirect_stdout(io.StringIO()):
+            package.main(['windows', arch, '1.0.0'])
+
+    def test_both_architectures_compile_and_no_zip_fallback(self):
+        for arch in ('arm64', 'x86_64'):
+            with self.subTest(arch=arch):
+                self.set_binaries(arch)
+                with mock.patch.object(package.subprocess, 'run', side_effect=self.compile_fixture) as runner:
+                    self.run_package(arch)
+                    runner.assert_called_once()
+                output = self.root / f'dist/Ulos-1.0.0-windows-{arch}-Setup.exe'
+                self.assertTrue(output.is_file())
+                self.assertFalse(list((self.root / 'dist').glob('*.zip')))
+                with self.assertRaises(SystemExit):
+                    self.run_package(arch)
+                output.unlink()
+
+    def test_missing_worker_and_mismatched_worker_fail_before_compilation(self):
+        worker = self.target / 'ulos-torrent-worker.exe'
+        with mock.patch.object(package.subprocess, 'run') as runner:
+            worker.unlink()
+            with self.assertRaises(SystemExit):
+                self.run_package()
+            worker.write_bytes(header('windows', 'x86_64'))
+            with self.assertRaises(ValueError):
+                self.run_package()
+            runner.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_missing_compiler_fails_closed(self):
+        self.compiler.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'ISCC.exe required'):
+            self.run_package()
+        self.assertFalse(self.output.exists())
+        self.assertFalse(list((self.root / 'dist').glob('*.zip')))
+
+    def test_missing_license_fails_closed(self):
+        (self.root / 'packaging/licenses/Boost-1.0.txt').unlink()
+        with mock.patch.object(package.subprocess, 'run') as runner:
+            with self.assertRaisesRegex(ValueError, 'required license'):
+                self.run_package()
+            runner.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_compiler_failure_missing_output_and_invalid_output_not_published(self):
+        import subprocess
+        def invalid_output(command, check):
+            defines = dict(arg[2:].split('=', 1) for arg in command if arg.startswith('/D'))
+            (Path(defines['BuildOutputDir']) / (defines['OutputName'] + '.exe')).write_bytes(bytes(128))
+        for effect, exception in ((subprocess.CalledProcessError(1, 'ISCC'), subprocess.CalledProcessError),
+                                  (None, RuntimeError), (invalid_output, RuntimeError)):
+            with self.subTest(effect=effect):
+                with mock.patch.object(package.subprocess, 'run', side_effect=effect):
+                    with self.assertRaises(exception):
+                        self.run_package()
+                self.assertFalse(self.output.exists())
+                self.assertFalse(list((self.root / 'dist').glob('*.zip')))
+
+    def test_existing_symlink_output_refused(self):
+        self.output.parent.mkdir()
+        self.output.symlink_to(self.root / 'absent')
+        with self.assertRaises(SystemExit):
+            self.run_package()
+
+    def test_iss_policy_and_exact_compiler_pin(self):
+        source = Path(__file__).resolve().parent.parent / 'packaging/windows/ulos.iss'
+        script = source.read_text()
+        for setting in ('PrivilegesRequired=lowest', 'CloseApplications=no', 'RestartApplications=no',
+                        'ChangesAssociations=no', 'LicenseFile={#StageDir}\\LICENSE',
+                        'InfoBeforeFile={#StageDir}\\OSS-NOTICES.txt',
+                        '#if VER != EncodeVer(6, 7, 3)', '#define InstallArchitecture "arm64"',
+                        '#define InstallArchitecture "x64os"',
+                        'ArchitecturesInstallIn64BitMode={#InstallArchitecture}'):
+            self.assertIn(setting, script)
+        for forbidden in ('[Run]', '[UninstallRun]', '[Registry]', 'PrivilegesRequiredOverridesAllowed'):
+            self.assertNotIn(forbidden, script)
 
 
 if __name__ == '__main__':

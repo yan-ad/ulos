@@ -142,7 +142,10 @@ def verify_windows_static(worker):
         if lower not in {'kernel32.dll', 'user32.dll', 'advapi32.dll', 'ws2_32.dll',
                          'mswsock.dll', 'iphlpapi.dll', 'bcrypt.dll', 'crypt32.dll',
                          'secur32.dll', 'shell32.dll', 'ole32.dll', 'ntdll.dll',
-                         'shlwapi.dll', 'gdi32.dll', 'normaliz.dll', 'userenv.dll'}:
+                         'shlwapi.dll', 'gdi32.dll', 'normaliz.dll', 'userenv.dll',
+                         # Windows Debug Help is an OS component used by
+                         # libtorrent's Debug assertion/backtrace support.
+                         'dbghelp.dll'}:
             raise ValueError(f'Unexpected DLL dependency in static worker: {name}')
 
 

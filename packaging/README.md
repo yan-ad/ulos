@@ -1,7 +1,7 @@
 # Local opener packaging
 
-These are development packaging aids, not publisher-signed/notarized installers or a
-verified cross-platform distribution. No magnet scheme is advertised. No custom
+These are development packaging aids, not a publisher-signed/notarized or clean-host-verified cross-platform distribution.
+Next-build Windows packages use a real per-user Inno Setup installer, described below. No magnet scheme is advertised. No custom
 icon or unsupported minimum OS baseline is invented. Keep `LICENSE`,
 `THIRD_PARTY_NOTICES.md`, and `licenses/Apache-2.0.txt` with redistributed binaries;
 the supplied `licenses/libtorrent-BSD-3-Clause.txt`, `licenses/libtorrent-2.1.2-NOTICES.txt` (full component notices), `licenses/OpenSSL-Apache-2.0.txt`, `licenses/Boost-1.0.txt` and `licenses/nlohmann-json-MIT.txt` must also accompany the native helper/runtime closure. Review additional or changed dependency obligations before distribution; supplied notices are not a full transitive compliance audit.
@@ -55,6 +55,79 @@ Linux desktop discovery and native launch remain unverified on this macOS host.
 
 ## Windows
 
+### Setup.exe (next build)
+
+`python scripts/release-package.py windows x86_64 VERSION` (or `arm64`) produces
+**`dist/Ulos-VERSION-windows-ARCH-Setup.exe`**, never a fallback ZIP. Existing
+published ZIPs remain historical assets. The packager validates desktop/worker PE
+headers, stages both binaries and **all** `packaging/licenses/` texts, and requires
+the full supplied engine/runtime license set. It generates UTF-8 `OSS-NOTICES.txt`
+from `THIRD_PARTY_NOTICES.md` plus all full license/component texts. Inno Setup's
+stock `LicenseFile` page shows Ulos's MIT `LICENSE`; its separate scrollable
+`InfoBeforeFile` page shows the complete combined OSS notices. The same documents
+are installed offline. Supplied notices are not a completed transitive compliance
+audit; changes to dependencies still require review.
+
+`packaging/windows/ulos.iss` pins **Inno Setup 6.7.3**, the maintained Inno 6 release
+listed on the [official downloads page](https://jrsoftware.org/isdl.php). Inno 7 is
+not silently substituted. The preprocessor rejects any other compiler version.
+The 32-bit compiler/Setup bootstrap can run under Windows ARM64's x86 emulation;
+the **payload** remains native ARM64, using `ArchitecturesAllowed=arm64` **and**
+`ArchitecturesInstallIn64BitMode=arm64`. x86-64 uses `x64os` for both, deliberately
+requiring native x64 Windows rather than promising emulation compatibility. Do
+not use `x64compatible` for the ARM64 payload. See Inno's [architecture identifiers](https://jrsoftware.org/ishelp/topic_archidentifiers.htm)
+and [64-bit install mode](https://jrsoftware.org/ishelp/topic_setup_architecturesinstallin64bitmode.htm).
+
+Developer/CI PowerShell commands (explicit tool-install opt-in; no Ulos launch):
+
+```powershell
+# From the repository root, with Python, native Rust/MSVC/SDK/CMake available:
+$compiler = & ./scripts/install-inno-setup.ps1
+if (-not $?) { throw 'Compiler installation failed' }
+$env:ULOS_ISCC = $compiler
+# CARGO_BUILD_TARGET must match the native host: x86_64-pc-windows-msvc
+# or aarch64-pc-windows-msvc. CARGO_TARGET_DIR is respected by both scripts.
+cargo build --locked --release -p ulos-desktop
+python scripts/build-torrent-worker.py --profile release --test --install-deps
+python scripts/release-package.py windows x86_64 0.0.1-pre.0
+# ARM host: replace x86_64 with arm64; version must match desktop Cargo.toml.
+```
+
+The helper downloads only
+`https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe`,
+verifies SHA-256
+`9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732`
+([Microsoft winget 6.7.3 manifest](https://github.com/microsoft/winget-pkgs/blob/master/manifests/j/JRSoftware/InnoSetup/6.7.3/JRSoftware.InnoSetup.installer.yaml)),
+and requires a valid **Pyrsys B.V.** Authenticode signature before execution. See
+[official upstream verification guidance](https://jrsoftware.org/isdl-verify.php).
+It installs the compiler under the current user's local app data, refuses an
+existing destination, and never changes system PATH or requests elevation. An
+already provisioned trusted exact-version compiler can instead be selected via
+`ULOS_ISCC=C:\path\ISCC.exe` or PATH. The packager never downloads/installs tools;
+missing ISCC, a compiler failure or missing output fails closed. Compile output is
+private until success; final output creation is exclusive and refuses symlinks.
+The installer-engine license is also bundled as `Inno-Setup-6.7.3.txt`.
+
+Setup uses `PrivilegesRequired=lowest` with no privilege overrides, installs to
+`{localappdata}\Programs\Ulos`, creates per-user Start menu links and an Installed
+apps uninstall entry. No `[Run]`, `[Registry]`, services, default handlers,
+magnet/file associations, automatic app launch, app termination or elevation.
+`CloseApplications=no` and `RestartApplications=no` disable Restart Manager's
+automatic closure/restart, including silent installs. Users must close Ulos before
+updates/uninstall; downloads/history are not targeted for deletion.
+
+**Validation limits:** Python tests use synthetic headers and a mocked compiler
+runner to inspect staged payloads/notices, architecture defines, expected output,
+missing-license/worker/compiler failures and exclusive publication. They do not
+compile Inno Setup or validate native wizard rendering/extraction/runtime. Before
+publishing, build with the real pinned ISCC on both native Windows targets;
+manually inspect MIT/OSS pages, install as a standard user, verify worker launch
+and installed license contents, then exercise update/uninstall with Ulos closed
+and open (no forced termination), confirm no UAC/auto-launch/default changes and
+no deletion of downloads/history. No such native result is claimed on macOS.
+
+### Optional explicit Open With registration (not run by Setup)
+
 After placing the binary in a stable local location, deliberately invoke
 `packaging/windows/register-open-with.ps1 -ExecutablePath 'C:\\Apps\\Ulos\\Ulos.exe'`.
 `-WhatIf` previews the intended registration without registry writes. This
@@ -98,8 +171,8 @@ transfer. Parent UI must present each accepted file for review.
 ## Release workflow
 
 `.github/workflows/release.yml` accepts an existing `v` tag and verifies that its
-Cargo version matches. It is configured to build six native archives: Apple
-silicon/Intel macOS DMGs, Windows x86-64/ARM64 ZIPs, and Ubuntu 24.04 x86-64/ARM64
+Cargo version matches. It is configured for six native packages: Apple
+silicon/Intel macOS DMGs, Windows x86-64/ARM64 Setup.exe installers, and Ubuntu 24.04 x86-64/ARM64
 portable tar archives. The ARM64 additions are pending a future release, not
 retroactive assets for an existing release. Engine tests run on each build target;
 full desktop adapter tests/lint also run in CI on Windows ARM64 and Linux ARM64
@@ -114,8 +187,8 @@ toolset explicitly (including for native dependencies such as aws-lc-sys).
 Each matrix entry requires the exact `rustc -vV` host to equal its Cargo target;
 installing a cross target alone does not pass. The packager checks PE Machine,
 ELF e_machine, or thin Mach-O cputype against the requested architecture before
-creating an archive. Header tests use synthetic fixtures and do not claim native
-compilation or runtime testing. A sibling `ulos-torrent-worker(.exe)` is mandatory and architecture-checked, with relocated runtime libraries checked/copied when present. The workflow builds it first; the archive packager itself does not manufacture a worker.
+creating a package. Header tests use synthetic fixtures and do not claim native
+compilation or runtime testing. A sibling `ulos-torrent-worker(.exe)` is mandatory and architecture-checked, with relocated runtime libraries checked/copied when present. The workflow builds it first; the release packager itself does not manufacture a worker.
 
 All builds must succeed before publication. SHA256SUMS is generated from the six artifacts; publishing uses
 `--verify-tag --draft=false --prerelease=false --latest`, including `-pre` names.

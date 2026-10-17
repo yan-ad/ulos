@@ -1,9 +1,9 @@
 # Install Ulos
 
-Download the archive for your operating system and CPU from the release assets.
+Download the package for your operating system and CPU from the release assets.
 Windows ARM64 and Linux ARM64 are configured for future releases; use only assets
 actually listed on the selected release. Older releases may not include them.
-SHA256SUMS records the archive digests; it is not a signature or publisher identity.
+SHA256SUMS records the package digests; it is not a signature or publisher identity.
 
 - **macOS Apple silicon:** use `macos-arm64.dmg`.
 - **macOS Intel:** use `macos-x86_64.dmg`.
@@ -13,10 +13,21 @@ SHA256SUMS records the archive digests; it is not a signature or publisher ident
   normal Finder Open / System Settings Privacy & Security approval flow. Do not
   disable Gatekeeper or remove quarantine globally. Runner build/test success does
   not certify compatibility with older macOS releases.
-- **Windows Intel/AMD x86-64** (`windows-x86_64.zip`) or **Windows ARM64**
-  (`windows-arm64.zip`, for ARM-based PCs): extract the ZIP to a folder, then double-click **Ulos.exe**.
-  The executable is not publisher-signed; Windows SmartScreen may warn. No registry
-  changes or administrator access are required to start the application.
+- **Windows Intel/AMD x86-64** (`windows-x86_64-Setup.exe`) or **Windows ARM64**
+  (`windows-arm64-Setup.exe`, for ARM-based PCs), **next build only**: open Setup,
+  read/accept the Ulos MIT license, then read the scrollable third-party OSS notice
+  page. Install for your Windows account (default: `%LOCALAPPDATA%\Programs\Ulos`).
+  No administrator access/elevation is requested. Setup adds a Start menu shortcut
+  and an entry in Windows Installed apps for uninstalling. It does not launch Ulos,
+  close running applications, register torrent/magnet handlers, or change defaults.
+  Close Ulos yourself before updating/uninstalling; do not interrupt active downloads.
+  Use the Start menu to open Ulos after installation. The installed `LICENSE`,
+  `THIRD_PARTY_NOTICES.md`, `OSS-NOTICES.txt` and `licenses/` remain readable offline;
+  the Start menu also links to the combined notices. Uninstall does not purge your
+  downloads or saved history. The installer is not publisher-signed; SmartScreen
+  may warn. Review the source/download; never disable Windows security globally.
+  **Existing 0.0.1-pre.0 Windows assets remain ZIPs:** extract the entire ZIP to a
+  folder, then open **Ulos.exe**. This change does not rewrite published releases.
 - **Linux x86-64** (`linux-x86_64.tar.gz`) or **Linux ARM64**
   (`linux-arm64.tar.gz`): extract the `.tar.gz` with your archive manager, then open
   **Ulos** in the extracted folder. Some file managers require confirming that it
@@ -33,7 +44,7 @@ and the licenses folder with redistributed copies.
 
 ## Next-build torrent files
 
-Extract/copy the complete application, not just its main executable: the native
+Install/extract/copy the complete application, not just its main executable: the native
 `ulos-torrent-worker` helper and included `lib/` runtime libraries are required
 for v2/hybrid torrents, explicit magnet metadata resolution (including v1), peer uploads, public DHT and torrent rate/peer controls. Next-build application bundles require this helper and its complete runtime closure.
 Keep them in their supplied locations; no separate end-user engine installation

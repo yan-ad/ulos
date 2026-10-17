@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Create absent release archives. Does not launch or install the application."""
+"""Create absent release packages. Does not launch or install the application."""
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,7 +9,6 @@ import struct
 import sys
 import tarfile
 import tempfile
-import zipfile
 
 
 def verify_binary_architecture(path, platform, expected):
@@ -41,9 +41,62 @@ def verify_binary_architecture(path, platform, expected):
     return actual
 
 
+INNO_SETUP_VERSION = '6.7.3'
+REQUIRED_LICENSES = (
+    'Apache-2.0.txt', 'Boost-1.0.txt', 'OpenSSL-Apache-2.0.txt',
+    'libtorrent-2.1.2-NOTICES.txt', 'libtorrent-BSD-3-Clause.txt',
+    'nlohmann-json-MIT.txt', 'renamore-MIT.txt', 'Inno-Setup-6.7.3.txt',
+)
+
+
+def build_windows_installer(root, stage, output, arch, version):
+    """Invoke real ISCC; tests may mock the runner, never a ZIP fallback."""
+    compiler = os.environ.get('ULOS_ISCC') or shutil.which('ISCC.exe') or shutil.which('iscc')
+    if not compiler or not Path(compiler).is_file():
+        raise RuntimeError('Inno Setup 6.7.3 ISCC.exe required; set ULOS_ISCC or run scripts/install-inno-setup.ps1')
+    for filename in ('Ulos.exe', 'ulos-torrent-worker.exe', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'INSTALL.md'):
+        if not (stage / filename).is_file() or (stage / filename).stat().st_size == 0:
+            raise ValueError(f'Missing/empty installer payload: {filename}')
+    for filename in REQUIRED_LICENSES:
+        if not (stage / 'licenses' / filename).is_file() or (stage / 'licenses' / filename).stat().st_size == 0:
+            raise ValueError(f'Missing/empty required license: {filename}')
+    # Plain text UTF-8 BOM: readable both in the stock wizard and Windows Notepad.
+    sections = ['Ulos third-party software notices',
+                'Ulos is MIT licensed. Dependencies retain their own licenses.\n'
+                'These supplied notices are not a full transitive compliance audit.']
+    for file in [stage / 'THIRD_PARTY_NOTICES.md', *sorted((stage / 'licenses').glob('*.txt'))]:
+        sections.append(f'===== {file.name} =====\n{file.read_text(encoding="utf-8-sig")}')
+    (stage / 'OSS-NOTICES.txt').write_text('\n\n'.join(sections), encoding='utf-8-sig')
+    # Compile privately so failure cannot leave a release-shaped partial artifact.
+    with tempfile.TemporaryDirectory(prefix='ulos-iscc-') as temp:
+        built = Path(temp) / output.name
+        subprocess.run([
+            str(compiler), '/Qp', f'/DAppVersion={version}', f'/DPayloadArch={arch}',
+            f'/DStageDir={stage.resolve()}', f'/DBuildOutputDir={temp}',
+            f'/DOutputName={output.stem}', str(root / 'packaging/windows/ulos.iss'),
+        ], check=True)
+        if not built.is_file() or built.is_symlink() or built.stat().st_size < 64:
+            raise RuntimeError('ISCC succeeded without producing the expected Setup.exe')
+        with built.open('rb') as source:
+            if source.read(2) != b'MZ':
+                raise RuntimeError('ISCC output is not a Windows executable')
+            source.seek(0)
+            # Exclusive creation also refuses an output raced in after preflight.
+            with output.open('xb') as destination:
+                try:
+                    shutil.copyfileobj(source, destination)
+                except BaseException:
+                    output.unlink()
+                    raise
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 3:
+        sys.exit('Usage: release-package.py {macos|windows|linux} {arm64|x86_64} VERSION')
     platform, arch, version = argv
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
+        sys.exit('Unsupported release version')
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
     actual = subprocess.check_output([sys.executable, 'scripts/release-version.py', version], text=True).strip()
@@ -53,7 +106,7 @@ def main(argv=None):
     name = f'Ulos-{version}-{platform}-{arch}'
     dist = root / 'dist'
     dist.mkdir(exist_ok=True)
-    extension = {'macos': '.dmg', 'windows': '.zip', 'linux': '.tar.gz'}[platform]
+    extension = {'macos': '.dmg', 'windows': '-Setup.exe', 'linux': '.tar.gz'}[platform]
     output = dist / (name + extension)
     if output.exists() or output.is_symlink():
         sys.exit(f'Refusing existing output: {output}')
@@ -92,10 +145,7 @@ def main(argv=None):
             subprocess.run(['hdiutil', 'create', '-volname', 'Ulos', '-srcfolder', str(stage), '-format', 'UDZO', str(output)], check=True)
             subprocess.run(['hdiutil', 'verify', str(output)], check=True)
         elif platform == 'windows':
-            with zipfile.ZipFile(output, 'x', compression=zipfile.ZIP_DEFLATED) as archive:
-                for file in sorted(stage.rglob('*')):
-                    if file.is_file():
-                        archive.write(file, file.relative_to(stage.parent))
+            build_windows_installer(root, stage, output, arch, version)
         else:
             # x:gz refuses existing files. This is a portable folder, not an AppImage.
             with tarfile.open(output, 'x:gz') as archive:

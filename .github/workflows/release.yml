@@ -111,13 +111,13 @@ jobs:
         if: runner.os == 'Windows'
         with:
           arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - name: Configure native Windows ARM64 CMake builds
-        if: matrix.runner == 'windows-11-arm'
+      - name: Use the activated native MSVC toolchain for CMake
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          "CMAKE_GENERATOR=Visual Studio 17 2022" >> $env:GITHUB_ENV
-          "CMAKE_GENERATOR_PLATFORM=ARM64" >> $env:GITHUB_ENV
-          "CMAKE_GENERATOR_TOOLSET=host=arm64" >> $env:GITHUB_ENV
+          # NMake uses cl.exe from msvc-dev-cmd, including native ARM64.
+          # Do not assume a VS major version: ARM runners now ship VS 18.
+          "CMAKE_GENERATOR=NMake Makefiles" >> $env:GITHUB_ENV
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -156,6 +156,13 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
       - name: Build desktop
         run: cargo build --locked --release -p ulos-desktop
+      - name: Install pinned Inno Setup compiler (build tool only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $compiler = & ./scripts/install-inno-setup.ps1
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Missing ISCC compiler' }
+          "ULOS_ISCC=$compiler" >> $env:GITHUB_ENV
       - name: Package desktop
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -166,7 +173,7 @@ jobs:
           name: release-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             dist/*.dmg
-            dist/*.zip
+            dist/*-Setup.exe
             dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
@@ -230,7 +237,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          expected=("Ulos-$RELEASE_VERSION-macos-arm64.dmg" "Ulos-$RELEASE_VERSION-macos-x86_64.dmg" "Ulos-$RELEASE_VERSION-windows-x86_64.zip" "Ulos-$RELEASE_VERSION-linux-x86_64.tar.gz" "Ulos-$RELEASE_VERSION-windows-arm64.zip" "Ulos-$RELEASE_VERSION-linux-arm64.tar.gz")
+          expected=("Ulos-$RELEASE_VERSION-macos-arm64.dmg" "Ulos-$RELEASE_VERSION-macos-x86_64.dmg" "Ulos-$RELEASE_VERSION-windows-x86_64-Setup.exe" "Ulos-$RELEASE_VERSION-linux-x86_64.tar.gz" "Ulos-$RELEASE_VERSION-windows-arm64-Setup.exe" "Ulos-$RELEASE_VERSION-linux-arm64.tar.gz")
           test "$(find . -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
           for asset in "${expected[@]}"; do test -s "$asset"; done
           sha256sum "${expected[@]}" > SHA256SUMS

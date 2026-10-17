@@ -8,13 +8,14 @@ use gpui_kit::{
         Icon,
         button::Button,
         empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
+        h_flex,
         input::Input,
         label::Label,
         menu::{DropdownMenu, PopupMenuItem},
         sidebar::{Sidebar, SidebarCollapsible, SidebarGroup, SidebarMenu, SidebarMenuItem},
         status_bar::StatusBar,
         table::DataTable,
-        toolbar::Toolbar,
+        toolbar::{Toolbar, ToolbarGroup},
     },
 };
 
@@ -76,6 +77,45 @@ fn manager_menu_item(
 }
 
 impl DownloadManager {
+    pub(super) fn sidebar_toggle(&self, cx: &mut Context<Self>) -> Button {
+        toolbar_button(
+            "toggle-sidebar",
+            if self.sidebar_collapsed {
+                "Expand sidebar"
+            } else {
+                "Collapse sidebar"
+            },
+            if self.sidebar_collapsed {
+                AssetIcon::PanelLeftOpen
+            } else {
+                AssetIcon::PanelLeftClose
+            },
+        )
+        .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)))
+    }
+
+    fn can_resume_or_start_queue(&self) -> bool {
+        if let Some(id) = self.active {
+            self.row_command_enabled(id, crate::manager::row_menu::RowCommand::Resume)
+        } else {
+            !self.queue_running
+                && self
+                    .queue
+                    .next_in_queue(crate::scheduler::DEFAULT_QUEUE)
+                    .is_some()
+        }
+    }
+
+    fn resume_or_start_queue(&mut self, cx: &mut Context<Self>) {
+        if !self.can_resume_or_start_queue() {
+            return;
+        }
+        if let Some(id) = self.active {
+            self.toggle_pause(id, cx);
+        } else {
+            self.start_queue(cx);
+        }
+    }
     pub(super) fn theme_selector(
         &self,
         id: &'static str,
@@ -202,78 +242,78 @@ impl DownloadManager {
             .py_2()
             .flex_shrink_0()
             .content(
-                toolbar_button(
-                    "toggle-sidebar",
-                    if self.sidebar_collapsed {
-                        "Expand sidebar"
-                    } else {
-                        "Collapse sidebar"
-                    },
-                    if self.sidebar_collapsed {
-                        AssetIcon::PanelLeftOpen
-                    } else {
-                        AssetIcon::PanelLeftClose
-                    },
-                )
-                .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx))),
-            )
-            .content(
-                toolbar_button("add-url", "Add New", AssetIcon::Plus)
-                    .label("Add New")
-                    .dropdown_menu({
-                        let owner = cx.weak_entity();
-                        move |menu, _, _| {
-                            let http = owner.clone();
-                            let torrent = owner.clone();
-                            menu.item(PopupMenuItem::new("URL or magnet link…").on_click(
-                                move |_, window, cx| {
-                                    let _ = http.update(cx, |view, cx| view.open_add(window, cx));
-                                },
-                            ))
-                            .item(
-                                PopupMenuItem::new("Torrent file or magnet…").on_click(
-                                    move |_, _, cx| {
-                                        let _ = torrent
-                                            .update(cx, |view, cx| view.open_torrent(None, cx));
-                                    },
-                                ),
-                            )
-                        }
-                    }),
-            )
-            .content(
-                toolbar_button("start-queue", "Start Queue", AssetIcon::Play)
-                    .disabled(
-                        self.queue_running
-                            || self
-                                .queue
-                                .next_in_queue(crate::scheduler::DEFAULT_QUEUE)
-                                .is_none(),
+                ToolbarGroup::new("download-actions")
+                    .label("Download actions")
+                    .gap_1()
+                    .content(
+                        toolbar_button("add-url", "Add New", AssetIcon::Plus)
+                            .label("Add New")
+                            .dropdown_menu({
+                                let owner = cx.weak_entity();
+                                move |menu, _, _| {
+                                    let http = owner.clone();
+                                    let torrent = owner.clone();
+                                    menu.item(PopupMenuItem::new("URL or magnet link…").on_click(
+                                        move |_, window, cx| {
+                                            let _ = http
+                                                .update(cx, |view, cx| view.open_add(window, cx));
+                                        },
+                                    ))
+                                    .item(
+                                        PopupMenuItem::new("Torrent file or magnet…").on_click(
+                                            move |_, _, cx| {
+                                                let _ = torrent.update(cx, |view, cx| {
+                                                    view.open_torrent(None, cx)
+                                                });
+                                            },
+                                        ),
+                                    )
+                                }
+                            }),
                     )
-                    .on_click(cx.listener(|view, _, _, cx| view.start_queue(cx))),
+                    .content(
+                        toolbar_button(
+                            "start-queue",
+                            if self.active.is_some() {
+                                "Resume download"
+                            } else {
+                                "Start queue"
+                            },
+                            AssetIcon::Play,
+                        )
+                        .disabled(!self.can_resume_or_start_queue())
+                        .on_click(cx.listener(|view, _, _, cx| view.resume_or_start_queue(cx))),
+                    )
+                    .content(
+                        toolbar_button("stop-selected", "Stop selected", AssetIcon::Square)
+                            .disabled(!selected_active)
+                            .on_click(cx.listener(|view, _, _, cx| view.stop_selected(cx))),
+                    )
+                    .content(
+                        toolbar_button("stop-all", "Stop All", AssetIcon::CircleX)
+                            .disabled(self.queue.active_count() == 0)
+                            .on_click(cx.listener(|view, _, _, cx| view.stop_all(cx))),
+                    )
+                    .content(
+                        toolbar_button("remove-selected", "Remove", AssetIcon::Trash)
+                            .disabled(!removable)
+                            .tooltip(
+                                "Remove selected records from this session; files are not deleted",
+                            )
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.remove_selected(window, cx)),
+                            ),
+                    )
+                    .content(
+                        toolbar_button("clear-finished", "Clear finished", AssetIcon::Check)
+                            .disabled(!finished)
+                            .tooltip("Clear finished session records; downloaded files are kept")
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.clear_finished(window, cx)),
+                            ),
+                    ),
             )
-            .content(
-                toolbar_button("stop-selected", "Stop selected", AssetIcon::Square)
-                    .disabled(!selected_active)
-                    .on_click(cx.listener(|view, _, _, cx| view.stop_selected(cx))),
-            )
-            .content(
-                toolbar_button("stop-all", "Stop All", AssetIcon::CircleX)
-                    .disabled(self.queue.active_count() == 0)
-                    .on_click(cx.listener(|view, _, _, cx| view.stop_all(cx))),
-            )
-            .content(
-                toolbar_button("remove-selected", "Remove", AssetIcon::Trash)
-                    .disabled(!removable)
-                    .tooltip("Remove selected records from this session; files are not deleted")
-                    .on_click(cx.listener(|view, _, window, cx| view.remove_selected(window, cx))),
-            )
-            .content(
-                toolbar_button("clear-finished", "Clear finished", AssetIcon::Check)
-                    .disabled(!finished)
-                    .tooltip("Clear finished session records; downloaded files are kept")
-                    .on_click(cx.listener(|view, _, window, cx| view.clear_finished(window, cx))),
-            )
+            .content(div().flex_1().min_w(px(8.)))
             .content(
                 toolbar_button("scheduler", "Scheduler", AssetIcon::Calendar)
                     .on_click(cx.listener(|view, _, window, cx| view.open_scheduler(window, cx))),
@@ -282,15 +322,7 @@ impl DownloadManager {
                 toolbar_button("options", "Options", AssetIcon::Settings)
                     .on_click(cx.listener(|view, _, window, cx| view.open_options(window, cx))),
             )
-            .content(
-                toolbar_button("selected-details", "Details", AssetIcon::Info)
-                    .disabled(self.queue.selected.is_empty())
-                    .on_click(
-                        cx.listener(|view, _, window, cx| view.open_selected_details(window, cx)),
-                    ),
-            )
             .content(self.theme_selector("theme-selector", cx))
-            .content(div().flex_1().min_w(px(8.)))
             .content(self.render_toolbar_search())
     }
 
@@ -588,16 +620,16 @@ impl Render for DownloadManager {
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let menubar = Some(self.render_menu_strip(cx).into_any_element());
-        #[cfg(target_os = "macos")]
-        let menubar: Option<AnyElement> = None;
         #[cfg(target_os = "windows")]
         let menubar = Some(self.render_windows_header(cx).into_any_element());
         #[cfg(target_os = "macos")]
-        let toolbar = gpui_kit::component::TitleBar::new()
-            .h(px(48.))
-            .bg(cx.theme().background)
-            .child(self.render_queue_toolbar(cx).flex_1().min_w_0())
-            .into_any_element();
+        let menubar = Some(
+            gpui_kit::component::TitleBar::new()
+                .h(px(40.))
+                .into_any_element(),
+        );
+        #[cfg(target_os = "macos")]
+        let toolbar = self.render_queue_toolbar(cx).into_any_element();
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let toolbar = self.render_queue_toolbar(cx).into_any_element();
 
@@ -634,7 +666,6 @@ impl Render for DownloadManager {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .when_some(menubar, |this, menubar| this.child(menubar))
-            .child(toolbar)
             .child(
                 div()
                     .flex()
@@ -649,6 +680,7 @@ impl Render for DownloadManager {
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
+                            .child(div().debug_selector(|| "download-toolbar".into()).flex_shrink_0().min_w_0().child(toolbar))
                             .when_some(self.history_error.as_ref().map(|error| format!("History unavailable: {error} This session is not being saved.")), |this, error| { this.child(Label::new(error)) })
                             .when_some(self.notice.clone(), |this, notice| {
                                 this.child(Label::new(notice).px_4().py_2().text_xs())
@@ -659,9 +691,9 @@ impl Render for DownloadManager {
             .child(
                 StatusBar::new()
                     .flex_shrink_0()
-                    .left(Label::new(format!(
-                        "{count} downloads · {selected_count} selected"
-                    )))
+                    .left(h_flex().debug_selector(|| "download-count-controls".into()).gap_2().items_center()
+                        .child(self.sidebar_toggle(cx))
+                        .child(Label::new(format!("{count} downloads · {selected_count} selected"))))
                     .child(Label::new(format!(
                         "Queue {} · Session only",
                         if self.queue_running || self.scheduler.any_running() {

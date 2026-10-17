@@ -2017,8 +2017,8 @@ fn native_menu_toolbar_uses_stock_sizes_and_one_row_at_minimum_width(cx: &mut Te
             "Keep native traffic lights clear"
         );
         assert!(
-            add.top() < gpui_kit::px(18.),
-            "No separate titlebar strip above actions"
+            add.top() >= gpui_kit::px(40.),
+            "Commands are below native chrome"
         );
     }
     assert!((add.center().y - search.center().y).abs() <= gpui_kit::px(1.));
@@ -2031,7 +2031,6 @@ fn native_menu_toolbar_uses_stock_sizes_and_one_row_at_minimum_width(cx: &mut Te
         "remove-selected",
         "clear-finished",
         "scheduler",
-        "selected-details",
     ] {
         let button = cx.debug_bounds(selector).expect("toolbar control");
         assert!((button.center().y - add.center().y).abs() <= gpui_kit::px(1.));
@@ -2695,16 +2694,20 @@ fn sidebar_empty_light_and_dark_layout_stays_in_one_row_at_minimum_size(cx: &mut
             let search = cx.debug_bounds("download-search").expect("search wrapper");
             let toggle = cx.debug_bounds("toggle-sidebar").expect("sidebar toggle");
             let options = cx.debug_bounds("options").expect("options button");
-            assert!((toggle.center().y - search.center().y).abs() <= gpui_kit::px(1.));
+            assert!(
+                toggle.top() > search.bottom(),
+                "Sidebar toggle belongs beside bottom download count"
+            );
             assert!((options.center().y - search.center().y).abs() <= gpui_kit::px(1.));
             assert!(toggle.right() <= search.left());
             assert!(options.right() <= search.left());
             assert!(options.right() <= gpui_kit::px(880.));
-            #[cfg(target_os = "macos")]
-            assert!(
-                toggle.left() >= gpui_kit::px(80.),
-                "native traffic lights remain clear"
-            );
+            let count = cx.debug_bounds("download-count-controls").unwrap();
+            assert!(toggle.left() >= count.left() && toggle.right() <= count.right());
+            let add = cx.debug_bounds("add-url").unwrap();
+            let table = cx.debug_bounds("download-table").unwrap();
+            assert!(add.left() >= table.left() && add.left() <= table.left() + gpui_kit::px(16.));
+            assert!(cx.debug_bounds("selected-details").is_none());
             let sidebar = cx.debug_bounds("manager-sidebar").expect("sidebar wrapper");
             assert!(sidebar.bottom() <= gpui_kit::px(540.));
             view.read_with(cx, |view, _| {
@@ -2989,12 +2992,11 @@ fn theme_selector_stock_geometry_and_click_preserve_preference_until_selection(
     let add = cx.debug_bounds("add-url").expect("Add URL button");
     let search = cx.debug_bounds("download-search").expect("search wrapper");
     let toggle = cx.debug_bounds("toggle-sidebar").expect("sidebar toggle");
-    for control in [add, search, toggle] {
+    for control in [add, search] {
         assert!((theme.center().y - control.center().y).abs() <= gpui_kit::px(1.));
     }
-    for control in [add, toggle] {
-        assert!((theme.size.height - control.size.height).abs() <= gpui_kit::px(1.));
-    }
+    assert!(toggle.top() > search.bottom());
+    assert!((theme.size.height - add.size.height).abs() <= gpui_kit::px(1.));
     assert!(theme.size.height > gpui_kit::px(24.));
     assert!(theme.right() <= gpui_kit::px(880.));
     cx.update(|_, cx| assert_eq!(palette::preference(cx), ThemePreference::System));
@@ -3242,7 +3244,12 @@ fn advanced_parallel_pause_retains_slot_and_resumes_validated_ranges(cx: &mut Te
                 .all(|c| c.status == ConnectionStatus::Paused)
         );
     });
-    details.update(&mut child, |_, cx| cx.emit(TogglePause(id)));
+    draw(cx);
+    let resume = cx
+        .debug_bounds("start-queue")
+        .expect("Resume toolbar control");
+    cx.simulate_click(resume.center(), gpui_kit::Modifiers::default());
+    draw(cx);
     let mut observed = Vec::new();
     poll(cx, |_| {
         observed.extend(fixture.requests.try_iter());

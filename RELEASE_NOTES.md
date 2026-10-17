@@ -29,10 +29,18 @@ in the already-published 0.0.1-pre.0 release**. Existing tags/releases are not r
   libtorrent 2 packages; Windows pins 2.1.2 through vcpkg, not an all-OS version pin.
   See [packaging](packaging/README.md).
 - Future workflow targets six packages: macOS ARM64/x86-64 DMGs, Windows ARM64/x86-64
-  ZIPs and Ubuntu 24.04 ARM64/x86-64 tar archives. Windows ARM64 uses `windows-11-arm`,
+  Setup.exe installers and Ubuntu 24.04 ARM64/x86-64 tar archives. Windows ARM64 uses `windows-11-arm`,
   native MSVC/SDK and explicit CMake ARM64 host/toolset; Linux ARM64 uses
   `ubuntu-24.04-arm`. Exact Rust host/target and executable-header checks protect
   architecture identity.
+- Windows packages now use Inno Setup 6.7.3: `Ulos-{version}-windows-{arch}-Setup.exe`,
+  not portable ZIPs. Setup presents the Ulos MIT License and a separate readable
+  third-party notice page, installs the matching mandatory worker/full supplied
+  licenses per user, and provides Start menu shortcuts and uninstall. No elevation,
+  app auto-launch/forced close, torrent/magnet association or default takeover.
+  Compiler acquisition verifies a pinned upstream download hash and Authenticode
+  publisher; native Windows build/install/uninstall review remains a release gate.
+  Existing 0.0.1-pre.0 ZIP assets are unchanged.
 - CI configures real worker loopback and explicitly invoked ignored parent-task
   integration tests, plus desktop adapter checks. Configuration and synthetic
   packaging-header tests are not successful six-platform compile/runtime results.
