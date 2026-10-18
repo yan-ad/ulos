@@ -82,6 +82,66 @@ class BuildTests(unittest.TestCase):
     def test_pinned_vcpkg_commit(self):
         self.assertRegex(build.VCPKG_BASELINE, r'^[0-9a-f]{40}$')
 
+    def test_binary_archives_do_not_bypass_pinned_windows_dependency_install(self):
+        for arch, triplet in (('x86_64', 'x64-windows-static'), ('arm64', 'arm64-windows-static')):
+            for populated in (False, True):
+                with self.subTest(arch=arch, populated=populated), tempfile.TemporaryDirectory() as temp:
+                    target = Path(temp)
+                    root = target / 'native-deps' / build.VCPKG_BASELINE
+                    root.mkdir(parents=True)
+                    archives = target / 'archives'
+                    archives.mkdir()
+                    if populated:
+                        (archives / 'abi-entry.zip').write_bytes(b'cached dependency archive')
+                    provider = f'clear;files,{archives},readwrite'
+                    with mock.patch.dict(os.environ, {'VCPKG_DEFAULT_BINARY_CACHE': str(archives),
+                                                     'VCPKG_BINARY_SOURCES': provider}), \
+                            mock.patch.object(build, 'text', return_value=build.VCPKG_BASELINE), \
+                            mock.patch.object(build, 'run') as run:
+                        toolchain = build.install_dependencies('windows', arch, target)
+                    self.assertEqual(toolchain, root / 'scripts/buildsystems/vcpkg.cmake')
+                    run.assert_any_call('cmd', '/c', str(root / 'bootstrap-vcpkg.bat'), '-disableMetrics')
+                    install = run.call_args_list[-1]
+                    self.assertEqual(install.args, (root / 'vcpkg.exe', 'install',
+                                                  f'libtorrent[core,deprfun]:{triplet}',
+                                                  f'nlohmann-json:{triplet}'))
+                    self.assertEqual(install.kwargs['env']['VCPKG_BINARY_SOURCES'], provider)
+                    self.assertEqual(install.kwargs['env']['VCPKG_DEFAULT_BINARY_CACHE'], str(archives))
+
+    def test_cached_windows_checkout_must_still_match_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp)
+            (target / 'native-deps' / build.VCPKG_BASELINE).mkdir(parents=True)
+            with mock.patch.object(build, 'text', return_value='0' * 40), \
+                    mock.patch.object(build, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'pinned baseline'):
+                    build.install_dependencies('windows', 'arm64', target)
+                run.assert_not_called()
+
+    def test_worker_tests_and_validation_run_even_with_binary_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp).resolve()
+            executable = target / 'torrent-worker-build/windows-arm64-debug/ulos-torrent-worker.exe'
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b'fixture worker')
+            env = {'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_TARGET': 'aarch64-pc-windows-msvc',
+                   'VCPKG_BINARY_SOURCES': 'clear;files,fixture-cache,readwrite', 'GITHUB_ENV': ''}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(build, 'native_identity', return_value=('windows', 'arm64')), \
+                    mock.patch.object(build, 'install_dependencies', return_value=target / 'toolchain.cmake') as install, \
+                    mock.patch.object(build, 'run') as run, \
+                    mock.patch.object(build.package, 'verify_binary_architecture') as architecture, \
+                    mock.patch.object(build, 'verify_windows_static') as static:
+                build.main(['--profile', 'debug', '--test', '--install-deps'])
+            install.assert_called_once_with('windows', 'arm64', target)
+            commands = [call.args for call in run.call_args_list]
+            self.assertTrue(any(cmd[:2] == ('cmake', '--build') for cmd in commands))
+            self.assertTrue(any(cmd[0] == 'ctest' and '--no-tests=error' in cmd for cmd in commands))
+            self.assertTrue(any('loopback.py' in str(arg) for cmd in commands for arg in cmd))
+            architecture.assert_called_once_with(executable, 'windows', 'arm64')
+            static.assert_called_once()
+            self.assertTrue((target / 'aarch64-pc-windows-msvc/debug/ulos-torrent-worker.exe').is_file())
+
 
 if __name__ == '__main__':
     unittest.main()

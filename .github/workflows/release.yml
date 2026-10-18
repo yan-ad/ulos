@@ -160,8 +160,63 @@ jobs:
           python3 scripts/release-version.py "$RELEASE_VERSION"
           rustc -vV
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$CARGO_BUILD_TARGET"
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        continue-on-error: true
+        with:
+          shared-key: release-build-${{ matrix.target }}
+          cache-bin: false
+          cache-targets: true
+          cache-workspace-crates: false
+          cache-on-failure: false
+          env-vars: VCToolsVersion WindowsSDKVersion ImageOS ImageVersion
+          save-if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+      - name: Identify native dependency cache
+        if: runner.os == 'Windows'
+        id: native-cache
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = (Get-Command cl.exe -CommandType Application -ErrorAction Stop).Source
+          $linker = Join-Path (Split-Path -Parent $compiler) 'link.exe'
+          $recipe = Get-Content -LiteralPath scripts/build-torrent-worker.py -Raw
+          $baseline = [regex]::Match($recipe, "VCPKG_BASELINE = '([0-9a-f]{40})'").Groups[1].Value
+          if (-not $baseline) { throw 'Missing pinned vcpkg baseline' }
+          foreach ($name in @('VCToolsVersion', 'WindowsSDKVersion', 'ImageOS', 'ImageVersion', 'CARGO_BUILD_TARGET', 'RUNNER_ARCH')) {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Missing cache identity: $name" }
+          }
+          $identity = @('native-v1', $baseline, $env:CARGO_BUILD_TARGET, $env:RUNNER_ARCH,
+            $env:VCToolsVersion, $env:WindowsSDKVersion, $env:ImageOS, $env:ImageVersion,
+            (Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash,
+            (Get-FileHash -LiteralPath $linker -Algorithm SHA256).Hash,
+            (Get-FileHash -LiteralPath scripts/build-torrent-worker.py -Algorithm SHA256).Hash,
+            (Get-FileHash -LiteralPath native/torrent-worker/CMakeLists.txt -Algorithm SHA256).Hash) -join "`n"
+          $sha = [Security.Cryptography.SHA256]::Create()
+          try { $digest = [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))).ToLowerInvariant() }
+          finally { $sha.Dispose() }
+          $cache = Join-Path $env:GITHUB_WORKSPACE '.cache/ulos/vcpkg'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          "path=$cache" >> $env:GITHUB_OUTPUT
+          "key=ulos-native-v1-$env:RUNNER_ARCH-$baseline-$digest" >> $env:GITHUB_OUTPUT
+          "VCPKG_DEFAULT_BINARY_CACHE=$cache" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" >> $env:GITHUB_ENV
+      - name: Restore native dependency archives
+        if: runner.os == 'Windows'
+        id: restore-native
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: ${{ steps.native-cache.outputs.path }}
+          key: ${{ steps.native-cache.outputs.key }}
       - name: Build and test bundled native torrent worker
         run: python3 scripts/build-torrent-worker.py --profile release --test --install-deps
+      - name: Save verified native dependency archives
+        if: runner.os == 'Windows' && steps.restore-native.outputs.cache-hit != 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: ${{ steps.native-cache.outputs.path }}
+          key: ${{ steps.native-cache.outputs.key }}
       - name: Select native worker for Rust integration tests
         shell: bash
         run: |
@@ -258,6 +313,17 @@ jobs:
         with:
           python-version: '3.x'
           architecture: arm64
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        continue-on-error: true
+        with:
+          shared-key: desktop-aarch64-apple-darwin
+          cache-bin: false
+          cache-targets: true
+          cache-workspace-crates: false
+          cache-on-failure: false
+          env-vars: VCToolsVersion WindowsSDKVersion ImageOS ImageVersion
+          save-if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
       - name: Build and test bundled native torrent worker
         run: python3 scripts/build-torrent-worker.py --profile debug --test --install-deps
       - name: Select native worker for Rust integration tests
