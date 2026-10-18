@@ -16,9 +16,17 @@
 #include <iostream>
 #include <thread>
 namespace lt=libtorrent;
+namespace fs=std::filesystem;
+// Match the worker's bounded UTF-8 filesystem/buffer boundary. Do not delegate
+// opening a test path to libtorrent's deprecated filename constructor.
+static std::shared_ptr<lt::torrent_info> read_torrent(std::string const& name){
+ fs::path path=fs::u8path(name);if(!fs::is_regular_file(fs::symlink_status(path))||fs::file_size(path)>8*1024*1024)throw 1;
+ std::ifstream input(path,std::ios::binary);std::vector<char> bytes(8*1024*1024+1);input.read(bytes.data(),std::streamsize(bytes.size()));auto count=input.gcount();if(input.bad()||count<=0||count>8*1024*1024)throw 1;bytes.resize(size_t(count));
+ lt::error_code ec;auto result=std::make_shared<lt::torrent_info>(bytes.data(),int(bytes.size()),ec);if(ec)throw 1;return result;
+}
 static int fixture_main(std::vector<std::string> const& argv){int argc=int(argv.size());try{
  if(argc==3&&argv[1]=="--magnet-info"){
-  lt::add_torrent_params p;p.ti=std::make_shared<lt::torrent_info>(argv[2]);
+  lt::add_torrent_params p;p.ti=read_torrent(argv[2]);
   std::cout<<nlohmann::json({{"magnet",lt::make_magnet_uri(p)}}).dump()<<std::endl;return 0;
  }
  if((argc==6||argc==8)&&std::string(argv[1])=="--create-fixture"&&std::string(argv[3])=="--torrent-out"){
@@ -34,8 +42,17 @@ static int fixture_main(std::vector<std::string> const& argv){int argc=int(argv.
  if(argc!=7||std::string(argv[1])!="--seed-test"||std::string(argv[3])!="--data"||std::string(argv[5])!="--listen")throw 1;
  std::string listen=argv[6];if(listen.rfind("127.0.0.1:",0)!=0)throw 1;
  lt::settings_pack s;s.set_str(lt::settings_pack::listen_interfaces,listen);s.set_bool(lt::settings_pack::enable_dht,false);s.set_bool(lt::settings_pack::enable_lsd,false);s.set_bool(lt::settings_pack::enable_upnp,false);s.set_bool(lt::settings_pack::enable_natpmp,false);
- lt::session session(s);lt::add_torrent_params p;p.ti=std::make_shared<lt::torrent_info>(argv[2]);p.save_path=argv[4];p.flags &= ~lt::torrent_flags::paused;p.flags &= ~lt::torrent_flags::auto_managed;
- auto h=session.add_torrent(p);for(int i=0;i<300&&(!h.status().is_seeding||session.listen_port()==0);++i)std::this_thread::sleep_for(std::chrono::milliseconds(100));if(!h.status().is_seeding||session.listen_port()==0)throw 1;
+ lt::add_torrent_params p;p.ti=read_torrent(argv[2]);p.save_path=argv[4];p.flags &= ~lt::torrent_flags::paused;p.flags &= ~lt::torrent_flags::auto_managed;
+ lt::session session(s);auto h=session.add_torrent(p);
+ for(int i=0;i<300;++i){
+  auto status=h.status();
+  if(status.errc){std::cerr<<"Fixture seed check failed; error="<<status.errc.value()<<"\n";throw 1;}
+  if(status.is_seeding&&session.listen_port()!=0)break;
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+ }
+ if(!h.status().is_seeding||session.listen_port()==0){
+  auto status=h.status();std::cerr<<"Fixture seed readiness failed; state="<<int(status.state)<<"; seeding="<<status.is_seeding<<"; listen="<<session.listen_port()<<"; checked="<<status.total_done<<"\n";throw 1;
+ }
  std::cout<<nlohmann::json({{"event","seed_ready"},{"port",session.listen_port()}}).dump()<<std::endl;
  std::string line;std::getline(std::cin,line);return 0;
 }catch(...){std::cerr<<"Fixture operation failed\n";return 1;}}

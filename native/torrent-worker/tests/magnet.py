@@ -10,14 +10,44 @@ import threading
 
 worker, fixture = map(os.path.abspath, sys.argv[1:])
 
+class Events(queue.Queue):
+    def __init__(self, process):
+        super().__init__()
+        self.process = process
+        self.history = []
+
+    def get(self, *args, **kwargs):
+        try:
+            event = super().get(*args, **kwargs)
+        except queue.Empty:
+            self.failure('timed out waiting for JSON event')
+        if event is None:
+            self.failure('early EOF on JSON event stream')
+        if isinstance(event, Exception):
+            self.failure('invalid JSON event: ' + str(event))
+        self.history.append(event)
+        return event
+
+    def failure(self, reason):
+        try:
+            code = self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            code = 'still running'
+        stderr = self.process.stderr.read() if code != 'still running' else '(child still running)'
+        raise AssertionError(f'{reason}; command={self.process.args!r}; exit={code}; stderr={stderr!r}; events={self.history!r}')
+
 def spawn(args):
     p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, encoding='utf-8')
-    q = queue.Queue()
+    q = Events(p)
     def read():
-        for line in p.stdout:
-            q.put(json.loads(line))
-        q.put(None)
+        try:
+            for line in p.stdout:
+                q.put(json.loads(line))
+        except Exception as error:
+            q.put(error)
+        finally:
+            q.put(None)
     threading.Thread(target=read, daemon=True).start()
     return p, q
 
@@ -31,7 +61,8 @@ def finish(p):
     p.wait(timeout=10)
 
 with tempfile.TemporaryDirectory() as tmp:
-    root = Path(tmp)
+    root = Path(tmp) / 'unicode-文件-é'
+    root.mkdir()
     for size in [1024, 65537]:
         data = root / ('source-' + str(size)) / 'payload.bin'
         data.parent.mkdir()

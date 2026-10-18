@@ -1,4 +1,18 @@
-# Ulos 0.0.1-pre.1
+# Ulos 0.0.1-pre.2
+
+Corrected testing release following the unpublished pre.1 attempts. The pre.1 tag
+remains unchanged. This build includes the existing MSVC linker binding plus:
+
+- Windows strict-lint fix for the Unix-only migration file import.
+- Native fixture metainfo reads through bounded UTF-8 filesystem paths and byte
+  buffers, with explicit seeder failure diagnostics and Unicode v1/v2/hybrid tests.
+- Stable real-click removal-dialog tests, reduced-motion setup, cancellation
+  completion checks, and repeated cancel/reopen coverage.
+
+The Windows ARM64 and full release results are not inferred from local macOS
+tests. Use only the assets actually published for this tag.
+
+## Included features from pre.1
 
 This testing release includes the following source and packaging changes. Old
 0.0.1-pre.0 assets remain unchanged; download only assets actually listed for this tag.

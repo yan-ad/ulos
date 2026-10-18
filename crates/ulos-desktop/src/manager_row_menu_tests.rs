@@ -43,6 +43,58 @@ fn row_menu_filter_changes_keep_target_and_escape_preserves_selection(cx: &mut T
     });
 }
 
+#[gpui::test]
+fn row_menu_removal_cancel_reopen_cycles_keep_real_dialog_clicks(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let saved = directory.path().join("second.bin");
+    std::fs::write(&saved, b"keep after repeated cancellation").unwrap();
+    let (_root, view, cx) = mount(cx, &runtime);
+    // Exercise real hit testing at rest, not the legacy wall-clock entrance.
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    let (first, second) = queued_pair(&view, directory.path(), cx);
+
+    for _ in 0..8 {
+        right_click(&view, second, cx);
+        let remove_intent = capture_remove(&view, second, cx);
+        activate_remove(&remove_intent, cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.removal_open);
+            assert_eq!(view.pending_removal, Some(vec![second]));
+        });
+
+        let cancel = dialog_button(cx, "cancel-removal");
+        cx.simulate_click(cancel.center(), Default::default());
+        assert_removal_cancelled(&view, second, cx);
+    }
+
+    view.read_with(cx, |view, _| {
+        assert!(view.queue.item(first).is_some());
+        assert!(view.queue.item(second).is_some());
+        assert!(view.queue.selected.contains(&first));
+    });
+    right_click(&view, second, cx);
+    let remove_intent = capture_remove(&view, second, cx);
+    activate_remove(&remove_intent, cx);
+    view.read_with(cx, |view, _| {
+        assert!(view.removal_open);
+        assert_eq!(view.pending_removal, Some(vec![second]));
+    });
+    let remove = dialog_button(cx, "remove-records");
+    cx.simulate_click(remove.center(), Default::default());
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert!(!view.removal_open && view.pending_removal.is_none());
+        assert!(view.queue.item(second).is_none());
+        assert!(view.queue.item(first).is_some() && view.queue.selected.contains(&first));
+        assert!(view.active.is_none());
+    });
+    assert_eq!(
+        std::fs::read(saved).unwrap(),
+        b"keep after repeated cancellation"
+    );
+}
+
 fn capture_remove(
     view: &Entity<DownloadManager>,
     id: DownloadId,
@@ -84,20 +136,54 @@ fn dialog_button(
     cx: &mut VisualTestContext,
     selector: &'static str,
 ) -> gpui_kit::Bounds<gpui_kit::Pixels> {
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    let mut previous = None;
+    for _ in 0..20 {
         draw(cx);
         if let Some(bounds) = cx.debug_bounds(selector) {
-            return bounds;
+            // Alert dialogs use the legacy wall-clock entrance animation.  A
+            // debug registration can therefore exist while its position and
+            // hitbox are still changing between input frames.  Require
+            // two settled snapshots with reduced motion enabled instead of
+            // clicking the first registration we happen to observe.  Advancing
+            // the deterministic clock alone cannot settle legacy animations.
+            if previous == Some(bounds) {
+                return bounds;
+            }
+            previous = Some(bounds);
+        } else {
+            previous = None;
         }
-        assert!(
-            Instant::now() < deadline,
-            "Dialog control did not render: {selector}"
-        );
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(50));
-        std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    panic!("Dialog control did not settle: {selector}");
+}
+
+fn assert_removal_cancelled(
+    view: &Entity<DownloadManager>,
+    second: DownloadId,
+    cx: &mut VisualTestContext,
+) {
+    view.read_with(cx, |view, _| {
+        assert!(!view.removal_open, "Cancel must close the confirmation");
+        assert!(
+            view.pending_removal.is_none(),
+            "Cancel must clear its target"
+        );
+        assert!(view.queue.item(second).is_some());
+    });
+    for _ in 0..20 {
+        draw(cx);
+        if cx.debug_bounds("cancel-removal").is_none()
+            && cx.debug_bounds("remove-records").is_none()
+            && cx.debug_bounds("dialog-layer").is_none()
+        {
+            return;
+        }
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+    }
+    panic!("closing dialog did not settle");
 }
 
 fn queued_pair(
@@ -169,6 +255,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     let saved = directory.path().join("second.bin");
     std::fs::write(&saved, b"keep these bytes").unwrap();
     let (_root, view, cx) = mount(cx, &runtime);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
     let (first, second) = queued_pair(&view, directory.path(), cx);
     right_click(&view, second, cx);
     let remove_intent = capture_remove(&view, second, cx);
@@ -193,12 +280,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     let cancel = dialog_button(cx, "cancel-removal");
     cx.simulate_click(cancel.center(), Default::default());
     draw(cx);
-    // Kit retains the closing dialog through its transition; it can still
-    // intercept pointer input until the deterministic clock advances.
-    cx.executor()
-        .advance_clock(std::time::Duration::from_millis(250));
-    draw(cx);
-    view.read_with(cx, |view, _| assert!(view.queue.item(second).is_some()));
+    assert_removal_cancelled(&view, second, cx);
     right_click(&view, second, cx);
     let remove_intent = capture_remove(&view, second, cx);
     activate_remove(&remove_intent, cx);
@@ -214,6 +296,7 @@ fn row_menu_removal_confirmation_targets_id_after_sort_and_keeps_files(cx: &mut 
     cx.simulate_click(remove.center(), Default::default());
     draw(cx);
     view.read_with(cx, |view, _| {
+        assert!(!view.removal_open && view.pending_removal.is_none());
         assert!(view.queue.item(first).is_some() && view.queue.selected.contains(&first));
         assert!(view.queue.item(second).is_none());
         assert!(view.active.is_none());

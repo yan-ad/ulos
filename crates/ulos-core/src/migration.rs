@@ -1,7 +1,8 @@
 //! Bounded URL-only migration. Source-bearing values deliberately do not implement Debug.
+#[cfg(not(windows))]
+use std::fs::File;
 use std::{
     fmt,
-    fs::File,
     io::{Read, Write},
     path::Path,
 };
