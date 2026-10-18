@@ -1,5 +1,11 @@
 # Implementation status
 
+### pre.1 Windows release-linker repair (2026-10-18)
+
+- Release run `39066608089` failed before publication on both Windows architectures: Cargo invoked `C:\Program Files\Git\usr\bin\link.exe` for Rust build scripts, which is the Unix `link` utility rather than the MSVC linker. Linux ARM64/x64, macOS ARM64/x64 packaging and the release desktop-test job passed; no pre.1 release assets were published.
+- Commit `79bedec` derives the absolute linker path beside the activated MSVC `cl.exe`, exports Cargo's target-specific linker setting and prepends the native tools directory. Windows release Cargo steps explicitly use PowerShell instead of Git Bash. Both CI Windows job types and release builds run an early dependency-free Cargo smoke containing a build script and application. A workflow regression test checks guard count, linker binding, smoke coverage and Windows release-shell selection. All 17 local Python tests, actionlint and diff checks passed; no application source or tag was changed by this repair.
+- Dispatched the corrected workflow from `main` for the unchanged `v0.0.1-pre.1` tag at `4277772`: run `39091623741`. Both Windows x64 and ARM64 native linker/build-script smoke steps passed remotely; native dependency and release-payload builds were still running at this observation. Full publication, installer execution and final runtime results remain unverified. The existing release guards, checksums and refusal to overwrite published assets remain enabled.
+
 Updated: 2026-10-14. Local host: macOS 27.0.1, Apple Silicon, Rust/Cargo 1.98.1. Initialization is committed as `7bf99c6`; subsequent HTTP/manager changes remain uncommitted. No push performed.
 
 ## Implemented foundation
