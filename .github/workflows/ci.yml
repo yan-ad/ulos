@@ -53,6 +53,34 @@ jobs:
           # NMake uses cl.exe from msvc-dev-cmd, including native ARM64.
           # Do not assume a VS major version: ARM runners now ship VS 18.
           "CMAKE_GENERATOR=NMake Makefiles" >> $env:GITHUB_ENV
+      - name: Verify native MSVC linker and Rust build-script linking
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = (Get-Command cl.exe -CommandType Application -ErrorAction Stop).Source
+          $tools = Split-Path -Parent $compiler
+          $native = Join-Path $tools 'link.exe'
+          if ($compiler -notmatch '\\VC\\Tools\\MSVC\\' -or -not (Test-Path -LiteralPath $native -PathType Leaf)) {
+            throw 'The activated native MSVC compiler/linker pair is missing'
+          }
+          $key = 'CARGO_TARGET_' + $env:CARGO_BUILD_TARGET.ToUpperInvariant().Replace('-', '_') + '_LINKER'
+          "$key=$native" >> $env:GITHUB_ENV
+          $tools >> $env:GITHUB_PATH
+          Set-Item -Path "Env:$key" -Value $native
+          $env:Path = "$tools;$env:Path"
+          Write-Host "Native Rust linker: $native"
+          $smoke = Join-Path $env:RUNNER_TEMP ('ulos-link-smoke-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path (Join-Path $smoke 'src') | Out-Null
+          try {
+            @('[package]', 'name = "ulos-link-smoke"', 'version = "0.0.0"', 'edition = "2024"', '[workspace]') | Set-Content -Encoding utf8 (Join-Path $smoke 'Cargo.toml')
+            'fn main() {}' | Set-Content -Encoding utf8 (Join-Path $smoke 'build.rs')
+            'fn main() {}' | Set-Content -Encoding utf8 (Join-Path $smoke 'src/main.rs')
+            cargo build --offline --manifest-path (Join-Path $smoke 'Cargo.toml') --target $env:CARGO_BUILD_TARGET --target-dir (Join-Path $smoke 'target')
+            if ($LASTEXITCODE -ne 0) { throw 'Native Rust build-script/application link smoke failed' }
+          } finally {
+            Remove-Item -LiteralPath $smoke -Recurse -Force
+          }
       - name: Install pinned Inno Setup compiler (build tool only)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -110,6 +138,34 @@ jobs:
           # NMake uses cl.exe from msvc-dev-cmd, including native ARM64.
           # Do not assume a VS major version: ARM runners now ship VS 18.
           "CMAKE_GENERATOR=NMake Makefiles" >> $env:GITHUB_ENV
+      - name: Verify native MSVC linker and Rust build-script linking
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $compiler = (Get-Command cl.exe -CommandType Application -ErrorAction Stop).Source
+          $tools = Split-Path -Parent $compiler
+          $native = Join-Path $tools 'link.exe'
+          if ($compiler -notmatch '\\VC\\Tools\\MSVC\\' -or -not (Test-Path -LiteralPath $native -PathType Leaf)) {
+            throw 'The activated native MSVC compiler/linker pair is missing'
+          }
+          $key = 'CARGO_TARGET_' + $env:CARGO_BUILD_TARGET.ToUpperInvariant().Replace('-', '_') + '_LINKER'
+          "$key=$native" >> $env:GITHUB_ENV
+          $tools >> $env:GITHUB_PATH
+          Set-Item -Path "Env:$key" -Value $native
+          $env:Path = "$tools;$env:Path"
+          Write-Host "Native Rust linker: $native"
+          $smoke = Join-Path $env:RUNNER_TEMP ('ulos-link-smoke-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path (Join-Path $smoke 'src') | Out-Null
+          try {
+            @('[package]', 'name = "ulos-link-smoke"', 'version = "0.0.0"', 'edition = "2024"', '[workspace]') | Set-Content -Encoding utf8 (Join-Path $smoke 'Cargo.toml')
+            'fn main() {}' | Set-Content -Encoding utf8 (Join-Path $smoke 'build.rs')
+            'fn main() {}' | Set-Content -Encoding utf8 (Join-Path $smoke 'src/main.rs')
+            cargo build --offline --manifest-path (Join-Path $smoke 'Cargo.toml') --target $env:CARGO_BUILD_TARGET --target-dir (Join-Path $smoke 'target')
+            if ($LASTEXITCODE -ne 0) { throw 'Native Rust build-script/application link smoke failed' }
+          } finally {
+            Remove-Item -LiteralPath $smoke -Recurse -Force
+          }
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |

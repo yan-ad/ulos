@@ -16,7 +16,7 @@
 
 **[Open the Releases page →](https://github.com/yan-ad/ulos/releases/latest)**
 
-Choose the file for your computer from the assets actually listed on that release. No terminal or build tools are needed. Windows Setup installers and ARM64 additions are configured for the this build, not replacements for existing release assets. Older releases may still offer portable ZIPs.
+Choose the file for your computer from the assets actually listed on that release. No terminal or build tools are needed. Windows Setup installers and ARM64 additions are configured for this build, not replacements for existing release assets. Older releases may still offer portable ZIPs.
 
 | Computer | Download | Install |
 | --- | --- | --- |

@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
 from pathlib import Path
 import struct
 import tempfile
@@ -190,6 +191,38 @@ class WindowsInstallerTests(unittest.TestCase):
         self.output.symlink_to(self.root / 'absent')
         with self.assertRaises(SystemExit):
             self.run_package()
+
+    def test_workflows_pin_windows_native_linker_and_powershell_cargo(self):
+        root = Path(__file__).resolve().parent.parent
+        guard = '      - name: Verify native MSVC linker and Rust build-script linking\n'
+        for name, jobs in (('ci.yml', ('engine', 'desktop')), ('release.yml', ('build',))):
+            text = (root / '.github/workflows' / name).read_text()
+            self.assertEqual(text.count(guard), len(jobs))
+            for job in jobs:
+                with self.subTest(workflow=name, job=job):
+                    # Job contents contain deeper indentation; stop only at a sibling job.
+                    body = re.split(r'\n  [a-zA-Z][\w-]*:\n', text.split(f'  {job}:\n', 1)[1], maxsplit=1)[0]
+                    self.assertEqual(body.count(guard), 1)
+                    smoke = body.split(guard, 1)[1].split('\n      - ', 1)[0]
+                    for required in (
+                        "if: runner.os == 'Windows'", 'shell: pwsh',
+                        'Get-Command cl.exe', "Join-Path $tools 'link.exe'",
+                        "'CARGO_TARGET_'", "'_LINKER'", '>> $env:GITHUB_ENV',
+                        '>> $env:GITHUB_PATH', "Join-Path $smoke 'build.rs'",
+                        'cargo build --offline', 'if ($LASTEXITCODE -ne 0)',
+                        'finally {', 'Remove-Item -LiteralPath $smoke',
+                    ):
+                        self.assertIn(required, smoke)
+                    self.assertLess(body.index(guard), body.index('      - name: Build and test bundled native torrent worker')
+                                    if job != 'engine' else body.index('      - run: cargo test --locked'))
+        release = (root / '.github/workflows/release.yml').read_text()
+        for name in ('Test engine and CLI (Windows native shell)',
+                     'Verify real v2 and hybrid task publication (Windows)',
+                     'Check desktop compilation (Windows)', 'Check strict lint (Windows)',
+                     'Build desktop (Windows)'):
+            step = release.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("if: runner.os == 'Windows'", step)
+            self.assertIn('shell: pwsh', step)
 
     def test_iss_policy_and_exact_compiler_pin(self):
         source = Path(__file__).resolve().parent.parent / 'packaging/windows/ulos.iss'
