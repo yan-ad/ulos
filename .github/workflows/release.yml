@@ -218,10 +218,20 @@ jobs:
           if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Missing ISCC compiler' }
           "ULOS_ISCC=$compiler" >> $env:GITHUB_ENV
       - name: Package desktop
+        shell: python {0}
         env:
-          PLATFORM: ${{ matrix.platform }}
-          ARCH: ${{ matrix.arch }}
-        run: python3 scripts/release-package.py "$PLATFORM" "$ARCH" "$RELEASE_VERSION"
+          ULOS_RELEASE_PLATFORM: ${{ matrix.platform }}
+          ULOS_RELEASE_ARCH: ${{ matrix.arch }}
+        run: |
+          import os
+          import subprocess
+          import sys
+          subprocess.run([
+              sys.executable, 'scripts/release-package.py',
+              os.environ['ULOS_RELEASE_PLATFORM'],
+              os.environ['ULOS_RELEASE_ARCH'],
+              os.environ['RELEASE_VERSION'],
+          ], check=True)
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}-${{ matrix.arch }}

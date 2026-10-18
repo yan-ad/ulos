@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 import struct
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
@@ -32,6 +33,26 @@ def header(platform, arch):
 
 
 class ArchitectureTests(unittest.TestCase):
+    def test_workflow_packaging_ignores_msvc_platform_environment(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/release.yml').read_text()
+        step = workflow.split('      - name: Package desktop\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('shell: python {0}', step)
+        self.assertNotIn('\n          PLATFORM:', step)
+        self.assertNotIn('\n          ARCH:', step)
+        code = compile(textwrap.dedent(step.split('        run: |\n', 1)[1]), 'release-package-step', 'exec')
+        for arch in ('x86_64', 'arm64'):
+            for inherited in ('x64', 'ARM64', ''):
+                with self.subTest(arch=arch, inherited=inherited), mock.patch.dict(os.environ, {
+                    'Platform': inherited, 'PLATFORM': inherited, 'ARCH': 'wrong',
+                    'ULOS_RELEASE_PLATFORM': 'windows', 'ULOS_RELEASE_ARCH': arch,
+                    'RELEASE_VERSION': '0.0.1-pre.2',
+                }), mock.patch('subprocess.run') as run:
+                    exec(code, {})
+                    run.assert_called_once_with([
+                        package.sys.executable, 'scripts/release-package.py',
+                        'windows', arch, '0.0.1-pre.2',
+                    ], check=True)
+
     def test_all_six_headers_and_mismatches(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'binary'
