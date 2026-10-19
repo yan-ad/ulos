@@ -31,10 +31,15 @@ impl NativeTorrentWindow {
         path: Option<std::path::PathBuf>,
         directory: Option<std::path::PathBuf>,
         runtime: tokio::runtime::Handle,
+        defaults: crate::config::ConfigSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = cx.new(|cx| AddTorrent::new(path, directory, runtime, window, cx));
+        let content = cx.new(|cx| {
+            let mut form = AddTorrent::new(path, directory, runtime, window, cx);
+            form.set_defaults(defaults);
+            form
+        });
         let weak = content.downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             weak.upgrade().is_none_or(|view| {
@@ -202,10 +207,18 @@ impl NativeAddWindow {
         source: Option<String>,
         default_directory: Option<std::path::PathBuf>,
         runtime: tokio::runtime::Handle,
+        defaults: crate::config::ConfigSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let content = cx.new(|cx| AddDownload::new(default_directory, runtime, window, cx));
+        let content = cx.new(|cx| {
+            let mut form = AddDownload::new(default_directory, runtime, window, cx);
+            form.options.connections = usize::from(defaults.http_connections);
+            form.options.bytes_per_second = defaults.http_rate_limit;
+            form.magnet_review
+                .update(cx, |review, _| review.set_defaults(defaults));
+            form
+        });
         if let Some(source) = source {
             content.update(cx, |form, cx| form.prefill(source, window, cx));
         }

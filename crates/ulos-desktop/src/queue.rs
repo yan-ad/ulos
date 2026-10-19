@@ -30,6 +30,26 @@ pub enum Category {
     Other,
 }
 
+pub(crate) fn pause_available(
+    active: bool,
+    cancelling: bool,
+    pending: Option<bool>,
+    torrent: bool,
+    paused: bool,
+    resume: ulos_core::transfer::ResumeCapability,
+    phase: Option<TorrentPhase>,
+) -> bool {
+    active
+        && !cancelling
+        && pending.is_none()
+        && if torrent {
+            phase != Some(TorrentPhase::Publishing)
+                && (paused || phase == Some(TorrentPhase::Downloading))
+        } else {
+            resume == ulos_core::transfer::ResumeCapability::Supported
+        }
+}
+
 impl Category {
     pub const ALL: [Self; 7] = [
         Self::Image,
@@ -107,6 +127,8 @@ pub struct QueueItem {
     pub added_at: SystemTime,
     pub state: Option<TransferState>,
     pub cancelling: bool,
+    /// Accepted control intent, not an observed worker phase.
+    pub pause_pending: Option<bool>,
     pub options: TransferOptions,
     pub telemetry: TransferTelemetry,
     pub torrent_settings: ulos_core::torrent::TorrentSettings,
@@ -120,9 +142,21 @@ pub struct QueueItem {
     source: String,
     last_sample: Option<(Instant, u64)>,
     measured_rate: Option<f64>,
+    torrent_sample: Option<Instant>,
 }
 
 impl QueueItem {
+    pub fn can_pause(&self) -> bool {
+        pause_available(
+            self.is_active(),
+            self.cancelling,
+            self.pause_pending,
+            self.is_torrent,
+            matches!(self.state, Some(TransferState::Paused(_))),
+            self.telemetry.resume,
+            self.torrent_telemetry.as_ref().map(|t| t.phase.clone()),
+        )
+    }
     pub fn name(&self) -> String {
         self.destination
             .file_name()
@@ -142,6 +176,9 @@ impl QueueItem {
     pub fn status(&self) -> &str {
         if self.cancelling && self.is_active() {
             return "Cancelling";
+        }
+        if let Some(paused) = self.pause_pending {
+            return if paused { "Pausing" } else { "Resuming" };
         }
         if self.is_torrent && self.is_active() {
             if matches!(self.state, Some(TransferState::Paused(_))) {
@@ -204,8 +241,8 @@ impl QueueItem {
                     telemetry.phase == TorrentPhase::Downloading
                         && matches!(self.state, Some(TransferState::Downloading(_)))
                         && self
-                            .last_sample
-                            .is_some_and(|(time, _)| time.elapsed() < Duration::from_secs(2))
+                            .torrent_sample
+                            .is_some_and(|time| time.elapsed() < Duration::from_secs(2))
                 })
                 .map(|telemetry| telemetry.download_bytes_per_second as f64);
         }
@@ -218,6 +255,17 @@ impl QueueItem {
         } else {
             None
         }
+    }
+
+    pub fn live_torrent(&self) -> Option<&TorrentTelemetry> {
+        self.torrent_telemetry.as_ref().filter(|sample| {
+            self.is_torrent
+                && sample.phase == TorrentPhase::Downloading
+                && matches!(self.state, Some(TransferState::Downloading(_)))
+                && self
+                    .torrent_sample
+                    .is_some_and(|time| time.elapsed() < Duration::from_secs(2))
+        })
     }
 
     pub fn eta(&self) -> Option<Duration> {
@@ -234,6 +282,13 @@ impl QueueItem {
     pub fn apply_state(&mut self, state: TransferState, now: Instant) {
         if self.state.as_ref().is_some_and(TransferState::is_terminal) {
             return;
+        }
+        if self.pause_pending.is_some_and(|paused| {
+            (paused && matches!(state, TransferState::Paused(_)))
+                || (!paused && matches!(state, TransferState::Downloading(_)))
+                || state.is_terminal()
+        }) {
+            self.pause_pending = None;
         }
         match &state {
             TransferState::Downloading(progress) => {
@@ -291,6 +346,8 @@ impl QueueItem {
         }
         if state.is_terminal() {
             self.cancelling = false;
+            self.pause_pending = None;
+            self.torrent_sample = None;
             self.last_sample = None;
             self.measured_rate = None;
         }
@@ -322,6 +379,7 @@ impl QueueItem {
             total_bytes: Some(value.total_bytes),
         };
         self.torrent_telemetry = Some(value);
+        self.torrent_sample = Some(Instant::now());
     }
 
     pub fn can_retry(&self) -> bool {
@@ -341,6 +399,8 @@ impl QueueItem {
         self.completion = CompletionGate::default();
         self.state = None;
         self.cancelling = false;
+        self.pause_pending = None;
+        self.torrent_sample = None;
         self.downloaded_bytes = 0;
         self.total_bytes = self.torrent_source.as_ref().map(TorrentSource::total_bytes);
         self.torrent_telemetry = self
@@ -367,6 +427,7 @@ impl QueueItem {
             return false;
         }
         self.cancelling = true;
+        self.pause_pending = None;
         true
     }
 }
@@ -490,6 +551,7 @@ impl SessionQueue {
                     added_at: record.added_at,
                     state: Some(state),
                     cancelling: false,
+                    pause_pending: None,
                     options: TransferOptions {
                         connections: 4,
                         collision: CollisionPolicy::Reject,
@@ -501,6 +563,7 @@ impl SessionQueue {
                     source: String::new(),
                     last_sample: None,
                     measured_rate: None,
+                    torrent_sample: None,
                 }
             })
             .collect();
@@ -591,17 +654,34 @@ impl SessionQueue {
             added_at: SystemTime::now(),
             state: None,
             cancelling: false,
+            pause_pending: None,
             downloaded_bytes: 0,
             total_bytes,
             source: url,
             last_sample: None,
             measured_rate: None,
+            torrent_sample: None,
         });
         Ok(id)
     }
 
     pub fn item(&self, id: DownloadId) -> Option<&QueueItem> {
         self.items.iter().find(|item| item.id == id)
+    }
+
+    pub fn retry(&mut self, id: DownloadId, collision: CollisionPolicy) -> bool {
+        let Some(item) = self.item(id).filter(|item| item.can_retry()) else {
+            return false;
+        };
+        if self.items.iter().any(|other| {
+            other.id != id
+                && other.destination == item.destination
+                && (other.is_queued() || other.is_active())
+        }) {
+            return false;
+        }
+        self.item_mut(id)
+            .is_some_and(|item| item.reset_for_retry(collision))
     }
 
     pub fn item_mut(&mut self, id: DownloadId) -> Option<&mut QueueItem> {
@@ -769,6 +849,7 @@ impl SessionQueue {
         before - self.items.len()
     }
 
+    #[cfg(test)]
     pub fn total_speed(&self) -> f64 {
         self.items
             .iter()
@@ -949,6 +1030,109 @@ mod tests {
         item.apply_torrent_telemetry(telemetry);
         assert_eq!(item.status(), "Cancelled");
         assert_eq!(item.speed_bytes_per_second(), None);
+    }
+
+    #[test]
+    fn accepted_pause_intent_waits_for_observation_and_cancel_wins() {
+        let mut queue = SessionQueue::default();
+        let id = queue
+            .add_torrent(torrent(false), "pending.bin".into())
+            .unwrap();
+        let item = queue.item_mut(id).unwrap();
+        let progress = DownloadProgress {
+            downloaded_bytes: 0,
+            total_bytes: Some(3),
+        };
+        item.apply_state(TransferState::Downloading(progress), Instant::now());
+        item.apply_torrent_telemetry(TorrentTelemetry {
+            phase: TorrentPhase::Downloading,
+            total_bytes: 3,
+            ..Default::default()
+        });
+        assert!(item.can_pause());
+        item.pause_pending = Some(true);
+        assert!(!item.can_pause());
+        assert_eq!(item.status(), "Pausing");
+        item.apply_state(TransferState::Downloading(progress), Instant::now());
+        assert_eq!(item.pause_pending, Some(true));
+        item.apply_state(TransferState::Paused(progress), Instant::now());
+        assert_eq!(item.pause_pending, None);
+        assert!(item.can_pause());
+        item.pause_pending = Some(false);
+        item.apply_state(TransferState::Paused(progress), Instant::now());
+        assert_eq!(item.status(), "Resuming");
+        assert!(item.request_cancel());
+        assert!(!item.request_cancel());
+        assert!(item.is_active());
+        assert!(!item.can_pause());
+        assert_eq!(item.status(), "Cancelling");
+        item.apply_state(
+            TransferState::Failed("control failed".into()),
+            Instant::now(),
+        );
+        assert_eq!(item.pause_pending, None);
+        assert!(!item.is_active());
+    }
+
+    #[test]
+    fn torrent_rates_expire_independently_of_state_heartbeats_and_retry_resets() {
+        let mut queue = SessionQueue::default();
+        let id = queue
+            .add_torrent(torrent(false), "fresh.bin".into())
+            .unwrap();
+        let item = queue.item_mut(id).unwrap();
+        let progress = DownloadProgress {
+            downloaded_bytes: 0,
+            total_bytes: Some(3),
+        };
+        item.apply_state(TransferState::Downloading(progress), Instant::now());
+        assert_eq!(item.speed_bytes_per_second(), None);
+        item.apply_torrent_telemetry(TorrentTelemetry {
+            phase: TorrentPhase::Downloading,
+            total_bytes: 3,
+            download_bytes_per_second: 1024,
+            ..Default::default()
+        });
+        assert_eq!(item.speed_bytes_per_second(), Some(1024.0));
+        item.torrent_sample = Some(Instant::now() - Duration::from_secs(3));
+        item.apply_state(TransferState::Downloading(progress), Instant::now());
+        assert_eq!(item.speed_bytes_per_second(), None);
+        item.apply_state(TransferState::Cancelled, Instant::now());
+        assert!(item.reset_for_retry(CollisionPolicy::Reject));
+        assert_eq!(item.speed_bytes_per_second(), None);
+        assert_eq!(
+            item.torrent_telemetry
+                .as_ref()
+                .unwrap()
+                .download_bytes_per_second,
+            0
+        );
+    }
+
+    #[test]
+    fn retry_revalidates_other_queued_destination_without_mutating_failed_record() {
+        let mut queue = SessionQueue::default();
+        let first = queue
+            .add_torrent(torrent(false), "collision.bin".into())
+            .unwrap();
+        queue
+            .item_mut(first)
+            .unwrap()
+            .apply_state(TransferState::Cancelled, Instant::now());
+        let other = queue
+            .add_torrent(torrent(false), "collision.bin".into())
+            .unwrap();
+        assert!(!queue.retry(first, CollisionPolicy::Reject));
+        assert!(!queue.retry(first, CollisionPolicy::Rename));
+        assert!(queue.item(first).unwrap().can_retry());
+        assert!(queue.item(other).unwrap().is_queued());
+        queue
+            .item_mut(other)
+            .unwrap()
+            .apply_state(TransferState::Failed("failure".into()), Instant::now());
+        assert!(queue.retry(first, CollisionPolicy::Reject));
+        assert!(queue.item(first).unwrap().is_queued());
+        assert!(!queue.retry(other, CollisionPolicy::Overwrite));
     }
 
     #[test]

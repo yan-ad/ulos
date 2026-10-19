@@ -169,6 +169,28 @@ fn number(value: &Json, key: &str) -> Result<u64, TorrentError> {
         .and_then(Json::as_u64)
         .ok_or(TorrentError::Worker)
 }
+// Protocol 1 workers predating these metrics omit them; null also explicitly
+// means unavailable. Present malformed values fail closed, even when inactive.
+fn optional_seeds(value: &Json) -> Result<Option<u32>, TorrentError> {
+    match value.get("seeds") {
+        None | Some(Json::Null) => Ok(None),
+        Some(n) => n
+            .as_u64()
+            .and_then(|n| n.try_into().ok())
+            .map(Some)
+            .ok_or(TorrentError::Worker),
+    }
+}
+fn optional_availability(value: &Json) -> Result<Option<f64>, TorrentError> {
+    match value.get("availability") {
+        None | Some(Json::Null) => Ok(None),
+        Some(n) => n
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0 && *n <= f64::from(u32::MAX))
+            .map(Some)
+            .ok_or(TorrentError::Worker),
+    }
+}
 fn stats(
     source: &TorrentSource,
     value: &Json,
@@ -189,9 +211,15 @@ fn stats(
         downloaded_bytes: downloaded,
         total_bytes: source.total,
         phase,
+        payload_downloaded_bytes: match value.get("payload_downloaded_bytes") {
+            None | Some(Json::Null) => None,
+            Some(value) => Some(value.as_u64().ok_or(TorrentError::Worker)?),
+        },
         uploaded_bytes: number(value, "uploaded_bytes")?,
         download_bytes_per_second: number(value, "download_bytes_per_second")?,
         upload_bytes_per_second: number(value, "upload_bytes_per_second")?,
+        seeds: optional_seeds(value)?,
+        availability: optional_availability(value)?,
         peers: number(value, "peers")?
             .try_into()
             .map_err(|_| TorrentError::Worker)?,
@@ -214,6 +242,8 @@ fn stats(
     if sample.phase != TorrentPhase::Downloading {
         sample.download_bytes_per_second = 0;
         sample.upload_bytes_per_second = 0;
+        sample.seeds = None;
+        sample.availability = None;
     }
     Ok(sample)
 }
@@ -330,6 +360,9 @@ async fn run_with_worker(
             result = timeout(HANDSHAKE, handshake) => { result.map_err(|_| TorrentError::Worker)??; }
         }
         if !initial.allow_upload { return Err(TorrentError::UploadRequired); }
+        for peer in source.initial_peers.iter() {
+            send(&mut stdin, json!({"command":"peer", "address":peer.ip().to_string(), "port":peer.port()})).await?;
+        }
         send(&mut stdin, json!({"command":"start"})).await?;
         if *commands.borrow_and_update() { send(&mut stdin, json!({"command":"pause"})).await?; }
         let mut command_open = true;
@@ -485,6 +518,16 @@ mod tests {
         let sample = stats(&source, &frame, &TorrentSettings::default()).unwrap();
         assert_eq!(sample.download_bytes_per_second, 0);
         assert_eq!(sample.upload_bytes_per_second, 0);
+        assert_eq!(sample.seeds, None);
+        assert_eq!(sample.availability, None);
+        frame["phase"] = json!("downloading");
+        frame["seeds"] = json!(7);
+        frame["availability"] = json!(1.25);
+        frame["payload_downloaded_bytes"] = json!(1234);
+        let sample = stats(&source, &frame, &TorrentSettings::default()).unwrap();
+        assert_eq!(sample.seeds, Some(7));
+        assert_eq!(sample.availability, Some(1.25));
+        assert_eq!(sample.payload_downloaded_bytes, Some(1234));
         for (key, bad) in [
             ("peers", json!(-1)),
             ("total_bytes", json!(2)),
@@ -495,6 +538,46 @@ mod tests {
             value[key] = bad;
             assert!(stats(&source, &value, &TorrentSettings::default()).is_err());
         }
+        for (key, bad) in [
+            ("seeds", json!(-1)),
+            ("seeds", json!(u64::MAX)),
+            ("seeds", json!(1.5)),
+            ("seeds", json!("7")),
+            ("availability", json!(-1.0)),
+            ("availability", json!(u64::MAX)),
+            ("availability", json!("NaN")),
+            ("availability", json!(false)),
+            ("payload_downloaded_bytes", json!(-1)),
+            ("payload_downloaded_bytes", json!(1.25)),
+            ("payload_downloaded_bytes", json!("1234")),
+        ] {
+            let mut value = frame.clone();
+            value[key] = bad;
+            assert!(stats(&source, &value, &TorrentSettings::default()).is_err());
+        }
+        // JSON cannot represent NaN/infinity; reject their wire tokens too.
+        for token in ["NaN", "Infinity", "1e999"] {
+            assert!(
+                serde_json::from_str::<Json>(&format!("{{\"availability\":{token}}}")).is_err()
+            );
+        }
+        for phase in ["checking", "paused", "publishing"] {
+            frame["phase"] = json!(phase);
+            let sample = stats(&source, &frame, &TorrentSettings::default()).unwrap();
+            assert_eq!(sample.seeds, None);
+            assert_eq!(sample.availability, None);
+        }
+        frame["phase"] = json!("downloading");
+        frame["seeds"] = Json::Null;
+        frame["availability"] = Json::Null;
+        let sample = stats(&source, &frame, &TorrentSettings::default()).unwrap();
+        assert_eq!(sample.seeds, None);
+        assert_eq!(sample.availability, None);
+        frame["seeds"] = json!(0);
+        frame["availability"] = json!(0.0);
+        let sample = stats(&source, &frame, &TorrentSettings::default()).unwrap();
+        assert_eq!(sample.seeds, Some(0));
+        assert_eq!(sample.availability, Some(0.0));
         frame["phase"] = json!("invented");
         assert!(stats(&source, &frame, &TorrentSettings::default()).is_err());
     }

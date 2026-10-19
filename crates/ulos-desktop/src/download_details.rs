@@ -24,8 +24,7 @@ use gpui_kit::{
 use ulos_core::{
     DownloadProgress,
     transfer::{
-        CollisionPolicy, ConnectionStatus, MAX_CONNECTIONS, ResumeCapability, TransferOptions,
-        TransferTelemetry,
+        CollisionPolicy, ConnectionStatus, MAX_CONNECTIONS, TransferOptions, TransferTelemetry,
     },
 };
 
@@ -46,6 +45,7 @@ pub struct DetailsSnapshot {
     pub eta: Option<Duration>,
     pub active: bool,
     pub cancelling: bool,
+    pub pause_pending: Option<bool>,
     pub error: Option<String>,
     pub telemetry: TransferTelemetry,
     pub options: TransferOptions,
@@ -369,19 +369,15 @@ impl DownloadDetails {
         !self.snapshot.is_torrent && self.snapshot.active && !self.snapshot.cancelling
     }
     fn can_pause(&self) -> bool {
-        self.snapshot.active
-            && !self.snapshot.cancelling
-            && if self.snapshot.is_torrent {
-                self.snapshot.torrent.as_ref().is_some_and(|telemetry| {
-                    matches!(
-                        telemetry.phase,
-                        ulos_core::torrent::TorrentPhase::Downloading
-                            | ulos_core::torrent::TorrentPhase::Paused
-                    )
-                })
-            } else {
-                self.snapshot.telemetry.resume == ResumeCapability::Supported
-            }
+        crate::queue::pause_available(
+            self.snapshot.active,
+            self.snapshot.cancelling,
+            self.snapshot.pause_pending,
+            self.snapshot.is_torrent,
+            self.snapshot.paused,
+            self.snapshot.telemetry.resume,
+            self.snapshot.torrent.as_ref().map(|t| t.phase.clone()),
+        )
     }
     fn can_configure_connections(&self) -> bool {
         !self.snapshot.is_torrent

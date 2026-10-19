@@ -31,20 +31,8 @@ impl DownloadManager {
             RowCommand::Pause | RowCommand::Resume => {
                 let paused = matches!(item.state, Some(TransferState::Paused(_)));
                 self.active == Some(id)
-                    && item.is_active()
-                    && !item.cancelling
+                    && item.can_pause()
                     && paused == (command == RowCommand::Resume)
-                    && if item.is_torrent {
-                        item.torrent_telemetry.as_ref().is_some_and(|telemetry| {
-                            matches!(
-                                telemetry.phase,
-                                ulos_core::torrent::TorrentPhase::Downloading
-                                    | ulos_core::torrent::TorrentPhase::Paused
-                            )
-                        })
-                    } else {
-                        item.telemetry.resume == ulos_core::transfer::ResumeCapability::Supported
-                    }
             }
             RowCommand::Stop => self.active == Some(id) && item.is_active() && !item.cancelling,
             RowCommand::Retry => item.can_retry() && !self.removal_busy,

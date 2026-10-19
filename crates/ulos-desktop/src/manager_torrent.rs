@@ -115,12 +115,21 @@ impl DownloadManager {
         let owner = cx.entity();
         let runtime = self.runtime.clone();
         let directory = self
-            .paths
-            .as_ref()
-            .and_then(|paths| paths.downloads.clone());
+            .settings
+            .snapshot
+            .default_directory
+            .clone()
+            .or_else(|| {
+                self.paths
+                    .as_ref()
+                    .and_then(|paths| paths.downloads.clone())
+            });
         let options = add_options(cx);
+        let defaults = self.settings.snapshot.clone();
         match open_window(options, cx, move |window, cx| {
-            cx.new(|cx| NativeTorrentWindow::new(owner, path, directory, runtime, window, cx))
+            cx.new(|cx| {
+                NativeTorrentWindow::new(owner, path, directory, runtime, defaults, window, cx)
+            })
         }) {
             Ok((handle, root)) => {
                 let content = root.read(cx).content.downgrade();

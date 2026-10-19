@@ -322,7 +322,7 @@ impl DownloadManager {
                     .on_click(cx.listener(|view, _, window, cx| view.open_scheduler(window, cx))),
             )
             .content(
-                toolbar_button("options", "Options", AssetIcon::Settings)
+                toolbar_button("options", "Settings", AssetIcon::Settings)
                     .on_click(cx.listener(|view, _, window, cx| view.open_options(window, cx))),
             )
             .content(self.theme_selector("theme-selector", cx))
@@ -612,13 +612,13 @@ impl Render for DownloadManager {
         self.render_count.set(self.render_count.get() + 1);
         let count = self.queue.items.len();
         let selected_count = self.queue.selected.len();
-        let active_count = self.queue.active_count();
-        let rate = self
-            .queue
-            .items
-            .iter()
-            .any(|item| item.speed_bytes_per_second().is_some())
-            .then(|| self.queue.total_speed());
+        let (down, up) = session_traffic::rates(self.queue.items.iter());
+        let rate_text = |rate: Option<f64>| {
+            rate.map_or_else(
+                || "— B/s".into(),
+                |rate| format!("{}/s", formatting::bytes(rate as u64)),
+            )
+        };
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let section_header = Some(self.render_menu_strip(cx).into_any_element());
@@ -718,24 +718,12 @@ impl Render for DownloadManager {
                     .left(h_flex().debug_selector(|| "download-count-controls".into()).ml(px(-4.)).gap_2().items_center()
                         .child(self.sidebar_toggle(cx))
                         .child(Label::new(format!("{count} downloads · {selected_count} selected"))))
-                    .child(Label::new(format!(
-                        "Queue {} · Session only",
-                        if self.queue_running || self.scheduler.any_running() {
-                            "Running"
-                        } else {
-                            "stopped"
-                        }
-                    )))
-                    .right(Label::new(if active_count == 0 {
-                        "0 active".to_owned()
-                    } else if let Some(rate) = rate {
-                        format!(
-                            "{active_count} active · {}/s",
-                            formatting::bytes(rate as u64)
-                        )
-                    } else {
-                        format!("{active_count} active")
-                    })),
+                    .child(Label::new("Session payload"))
+                    .right(div().debug_selector(|| "session-traffic".into()).child(Label::new(format!(
+                        "Down {} ({}) · Up {} ({})",
+                        rate_text(down), formatting::bytes(self.session_traffic.downloaded),
+                        rate_text(up), formatting::bytes(self.session_traffic.uploaded),
+                    )))),
             )
     }
 }

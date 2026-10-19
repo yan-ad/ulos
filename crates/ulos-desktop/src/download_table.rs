@@ -39,6 +39,11 @@ pub struct DownloadRow {
     pub time_left: Option<Duration>,
     pub last_try: Option<SystemTime>,
     pub description: String,
+    pub seeds: Option<u32>,
+    pub peers: Option<u32>,
+    pub upload_speed: Option<u64>,
+    pub ratio: Option<f64>,
+    pub availability: Option<f64>,
 }
 
 pub struct DownloadTable {
@@ -96,6 +101,18 @@ fn columns() -> Vec<Column> {
             .width(px(240.))
             .movable(false),
         Column::new("protocol", "Type")
+            .width(px(100.))
+            .movable(false),
+        Column::new("seeds", "Seeds").width(px(85.)).movable(false),
+        Column::new("peers", "Peers").width(px(85.)).movable(false),
+        Column::new("up-speed", "Up speed")
+            .width(px(120.))
+            .movable(false),
+        Column::new("ratio", "Ratio").width(px(85.)).movable(false),
+        Column::new("category", "Category")
+            .width(px(110.))
+            .movable(false),
+        Column::new("availability", "Availability")
             .width(px(100.))
             .movable(false),
     ]
@@ -269,6 +286,37 @@ impl TableDelegate for DownloadTable {
             7 => Label::new(row.last_try_label()).into_any_element(),
             8 => Label::new(row.description.clone()).into_any_element(),
             9 => Label::new(if row.is_torrent { "Torrent" } else { "HTTP" }).into_any_element(),
+            10 => Label::new(
+                row.seeds
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            )
+            .into_any_element(),
+            11 => Label::new(
+                row.peers
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            )
+            .into_any_element(),
+            12 => Label::new(
+                row.upload_speed
+                    .map(|v| format!("{}/s", formatting::bytes(v)))
+                    .unwrap_or_else(|| "—".into()),
+            )
+            .into_any_element(),
+            13 => Label::new(
+                row.ratio
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "—".into()),
+            )
+            .into_any_element(),
+            14 => Label::new(row.category.label()).into_any_element(),
+            15 => Label::new(
+                row.availability
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "—".into()),
+            )
+            .into_any_element(),
             _ => unreachable!("unknown download table column"),
         }
     }
@@ -311,6 +359,11 @@ mod tests {
             time_left: None,
             last_try: None,
             description: String::new(),
+            seeds: None,
+            peers: None,
+            upload_speed: None,
+            ratio: None,
+            availability: None,
         }
     }
 
@@ -328,6 +381,12 @@ mod tests {
             ("last-try", "Last try", 160.),
             ("description", "Description", 240.),
             ("protocol", "Type", 100.),
+            ("seeds", "Seeds", 85.),
+            ("peers", "Peers", 85.),
+            ("up-speed", "Up speed", 120.),
+            ("ratio", "Ratio", 85.),
+            ("category", "Category", 110.),
+            ("availability", "Availability", 100.),
         ];
         assert_eq!(columns.len(), contract.len());
         for (index, (column, (key, label, width))) in columns.iter().zip(contract).enumerate() {

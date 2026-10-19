@@ -4,6 +4,7 @@ mod add_download;
 mod add_torrent;
 mod clipboard;
 mod completion;
+mod config;
 mod download_details;
 mod download_table;
 mod download_task;
@@ -19,6 +20,7 @@ mod platform_paths;
 mod queue;
 mod scheduler;
 mod scheduler_window;
+mod settings_window;
 mod storage;
 mod updates;
 mod window_chrome;
@@ -44,15 +46,35 @@ fn main() {
             .await
             .unwrap_or_else(|_| Err("Platform location worker stopped unexpectedly.".into()))
     });
-    let (paths, history, writer, history_error) = match paths {
+    let (paths, history, writer, history_error, settings) = match paths {
         Ok(paths) => match runtime.block_on(storage::load_history(paths.history.clone())) {
             Ok(records) => {
                 let writer = storage::HistoryWriter::new(&handle, paths.history.clone());
-                (Some(paths), records, Some(writer), None)
+                let settings = runtime
+                    .block_on(tokio::task::spawn_blocking({
+                        let path = paths.config.clone();
+                        move || config::load(path)
+                    }))
+                    .unwrap_or_else(|_| config::LoadedSettings::unavailable());
+                (Some(paths), records, Some(writer), None, settings)
             }
-            Err(error) => (Some(paths), Vec::new(), None, Some(error)),
+            Err(error) => {
+                let settings = runtime
+                    .block_on(tokio::task::spawn_blocking({
+                        let path = paths.config.clone();
+                        move || config::load(path)
+                    }))
+                    .unwrap_or_else(|_| config::LoadedSettings::unavailable());
+                (Some(paths), Vec::new(), None, Some(error), settings)
+            }
         },
-        Err(error) => (None, Vec::new(), None, Some(error)),
+        Err(error) => (
+            None,
+            Vec::new(),
+            None,
+            Some(error),
+            config::LoadedSettings::unavailable(),
+        ),
     };
     let flush_writer = writer.clone();
     let inbox = std::rc::Rc::new(std::cell::RefCell::new(Vec::<std::path::PathBuf>::new()));
@@ -105,6 +127,7 @@ fn main() {
         };
         manager.update(cx, |manager, cx| {
             manager.initialize_history(paths, history, writer, history_error, cx);
+            manager.initialize_settings(settings, cx);
             manager.watch_torrent_intake(inbox, intake_error, cx);
         });
         let update_owner = manager.downgrade();

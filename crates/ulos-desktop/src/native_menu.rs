@@ -138,7 +138,7 @@ fn item(label: &str, action: impl Action, command: Command, state: &MenuState) -
 pub fn menus(state: &MenuState) -> Vec<Menu> {
     vec![
         Menu::new("Ulos").items([
-            item("Options…", OpenOptions, Command::Options, state),
+            item("Settings…", OpenOptions, Command::Options, state),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
@@ -216,7 +216,7 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
                 state,
             ),
             MenuItem::separator(),
-            item("Options…", OpenOptions, Command::Options, state),
+            item("Settings…", OpenOptions, Command::Options, state),
         ]),
         Menu::new("View").items([
             item(

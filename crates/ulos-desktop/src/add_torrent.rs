@@ -72,6 +72,7 @@ impl Drop for Worker {
 
 pub struct AddTorrent {
     embedded: bool,
+    defaults: crate::config::ConfigSnapshot,
     embedded_address: Option<Entity<InputState>>,
     pub source: Option<TorrentSource>,
     pub destination: Entity<InputState>,
@@ -167,6 +168,7 @@ impl AddTorrent {
         }
         let mut view = Self {
             embedded: false,
+            defaults: crate::config::ConfigSnapshot::default(),
             embedded_address: None,
             available_native: ulos_core::torrent::native_worker_available(),
             download_rate,
@@ -201,6 +203,50 @@ impl AddTorrent {
             view.set_source_path(path, window, cx);
         }
         view
+    }
+
+    pub(crate) fn set_defaults(&mut self, defaults: crate::config::ConfigSnapshot) {
+        self.defaults = defaults;
+    }
+
+    fn set_upload_consent(&mut self, allowed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.available_native || self.choosing_path || self.loading {
+            return;
+        }
+        self.reset_settings(window, cx);
+        if allowed {
+            self.options.settings.allow_upload = true;
+            self.options.settings.dht = self.defaults.dht_enabled
+                && self
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| !source.is_private());
+            self.download_rate.update(cx, |input, cx| {
+                input.set_value(
+                    self.defaults
+                        .torrent_download_limit
+                        .map(|v| v.div_ceil(1024).to_string())
+                        .unwrap_or_default(),
+                    window,
+                    cx,
+                )
+            });
+            self.upload_rate.update(cx, |input, cx| {
+                input.set_value(
+                    self.defaults
+                        .torrent_upload_limit
+                        .map(|v| v.div_ceil(1024).to_string())
+                        .unwrap_or_default(),
+                    window,
+                    cx,
+                )
+            });
+            self.peer_limit.update(cx, |input, cx| {
+                input.set_value(self.defaults.torrent_peer_limit.to_string(), window, cx)
+            });
+            self.refresh_option_draft(cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn embedded(
@@ -926,17 +972,15 @@ impl Render for AddTorrent {
                     .child(self.metadata(cx))
                     .when(self.source.as_ref().is_some_and(|source| source.protocol() != TorrentProtocol::V1) && !self.options.settings.allow_upload, |content| content.child(Label::new("V2 / hybrid detected: native engine requires explicit peer-upload consent below.")))
                     .when(!self.available_native, |content| content.child(Label::new("Native torrent worker unavailable. V1 download-only remains available; uploads, DHT and torrent limits require the native worker.")))
+                    .child(Label::new(if self.defaults.dht_enabled {
+                        "Saved public-DHT preference is on. Allowing peer uploads applies it for this public torrent; review the DHT checkbox before starting. Source changes revoke both permissions."
+                    } else { "Public DHT is off by default. It exposes your IP/infohash to the public network; private torrents never use it." }))
                     .child(Checkbox::new("torrent-upload-consent").label("Allow peer uploads while downloading").checked(self.options.settings.allow_upload).disabled(!self.available_native || self.choosing_path || self.loading)
-                        .on_click(cx.listener(|view, checked, window, cx| { view.options.settings.allow_upload = *checked; if !*checked {
-                            view.options.settings = TorrentSettings::default();
-                            view.download_rate.update(cx, |input, cx| input.set_value("", window, cx));
-                            view.upload_rate.update(cx, |input, cx| input.set_value("", window, cx));
-                            view.peer_limit.update(cx, |input, cx| input.set_value("100", window, cx));
-                        } cx.notify(); })))
+                        .on_click(cx.listener(|view, checked, window, cx| view.set_upload_consent(*checked, window, cx))))
                     .child(Checkbox::new("torrent-dht").label("Use DHT for public torrents").checked(self.options.settings.dht)
                         .disabled(!self.available_native || !self.options.settings.allow_upload || self.source.as_ref().is_none_or(TorrentSource::is_private))
                         .on_click(cx.listener(|view, checked, _, cx| { if view.available_native && view.options.settings.allow_upload && view.source.as_ref().is_some_and(|source| !source.is_private()) { view.options.settings.dht = *checked; } cx.notify(); })))
-                    .child(Label::new("Native limits: 1–1048576 KiB/s (blank = unlimited); 1–10000 peers. Requires peer-upload consent."))
+                    .child(Label::new("Native limits: 1–1048576 KiB/s (blank = unlimited); 1–10000 peers. Requires peer-upload consent. Saved byte-rate defaults round up to whole KiB/s in this review."))
                     .child(Form::new()
                         .child(Field::new().label("Download KiB/s").child(Input::new(&self.download_rate).disabled(!self.available_native || !self.options.settings.allow_upload)))
                         .child(Field::new().label("Upload KiB/s").child(Input::new(&self.upload_rate).disabled(!self.available_native || !self.options.settings.allow_upload)))
@@ -1004,6 +1048,65 @@ mod tests {
         bytes.extend_from_slice(&[0; 20]);
         bytes.extend_from_slice(b"ee");
         bytes
+    }
+
+    #[gpui::test]
+    fn saved_dht_and_limits_require_fresh_consent_and_never_apply_to_private(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.update(gpui_kit::init);
+        let mut form = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view =
+                cx.new(|cx| AddTorrent::new(None, None, runtime.handle().clone(), window, cx));
+            form = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let form = form.unwrap();
+        cx.update(|window, cx| {
+            form.update(cx, |view, cx| {
+                view.available_native = true;
+                view.set_defaults(crate::config::ConfigSnapshot {
+                    dht_enabled: true,
+                    torrent_download_limit: Some(2049),
+                    torrent_upload_limit: Some(1025),
+                    torrent_peer_limit: 321,
+                    ..Default::default()
+                });
+                view.source = Some(ulos_core::torrent::parse(metainfo()).unwrap());
+                assert_eq!(
+                    view.options.settings,
+                    ulos_core::torrent::TorrentSettings::default()
+                );
+                assert!(!view.resolution_dht);
+                view.set_upload_consent(true, window, cx);
+                assert!(view.options.settings.allow_upload && view.options.settings.dht);
+                assert_eq!(view.options.settings.download_bytes_per_second, Some(3072));
+                assert_eq!(view.options.settings.upload_bytes_per_second, Some(2048));
+                assert_eq!(view.options.settings.peer_limit, 321);
+                view.set_upload_consent(false, window, cx);
+                assert_eq!(
+                    view.options.settings,
+                    ulos_core::torrent::TorrentSettings::default()
+                );
+                let mut private = metainfo();
+                private.truncate(private.len() - 2);
+                private.extend_from_slice(b"7:privatei1eee");
+                view.source = Some(ulos_core::torrent::parse(private).unwrap());
+                assert!(view.source.as_ref().unwrap().is_private());
+                view.set_upload_consent(true, window, cx);
+                assert!(view.options.settings.allow_upload);
+                assert!(!view.options.settings.dht);
+                assert!(!view.resolution_dht);
+                view.set_magnet_address("magnet:?xt=urn:btih:bad".into(), window, cx);
+                assert_eq!(
+                    view.options.settings,
+                    ulos_core::torrent::TorrentSettings::default()
+                );
+                assert!(!view.resolution_dht);
+            })
+        });
     }
 
     fn settle(cx: &mut VisualTestContext, mut ready: impl FnMut(&mut VisualTestContext) -> bool) {

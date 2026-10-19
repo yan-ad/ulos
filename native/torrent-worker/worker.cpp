@@ -22,6 +22,9 @@
 #include <cerrno>
 #include <iomanip>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <sstream>
 
 namespace lt=libtorrent;
@@ -222,8 +225,8 @@ static int worker_main(std::vector<std::string> const& argv) {
   if(hashes.has_v1())manifest["infohash_v1"]=hex(hashes.v1.data(),20);
   if(hashes.has_v2())manifest["infohash_v2"]=hex(hashes.v2.data(),32);
   emit({{"event","ready"},{"protocol",1},{"engine","libtorrent"},{"version",LIBTORRENT_VERSION},{"capabilities",{{"no_upload",false}}}});emit(manifest);
-  Input input;bool start=false;std::vector<json> queued;
-  while(!start){auto commands=input.read(100);if(input.eof){emit({{"event","cancelled"}});return 0;}for(auto const& c:commands){if(start){if(queued.size()>=64)throw 1;queued.push_back(c);continue;}keys(c,{"command"});if(c.at("command")!="start")throw 1;start=true;}}
+  Input input;bool start=false;std::vector<json> queued;std::vector<lt::tcp::endpoint> initial_peers;
+  while(!start){auto commands=input.read(100);if(input.eof){emit({{"event","cancelled"}});return 0;}for(auto const& c:commands){if(start){if(queued.size()>=64)throw 1;queued.push_back(c);continue;}if(c.at("command")=="peer"){keys(c,{"command","address","port"});auto ip=lt::make_address(c.at("address").get<std::string>(),ec);auto port=limit(c,"port");if(ec||ip.is_unspecified()||ip.is_multicast()||port==0||port>65535||initial_peers.size()>=64)throw 1;initial_peers.emplace_back(ip,static_cast<unsigned short>(port));continue;}keys(c,{"command"});if(c.at("command")!="start")throw 1;start=true;}}
   // libtorrent has no supported hard no-upload switch. Fail closed rather than
   // interpreting upload_mode (which disables downloads) or a zero rate (unlimited).
   if(!upload){emit({{"event","error"},{"message","This engine cannot guarantee no-upload mode"}});return 1;}
@@ -231,14 +234,17 @@ static int worker_main(std::vector<std::string> const& argv) {
   {
    lt::settings_pack s;s.set_bool(lt::settings_pack::enable_dht,dht&&!ti->priv());s.set_bool(lt::settings_pack::enable_lsd,false);s.set_bool(lt::settings_pack::enable_upnp,false);s.set_bool(lt::settings_pack::enable_natpmp,false);
    s.set_str(lt::settings_pack::listen_interfaces,"0.0.0.0:0");
-   s.set_int(lt::settings_pack::download_rate_limit,int(down));s.set_int(lt::settings_pack::upload_rate_limit,int(up));s.set_int(lt::settings_pack::connections_limit,int(peers));
-   s.set_int(lt::settings_pack::alert_mask,lt::alert_category::error);
+   // Session limits would remain a hidden ceiling after live per-torrent
+   // updates. This isolated session has exactly one torrent: apply limits there.
+   s.set_int(lt::settings_pack::connections_limit,10000);
+   s.set_int(lt::settings_pack::alert_mask,lt::alert_category::error|lt::alert_category::status);
    lt::session session(s);
    lt::add_torrent_params p;p.ti=ti;p.save_path=out.u8string();p.flags &= ~lt::torrent_flags::auto_managed;p.flags &= ~lt::torrent_flags::paused;
+   p.peers=std::move(initial_peers);p.download_limit=int(down);p.upload_limit=int(up);p.max_connections=int(peers);
    p.flags |= lt::torrent_flags::disable_lsd;
    if(ti->priv())p.flags |= lt::torrent_flags::disable_dht | lt::torrent_flags::disable_pex;
    auto h=session.add_torrent(p,ec);if(ec)throw 1;
-   auto last=Clock::now();int64_t previous=-1;std::string previous_phase;
+   auto last=Clock::now();int64_t previous=-1;std::string previous_phase;bool pause_requested=false,pause_ack=false;
    while(!cancel&&!complete){
     auto commands=std::move(queued);queued.clear();if(commands.empty())commands=input.read(100);
     for(auto const& c:commands){
@@ -247,20 +253,25 @@ static int worker_main(std::vector<std::string> const& argv) {
      else if(cmd=="peers"){keys(c,{"command","limit"});auto n=limit(c,"limit");if(n==0||n>10000)throw 1;h.set_max_connections(int(n));}
       else if(cmd=="connect_peer"){
       keys(c,{"command","address","port"});auto ip=lt::make_address(c.at("address").get<std::string>(),ec);auto port=limit(c,"port");if(ec||!ip.is_loopback()||port==0||port>65535)throw 1;h.connect_peer(lt::tcp::endpoint(ip,static_cast<unsigned short>(port)));
-     }else{keys(c,{"command"});if(cmd=="pause")h.pause();else if(cmd=="resume")h.resume();else if(cmd=="cancel")cancel=true;else throw 1;}
+     }else{keys(c,{"command"});if(cmd=="pause"){if(!pause_requested){pause_requested=true;pause_ack=false;h.pause();}}else if(cmd=="resume"){if(pause_requested){pause_requested=false;pause_ack=false;h.resume();}}else if(cmd=="cancel")cancel=true;else throw 1;}
     }
     if(input.eof)cancel=true;
-    std::vector<lt::alert*> alerts;session.pop_alerts(&alerts);for(auto* alert:alerts)if(lt::alert_cast<lt::torrent_error_alert>(alert))throw 1;
+    std::vector<lt::alert*> alerts;session.pop_alerts(&alerts);for(auto* alert:alerts){if(lt::alert_cast<lt::torrent_error_alert>(alert))throw 1;if(lt::alert_cast<lt::torrent_paused_alert>(alert)&&pause_requested)pause_ack=true;}
     if(cancel)break;
     auto st=h.status();if(st.errc)throw 1;
     auto now=Clock::now();auto progress=st.total_payload_download+st.total_done;
-    bool paused=bool(st.flags & lt::torrent_flags::paused);
+    bool paused=pause_requested&&pause_ack&&bool(st.flags & lt::torrent_flags::paused);
     bool checking=st.state==lt::torrent_status::checking_files||st.state==lt::torrent_status::checking_resume_data;
-    complete=st.is_seeding;
+    complete=!pause_requested&&!checking&&st.is_finished&&uint64_t(st.total_wanted_done)==total;
      std::string phase=complete?"publishing":paused?"paused":checking?"checking":"downloading";
      if(progress!=previous||phase!=previous_phase||phase!="downloading")last=now;
      previous=progress;previous_phase=phase;
-    emit({{"event","stats"},{"phase",phase},{"downloaded_bytes",st.total_wanted_done},{"total_bytes",total},{"download_bytes_per_second",paused?0:st.download_payload_rate},{"upload_bytes_per_second",paused?0:st.upload_payload_rate},{"uploaded_bytes",st.total_payload_upload},{"peers",st.num_peers},{"connecting_peers",std::max(0,st.num_connections-st.num_peers)},{"queued_peers",st.connect_candidates},{"seen_peers",st.list_peers},{"stalled_for_secs",std::chrono::duration_cast<std::chrono::seconds>(now-last).count()},{"tracker_count",ti->trackers().size()}});
+    // num_seeds is the exact connected-seed count. distributed_copies is the
+    // engine's fractional availability metric; -1 means libtorrent does not
+    // track it (notably when seeding), so preserve that as JSON null.
+    json availability=nullptr;
+    if(phase=="downloading"&&std::isfinite(st.distributed_copies)&&st.distributed_copies>=0.f&&static_cast<double>(st.distributed_copies)<=std::numeric_limits<uint32_t>::max()) availability=st.distributed_copies;
+    emit({{"event","stats"},{"phase",phase},{"downloaded_bytes",st.total_wanted_done},{"total_bytes",total},{"download_bytes_per_second",paused?0:st.download_payload_rate},{"upload_bytes_per_second",paused?0:st.upload_payload_rate},{"payload_downloaded_bytes",std::max(int64_t(0),st.all_time_download)},{"uploaded_bytes",std::max(int64_t(0),st.all_time_upload)},{"peers",st.num_peers},{"seeds",phase=="downloading"&&st.num_seeds>=0?json(st.num_seeds):json(nullptr)},{"availability",availability},{"connecting_peers",std::max(0,st.num_connections-st.num_peers)},{"queued_peers",st.connect_candidates},{"seen_peers",st.list_peers},{"stalled_for_secs",std::chrono::duration_cast<std::chrono::seconds>(now-last).count()},{"tracker_count",ti->trackers().size()}});
    }
    h.pause();
    // The session destructor synchronously joins its network/disk workers. No

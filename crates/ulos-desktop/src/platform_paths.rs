@@ -8,6 +8,7 @@ pub struct PlatformPaths {
     pub home: PathBuf,
     pub downloads: Option<PathBuf>,
     pub history: PathBuf,
+    pub config: PathBuf,
 }
 impl PlatformPaths {
     pub fn detect() -> Result<Self, String> {
@@ -30,6 +31,7 @@ impl PlatformPaths {
             home,
             downloads,
             history: project.data_local_dir().join("history.sqlite"),
+            config: project.config_dir().join("ulos.conf"),
         })
     }
     pub fn folder_label(&self, path: &Path) -> String {

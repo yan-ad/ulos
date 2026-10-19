@@ -127,6 +127,7 @@ pub struct TorrentSource {
     hash_v1: Option<String>,
     hash_v2: Option<String>,
     is_private: bool,
+    initial_peers: Arc<[std::net::SocketAddr]>,
 }
 impl TorrentSource {
     pub fn protocol(&self) -> TorrentProtocol {
@@ -163,7 +164,7 @@ impl TorrentSource {
 
 // A small strict bencode parser bounds depth and node count BEFORE handing any
 // untrusted metadata to the engine's recursive deserializer. Borrow byte strings.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Value<'a> {
     Int(u64),
     Bytes(&'a [u8]),
@@ -405,6 +406,7 @@ pub fn parse(bytes: Vec<u8>) -> Result<TorrentSource, TorrentError> {
             hash_v1,
             hash_v2: Some(parsed.hash),
             is_private,
+            initial_peers: Arc::from([]),
         });
     }
     let pieces = field(info, b"pieces")?.bytes()?;
@@ -527,6 +529,7 @@ pub fn parse(bytes: Vec<u8>) -> Result<TorrentSource, TorrentError> {
         hash_v1: Some(hash),
         hash_v2: None,
         is_private,
+        initial_peers: Arc::from([]),
     })
 }
 
@@ -642,6 +645,15 @@ pub struct TorrentTelemetry {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub peers: u32,
+    /// Currently connected seed peers (libtorrent `num_seeds`), not tracker
+    /// scrape totals or known candidates. Unsupported engines report None.
+    pub seeds: Option<u32>,
+    /// Distributed piece copies among connected peers (`distributed_copies`):
+    /// integer part is rarest-piece copies; fraction is the share with more.
+    /// Not a percentage or a guarantee of completion. None when unavailable.
+    pub availability: Option<f64>,
+    /// Observed payload received this attempt, not verified progress or wire bytes.
+    pub payload_downloaded_bytes: Option<u64>,
     pub uploaded_bytes: u64,
     pub phase: TorrentPhase,
     pub download_bytes_per_second: u64,
@@ -730,6 +742,8 @@ impl TorrentTelemetry {
         self.download_bytes_per_second = 0;
         self.upload_bytes_per_second = 0;
         self.peers = 0;
+        self.seeds = None;
+        self.availability = None;
         self.connecting_peers = 0;
         self.queued_peers = 0;
         self.stalled_for_secs = 0;
@@ -1061,6 +1075,27 @@ fn cancellation_requested(cancelled: &mut oneshot::Receiver<()>) -> bool {
     cancelled.try_recv() != Err(oneshot::error::TryRecvError::Empty)
 }
 
+// rqbit replaces its Live counters on resume. Keep observed high-water marks
+// per live segment; paused/checking samples do not count as a new segment.
+#[derive(Default)]
+struct PayloadCounter {
+    finished: u64,
+    current: u64,
+}
+impl PayloadCounter {
+    fn sample(&mut self, value: u64) -> u64 {
+        self.current = self.current.max(value);
+        self.total()
+    }
+    fn end_segment(&mut self) {
+        self.finished = self.total();
+        self.current = 0;
+    }
+    fn total(&self) -> u64 {
+        self.finished.saturating_add(self.current)
+    }
+}
+
 async fn run_engine(
     source: &TorrentSource,
     output: &Path,
@@ -1088,20 +1123,34 @@ async fn run_engine(
         let added=tokio::select! {
             biased;
             _=&mut *cancelled=>return Ok(false),
-            r=session.add_torrent(librqbit::AddTorrent::from_bytes(source.bytes.to_vec()),Some(librqbit::AddTorrentOptions {output_folder:Some(output.to_str().ok_or(TorrentError::Destination)?.to_owned()),..Default::default()}))=>r.map_err(|_|TorrentError::Engine)?,
+            r=session.add_torrent(librqbit::AddTorrent::from_bytes(source.bytes.to_vec()),Some(librqbit::AddTorrentOptions {output_folder:Some(output.to_str().ok_or(TorrentError::Destination)?.to_owned()),initial_peers:Some(source.initial_peers.to_vec()),..Default::default()}))=>r.map_err(|_|TorrentError::Engine)?,
         };
         let handle=added.into_handle().ok_or(TorrentError::Engine)?;
         let mut tick=tokio::time::interval(Duration::from_millis(100));
         let mut stall = StallMonitor::default();
+        let mut commands_open = true;
+        let mut payload = PayloadCounter::default();
         loop {
             tokio::select! {
                 biased;
                 _=&mut *cancelled=>return Ok(false),
+                command=commands.changed(), if commands_open=>{
+                    if command.is_err() { commands_open=false; }
+                },
                 _=tick.tick()=>{},
-                command=commands.changed()=>{if command.is_ok() {
-                    let paused=*commands.borrow_and_update();
-                    if paused {session.pause(&handle).await.map_err(|_|TorrentError::Engine)?;} else {session.unpause(&handle).await.map_err(|_|TorrentError::Engine)?;}
-                }},
+            }
+            // watch contains desired state, not a queue of engine operations.
+            // pause+resume can coalesce to `false` without ever pausing; rqbit
+            // rejects unpause-on-Live and pause-on-Paused as errors. Reconcile
+            // idempotently, including after an asynchronous initialization.
+            let paused=*commands.borrow_and_update();
+            if paused != handle.is_paused() {
+                if paused {
+                    if let Some(live) = handle.stats().live { payload.sample(live.snapshot.fetched_bytes); }
+                    session.pause(&handle).await.map_err(|_|TorrentError::Engine)?;
+                    payload.end_segment();
+                }
+                else {session.unpause(&handle).await.map_err(|_|TorrentError::Engine)?;}
             }
             let stats=handle.stats();
             let phase=match stats.state {
@@ -1122,7 +1171,13 @@ async fn run_engine(
                 seen_peers: telemetry.borrow().seen_peers,
                 ..TorrentTelemetry::default()
             };
+            // rqbit's aggregate peer snapshot does not expose connected seed
+            // counts or distributed copies. Leave both unknown, never infer
+            // them from connected peers or verified local progress.
             let fetched = stats.live.as_ref().map(|s| s.snapshot.fetched_bytes).unwrap_or(0);
+            sample.payload_downloaded_bytes = Some(if let Some(live) = &stats.live {
+                payload.sample(live.snapshot.fetched_bytes)
+            } else { payload.total() });
             sample.stalled_for_secs = stall.sample(&phase, downloaded, fetched, Instant::now());
             if phase == TorrentPhase::Downloading && let Some(live) = &stats.live {
                 sample.peers = live.snapshot.peer_stats.live;
@@ -1134,7 +1189,7 @@ async fn run_engine(
             }
             state.send_replace(if phase==TorrentPhase::Paused {TransferState::Paused(progress)} else {TransferState::Downloading(progress)});
             telemetry.send_replace(sample);
-            if stats.finished {return Ok(true);}
+            if stats.finished && phase != TorrentPhase::Paused {return Ok(true);}
         }
     }.await;
     session.stop().await;
@@ -1405,6 +1460,42 @@ fn rename_directory(_from: &Path, _to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn payload_counter_keeps_observed_segments_across_pause_resume() {
+        let mut counter = super::PayloadCounter::default();
+        for value in [10, 100, 80, 100] {
+            counter.sample(value);
+        }
+        assert_eq!(counter.total(), 100);
+        counter.end_segment();
+        assert_eq!(counter.total(), 100);
+        assert_eq!(counter.sample(20), 120);
+        assert_eq!(counter.sample(90), 190);
+        counter.end_segment();
+        assert_eq!(counter.sample(5), 195);
+        counter.finished = u64::MAX;
+        assert_eq!(counter.sample(100), u64::MAX);
+    }
+    #[test]
+    fn stopped_activity_discards_live_seed_and_availability_samples() {
+        let mut sample = TorrentTelemetry {
+            seeds: Some(3),
+            availability: Some(1.25),
+            peers: 4,
+            download_bytes_per_second: 100,
+            upload_bytes_per_second: 20,
+            uploaded_bytes: 50,
+            ..TorrentTelemetry::default()
+        };
+        sample.stop_activity();
+        assert_eq!(sample.seeds, None);
+        assert_eq!(sample.availability, None);
+        assert_eq!(sample.peers, 0);
+        assert_eq!(sample.download_bytes_per_second, 0);
+        assert_eq!(sample.upload_bytes_per_second, 0);
+        assert_eq!(sample.uploaded_bytes, 50);
+    }
+
+    #[test]
     fn rate_conversion_rejects_invalid_and_uses_binary_bytes() {
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
             assert_eq!(super::bytes_per_second(invalid), 0);
@@ -1556,6 +1647,7 @@ mod tests {
             hash_v1: None,
             hash_v2: None,
             is_private: false,
+            initial_peers: Arc::from([]),
         };
         let (tx, mut rx) = oneshot::channel();
         let mut tx = Some(tx);
@@ -1625,6 +1717,7 @@ mod tests {
             hash_v1: None,
             hash_v2: None,
             is_private: false,
+            initial_peers: Arc::from([]),
         };
         fs::write(dir.path().join(&path), b"bad").unwrap();
         assert!(verify(&source, dir.path(), || false).is_err());

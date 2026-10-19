@@ -2,6 +2,10 @@ use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
 };
+#[path = "manager_settings.rs"]
+mod manager_settings;
+#[path = "session_traffic.rs"]
+mod session_traffic;
 
 use gpui_kit::{
     component::{
@@ -44,6 +48,8 @@ pub(crate) struct MenuStateChanged;
 impl EventEmitter<MenuStateChanged> for DownloadManager {}
 
 pub struct DownloadManager {
+    pub(crate) settings: crate::config::LoadedSettings,
+    pub(crate) settings_window: Option<ChildWindow<crate::settings_window::SettingsWindow>>,
     queue: SessionQueue,
     search: Entity<InputState>,
     queue_running: bool,
@@ -57,6 +63,8 @@ pub struct DownloadManager {
     _torrent_intake: Option<Task<()>>,
     torrent_picker_open: bool,
     attempt: u64,
+    session_traffic: session_traffic::SessionTraffic,
+    last_traffic_rates: (Option<f64>, Option<f64>),
     pub(crate) add_windows: BTreeMap<WindowId, ChildWindow<AddDownload>>,
     pub(crate) detail_windows: BTreeMap<DownloadId, ChildWindow<DownloadDetails>>,
     pub(crate) table: Entity<TableState<DownloadTable>>,
@@ -230,6 +238,8 @@ impl DownloadManager {
             }
         });
         Self {
+            settings: crate::config::LoadedSettings::unavailable(),
+            settings_window: None,
             queue: SessionQueue::default(),
             search,
             queue_running: false,
@@ -243,6 +253,8 @@ impl DownloadManager {
             _torrent_intake: None,
             torrent_picker_open: false,
             attempt: 0,
+            session_traffic: session_traffic::SessionTraffic::default(),
+            last_traffic_rates: (Some(0.0), Some(0.0)),
             add_windows: BTreeMap::new(),
             detail_windows: BTreeMap::new(),
             table,
@@ -310,7 +322,7 @@ impl DownloadManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.migration.busy {
+        if self.migration.busy || self.options_open {
             return;
         }
         self.add_windows
@@ -324,12 +336,21 @@ impl DownloadManager {
         }
         let owner = cx.entity();
         let directory = self
-            .paths
-            .as_ref()
-            .and_then(|paths| paths.downloads.clone());
+            .settings
+            .snapshot
+            .default_directory
+            .clone()
+            .or_else(|| {
+                self.paths
+                    .as_ref()
+                    .and_then(|paths| paths.downloads.clone())
+            });
         let runtime = self.runtime.clone();
+        let defaults = self.settings.snapshot.clone();
         match gpui_kit::open_window(add_options(cx), cx, move |window, cx| {
-            cx.new(|cx| NativeAddWindow::new(owner, source, directory, runtime, window, cx))
+            cx.new(|cx| {
+                NativeAddWindow::new(owner, source, directory, runtime, defaults, window, cx)
+            })
         }) {
             Ok((handle, wrapper)) => {
                 let content = wrapper.read(cx).content.downgrade();
@@ -437,6 +458,7 @@ impl DownloadManager {
         };
         self.attempt = self.attempt.wrapping_add(1);
         let attempt = self.attempt;
+        self.session_traffic.begin(attempt, id);
         let mut telemetry = task.telemetry();
         let mut torrent_telemetry = task.torrent_telemetry();
         let mut receiver = task.subscribe();
@@ -462,6 +484,7 @@ impl DownloadManager {
                                 return;
                             }
                             if let Some(receiver) = &mut torrent_telemetry
+                                && (terminal || matches!(receiver.has_changed(), Ok(true)))
                                 && let Some(item) = view.queue.item_mut(id)
                             {
                                 item.apply_torrent_telemetry(receiver.borrow_and_update().clone());
@@ -516,8 +539,10 @@ impl DownloadManager {
                 if view
                     .update(cx, |view, cx| {
                         let rate = view.measured_rate();
-                        if view.last_rate != rate {
+                        let traffic_rates = session_traffic::rates(view.queue.items.iter());
+                        if view.last_rate != rate || view.last_traffic_rates != traffic_rates {
                             view.last_rate = rate;
+                            view.last_traffic_rates = traffic_rates;
                             view.refresh_details(cx);
                             view.sync_table(cx);
                             cx.notify();
@@ -564,6 +589,7 @@ impl DownloadManager {
         });
         if let Some(item) = self.queue.item_mut(id) {
             item.apply_state(state, Instant::now());
+            self.session_traffic.observe_item(self.attempt, item);
         }
         if changed_kind || terminal {
             self.save_history();
@@ -773,6 +799,7 @@ impl DownloadManager {
             eta: item.eta(),
             active: item.is_active(),
             cancelling: item.cancelling,
+            pause_pending: item.pause_pending,
             telemetry: item.telemetry.clone(),
             options: item.options.clone(),
             can_retry: item.can_retry(),
@@ -878,7 +905,7 @@ impl DownloadManager {
     }
 
     pub(crate) fn toggle_pause(&mut self, id: DownloadId, cx: &mut Context<Self>) {
-        if self.active != Some(id) {
+        if self.active != Some(id) || !self.queue.item(id).is_some_and(|item| item.can_pause()) {
             return;
         }
         let paused = self
@@ -889,14 +916,19 @@ impl DownloadManager {
             .transfer
             .as_ref()
             .is_some_and(|task| if paused { task.resume() } else { task.pause() });
+        if accepted && let Some(item) = self.queue.item_mut(id) {
+            item.pause_pending = Some(!paused);
+        }
         self.notice = Some(
             if accepted {
                 "Transfer control requested."
             } else {
-                "Pause/resume is unavailable until verified range support is observed."
+                "The transfer cannot accept a pause/resume request."
             }
             .into(),
         );
+        self.refresh_details(cx);
+        self.sync_table(cx);
         cx.notify();
     }
 
@@ -981,11 +1013,9 @@ impl DownloadManager {
             return;
         }
         self.cancel_all_shutdowns(cx);
-        if !self
-            .queue
-            .item_mut(id)
-            .is_some_and(|item| item.reset_for_retry(collision))
-        {
+        if !self.queue.retry(id, collision) {
+            self.notice = Some("Retry unavailable: destination is already queued or active, or the policy is unsupported.".into());
+            cx.notify();
             return;
         }
         if self.active.is_none() {
@@ -1020,15 +1050,28 @@ impl DownloadManager {
             self.retry_download(id, collision, cx);
             return;
         }
+        let Some(destination) = self
+            .queue
+            .item(id)
+            .filter(|item| item.can_retry() && !item.is_torrent)
+            .map(|item| item.destination.clone())
+        else {
+            return;
+        };
         let owner = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let owner = owner.clone();
+            let destination = destination.clone();
             dialog.title("Replace existing file?")
                 .child(gpui_kit::component::label::Label::new("Retry will replace the destination file after a successful download. This cannot be undone."))
                 .footer(gpui_kit::component::h_flex()
                     .child(gpui_kit::component::button::Button::new("cancel-retry").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(gpui_kit::component::button::Button::new("confirm-retry").debug_selector(|| "confirm-retry".into()).label("Replace and retry").on_click(move |_, window, cx| {
-                        let _ = owner.update(cx, |view, cx| view.retry_download(id, collision, cx));
+                        let _ = owner.update(cx, |view, cx| {
+                            if view.queue.item(id).is_some_and(|item| item.can_retry() && !item.is_torrent && item.destination == destination) {
+                                view.retry_download(id, collision, cx);
+                            }
+                        });
                         window.close_dialog(cx);
                     })))
         });
@@ -1208,6 +1251,24 @@ impl DownloadManager {
                 time_left: item.eta(),
                 last_try: item.last_try,
                 description: item.description.clone(),
+                seeds: item.live_torrent().and_then(|sample| sample.seeds),
+                peers: item.live_torrent().map(|sample| sample.peers),
+                upload_speed: if !item.is_torrent {
+                    None
+                } else if item.is_active() && !matches!(item.state, Some(TransferState::Paused(_)))
+                {
+                    item.live_torrent()
+                        .map(|sample| sample.upload_bytes_per_second)
+                } else {
+                    Some(0)
+                },
+                ratio: item.torrent_telemetry.as_ref().and_then(|sample| {
+                    sample
+                        .payload_downloaded_bytes
+                        .filter(|v| *v > 0)
+                        .map(|v| sample.uploaded_bytes as f64 / v as f64)
+                }),
+                availability: item.live_torrent().and_then(|sample| sample.availability),
             })
             .collect();
         let all_selected = self.queue.all_visible_selected();
@@ -1275,27 +1336,7 @@ impl DownloadManager {
     }
 
     fn open_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.migration.busy
-            || self.options_open
-            || self.about_open
-            || self.scheduler_window.is_some()
-        {
-            return;
-        }
-        self.options_open = true;
-        let owner = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let enabled = owner.read_with(cx, |view, _| view.clipboard_enabled).unwrap_or(false);
-            let change_owner = owner.clone();
-            let close_owner = owner.clone();
-            dialog.title("Options").w(px(480.)).child(gpui_kit::component::group_box::GroupBox::new()
-                .child(gpui_kit::component::checkbox::Checkbox::new("clipboard-enabled").label("Detect copied HTTP / HTTPS links").checked(enabled)
-                    .on_change(move |checked, _, cx| { let _ = change_owner.update(cx, |view, cx| { view.clipboard_enabled = *checked; cx.notify(); }); }))
-                .child(gpui_kit::component::label::Label::new("Opt-in, this session only. Checked while the Ulos window is active. Links open a confirmation window; they never download automatically."))
-                .child(gpui_kit::component::label::Label::new("Clipboard contents are not logged or saved. Wayland clipboard access depends on the compositor.")))
-                .on_close(move |_, _, cx| { let _ = close_owner.update(cx, |view, cx| { view.options_open = false; cx.notify(); }); })
-        });
-        cx.notify();
+        self.open_settings(window, cx);
     }
 }
 
@@ -1417,6 +1458,9 @@ mod torrents;
 #[cfg(test)]
 #[path = "manager_app_tests.rs"]
 mod app_tests;
+#[cfg(test)]
+#[path = "manager_metrics_tests.rs"]
+mod metrics_tests;
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod tests;

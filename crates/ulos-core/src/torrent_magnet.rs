@@ -30,6 +30,8 @@ struct Magnet {
     v1: Option<String>,
     v2: Option<String>,
     canonical: String,
+    trackers: Vec<String>,
+    peers: Vec<SocketAddr>,
 }
 
 /// Validate the supported magnet subset, offline, with no filesystem access.
@@ -146,6 +148,8 @@ fn magnet(value: &str) -> Result<Magnet, TorrentError> {
         v1: None,
         v2: None,
         canonical: String::from("magnet:?"),
+        trackers: Vec::new(),
+        peers: Vec::new(),
     };
     let mut display_name = false;
     let mut trackers = 0;
@@ -191,6 +195,7 @@ fn magnet(value: &str) -> Result<Magnet, TorrentError> {
                     return Err(TorrentError::Limit);
                 }
                 tracker(&value)?;
+                result.trackers.push(value.clone());
                 value
             }
             "x.pe" => {
@@ -202,6 +207,7 @@ fn magnet(value: &str) -> Result<Magnet, TorrentError> {
                 if peer.port() == 0 || peer.ip().is_unspecified() || peer.ip().is_multicast() {
                     return Err(TorrentError::InvalidMetadata);
                 }
+                result.peers.push(peer);
                 peer.to_string()
             }
             _ => return Err(TorrentError::InvalidMetadata),
@@ -358,7 +364,7 @@ fn metadata(value: &Json, magnet: &Magnet) -> Result<TorrentSource, TorrentError
         .iter()
         .map(|p| (digit(p[0]) << 4) | digit(p[1]))
         .collect();
-    let source = parse(bytes)?;
+    let mut source = parse(bytes)?;
     if magnet
         .v1
         .as_ref()
@@ -370,6 +376,73 @@ fn metadata(value: &Json, magnet: &Magnet) -> Result<TorrentSource, TorrentError
     {
         return Err(TorrentError::Verification);
     }
+    // BEP 9 carries only info, and resume-data export need not retain the
+    // magnet's discovery hints. Preserve the approved trackers and numeric
+    // peers in the reviewed source; neither is an upload/DHT opt-in.
+    if !magnet.trackers.is_empty() {
+        let mut parser = super::Parser {
+            bytes: &source.bytes,
+            pos: 0,
+            nodes: 0,
+            info: None,
+        };
+        let root = parser.value(0)?;
+        let mut entries = root.dict()?.clone();
+        let mut trackers = std::collections::BTreeSet::new();
+        if let Some(value) = entries.get(b"announce".as_slice()) {
+            trackers.insert(value.bytes()?.to_vec());
+        }
+        if let Some(tiers) = entries.get(b"announce-list".as_slice()) {
+            for tier in tiers.list()? {
+                for tracker in tier.list()? {
+                    trackers.insert(tracker.bytes()?.to_vec());
+                }
+            }
+        }
+        trackers.extend(magnet.trackers.iter().map(|s| s.as_bytes().to_vec()));
+        if trackers.len() > super::MAX_TRACKERS {
+            return Err(TorrentError::Limit);
+        }
+        entries.remove(b"announce".as_slice());
+        entries.insert(
+            b"announce-list",
+            super::Value::List(
+                trackers
+                    .iter()
+                    .map(|s| super::Value::List(vec![super::Value::Bytes(s)]))
+                    .collect(),
+            ),
+        );
+        fn encode(value: &super::Value<'_>, out: &mut Vec<u8>) {
+            use super::Value;
+            match value {
+                Value::Int(n) => out.extend_from_slice(format!("i{n}e").as_bytes()),
+                Value::Bytes(b) => {
+                    out.extend_from_slice(format!("{}:", b.len()).as_bytes());
+                    out.extend_from_slice(b);
+                }
+                Value::List(values) => {
+                    out.push(b'l');
+                    for v in values {
+                        encode(v, out);
+                    }
+                    out.push(b'e');
+                }
+                Value::Dict(values) => {
+                    out.push(b'd');
+                    for (k, v) in values {
+                        encode(&Value::Bytes(k), out);
+                        encode(v, out);
+                    }
+                    out.push(b'e');
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        encode(&super::Value::Dict(entries), &mut bytes);
+        source = parse(bytes)?;
+    }
+    source.initial_peers = magnet.peers.clone().into();
     Ok(source)
 }
 

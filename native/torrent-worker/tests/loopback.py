@@ -63,6 +63,10 @@ class Events(queue.Queue):
                         'peers', 'connecting_peers', 'queued_peers', 'seen_peers',
                         'stalled_for_secs', 'tracker_count']:
                 assert isinstance(event[key], int) and event[key] >= 0, event
+            assert event['seeds'] is None or (isinstance(event['seeds'], int) and event['seeds'] >= 0), event
+            assert event['availability'] is None or (isinstance(event['availability'], (int, float)) and event['availability'] >= 0), event
+            assert isinstance(event['payload_downloaded_bytes'], int) and event['payload_downloaded_bytes'] >= 0, event
+            assert isinstance(event['uploaded_bytes'], int) and event['uploaded_bytes'] >= 0, event
             assert event['downloaded_bytes'] <= event['total_bytes'], event
         return event
 

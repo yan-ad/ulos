@@ -655,7 +655,14 @@ fn mixed_fifo_retains_torrent_slot_through_pause_and_cancellation(cx: &mut TestA
                 })
         })
     });
-    view.update(cx, |view, cx| view.toggle_pause(torrent, cx));
+    view.update(cx, |view, cx| {
+        view.toggle_pause(torrent, cx);
+        assert_eq!(view.queue.item(torrent).unwrap().pause_pending, Some(true));
+        assert_eq!(view.snapshot(torrent).unwrap().status, "Pausing");
+        assert!(!view.row_command_enabled(torrent, super::row_menu::RowCommand::Pause));
+        view.toggle_pause(torrent, cx);
+        assert_eq!(view.queue.item(torrent).unwrap().pause_pending, Some(true));
+    });
     poll(cx, |cx| {
         view.read_with(cx, |view, _| {
             matches!(
